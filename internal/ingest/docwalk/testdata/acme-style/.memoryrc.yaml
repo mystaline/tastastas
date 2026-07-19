@@ -1,0 +1,19 @@
+# Reference config matching a common structured-doc-tree convention:
+# {Module}/{PRD/APISpec/ERD/TestCases/VisualDesign}/{feature}(.md or /*.md)
+project_id: acme-docs
+mappings:
+  - path_glob: "*/PRD/**/*.md"
+    type: prd
+    group_by: "^[^/]+/PRD/(?P<feature>[^/]+)/"
+  - path_glob: "*/APISpec/*.md"
+    type: api-spec
+    group_by: "^[^/]+/APISpec/(?P<feature>[^.]+)\\.md$"
+  - path_glob: "*/ERD/*.md"
+    type: erd
+    group_by: "^[^/]+/ERD/(?P<feature>[^.]+)\\.md$"
+  - path_glob: "*/TestCases/*.md"
+    type: test-case
+    group_by: "^[^/]+/TestCases/(?P<feature>[^.]+)\\.md$"
+  - path_glob: "*/VisualDesign/*.md"
+    type: visual-design
+    group_by: "^[^/]+/VisualDesign/(?P<feature>[^.]+)\\.md$"

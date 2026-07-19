@@ -1,0 +1,9 @@
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+/bin/
+prototype/.venv/
+prototype/**/.ipynb_checkpoints/
+__pycache__/
+.env
