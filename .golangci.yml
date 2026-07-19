@@ -1,0 +1,25 @@
+run:
+  timeout: 60s
+
+linters:
+  enable:
+    - errorlint       # catches bare err == sentinel (must use errors.Is)
+    - gocritic        # catches common Go antipatterns
+    - unused          # dead code
+    - govet           # shadow, printf, etc.
+    - ineffassign     # useless assignments
+    - misspell        # typos in comments/strings
+    - unconvert       # unnecessary type conversions
+
+linters-settings:
+  errorlint:
+    asserts: false
+    comparison: true
+    errorf: false
+
+issues:
+  exclude-rules:
+    # Test setup helpers (os.MkdirAll, os.WriteFile) don't need error
+    # checks — the test fails immediately afterward if setup didn't work.
+    - path: _test\.go
+      linters: [errcheck]

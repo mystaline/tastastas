@@ -23,6 +23,7 @@ func genULID() string {
 		// down); fall back to zero entropy rather than panicking — the
 		// timestamp component alone still gives uniqueness at ms granularity
 		// for the overwhelmingly common single-writer case.
+		entropy = [10]byte{} // explicitly zero — documents intent, silences SA9003
 	}
 
 	var sb strings.Builder

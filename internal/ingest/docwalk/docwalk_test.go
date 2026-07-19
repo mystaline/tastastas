@@ -113,15 +113,6 @@ func nodeIDs(nodes []store.Node) []string {
 	return out
 }
 
-func findNode(nodes []store.Node, nodeType string) store.Node {
-	for _, n := range nodes {
-		if n.NodeType == nodeType {
-			return n
-		}
-	}
-	return store.Node{}
-}
-
 // relatedPRD is a test-only helper: with only one prd sharing the
 // "coupon-redeem" feature slug, find it by matching source path prefix.
 func relatedPRD(nodes []store.Node) string {

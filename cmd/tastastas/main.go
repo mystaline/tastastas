@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"os"
@@ -26,13 +27,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}
-	defer db.Close()
 
 	if *serve != "" {
 		// HTTP server mode
 		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-		defer cancel()
-		if err := mcpserver.ServeHTTP(ctx, db, *serve); err != nil && err != context.Canceled {
+		err := mcpserver.ServeHTTP(ctx, db, *serve)
+		cancel()
+		db.Close() // close before exit: log.Fatalf below skips defers
+		if err != nil && !errors.Is(err, context.Canceled) {
 			log.Fatalf("HTTP server: %v", err)
 		}
 		return
@@ -41,7 +43,9 @@ func main() {
 	// Stdio MCP server mode (default)
 	srv := mcpserver.NewServer(db)
 	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
+		db.Close() // close before os.Exit
 		log.Printf("server exited: %v", err)
 		os.Exit(1)
 	}
+	db.Close() // clean shutdown — close before main returns
 }
