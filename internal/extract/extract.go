@@ -63,7 +63,59 @@ Skip anything that is: a question, a task-in-progress, small talk, or already-ob
 
 // Extract runs the LLM against the given conversation snippet and returns
 // parsed facts. Returns empty slice (not nil) on LLM error or empty output.
+// Retries once on a parse failure — qwen3.5:2b-q4_K_M has real run-to-run
+// variance on structured output; a schema-constrained format (below)
+// eliminates most hard parse errors but not all field-content garbling,
+// so a single retry catches the residual flake rate cheaply.
 func (e *Extractor) Extract(ctx context.Context, conversation string) ([]Fact, error) {
+	facts, err := e.extractOnce(ctx, conversation)
+	if err != nil {
+		facts, err = e.extractOnce(ctx, conversation)
+		if err != nil {
+			return nil, fmt.Errorf("extract (after 1 retry): %w", err)
+		}
+	}
+
+	// Filter by minimum importance
+	if e.cfg.MinImportance > 0 {
+		filtered := facts[:0]
+		for _, f := range facts {
+			if f.Importance >= e.cfg.MinImportance {
+				filtered = append(filtered, f)
+			}
+		}
+		facts = filtered
+	}
+
+	// Cap at MaxFacts
+	if len(facts) > e.cfg.MaxFacts {
+		facts = facts[:e.cfg.MaxFacts]
+	}
+
+	return facts, nil
+}
+
+// factSchema constrains Ollama's output to a JSON array of flat objects
+// matching Fact's shape. This eliminates hard parse errors (missing
+// delimiters, wrong top-level shape) but does NOT guarantee clean field
+// content — qwen3.5:2b-q4_K_M has been observed embedding garbled JSON
+// fragments inside string fields even with this constraint in place.
+// validateFact (below) catches that residual class.
+var factSchema = map[string]any{
+	"type": "array",
+	"items": map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"kind":       map[string]any{"type": "string", "enum": []string{"fact", "entity"}},
+			"title":      map[string]any{"type": "string"},
+			"content":    map[string]any{"type": "string"},
+			"importance": map[string]any{"type": "number"},
+		},
+		"required": []string{"kind", "title", "content", "importance"},
+	},
+}
+
+func (e *Extractor) extractOnce(ctx context.Context, conversation string) ([]Fact, error) {
 	payload := ollamaRequest{
 		Model: e.cfg.Model,
 		Messages: []ollamaMessage{
@@ -74,7 +126,8 @@ func (e *Extractor) Extract(ctx context.Context, conversation string) ([]Fact, e
 		// qwen3.5:2b-q4_K_M is a thinking model — without this it leaks
 		// chain-of-thought into a separate "thinking" field and leaves
 		// message.content empty/truncated. Always false for extraction.
-		Think: false,
+		Think:  false,
+		Format: factSchema,
 	}
 
 	body, err := json.Marshal(payload)
@@ -166,20 +219,42 @@ func parseFacts(raw string) ([]Fact, error) {
 	}
 
 	// Validate and normalize
-	for i := range facts {
-		facts[i].Kind = strings.ToLower(strings.TrimSpace(facts[i].Kind))
-		if facts[i].Kind != "fact" && facts[i].Kind != "entity" {
-			facts[i].Kind = "fact" // default
+	clean := facts[:0]
+	for _, f := range facts {
+		f.Kind = strings.ToLower(strings.TrimSpace(f.Kind))
+		if f.Kind != "fact" && f.Kind != "entity" {
+			f.Kind = "fact" // default
 		}
-		if facts[i].Importance < 0 {
-			facts[i].Importance = 0
+		if f.Importance < 0 {
+			f.Importance = 0
 		}
-		if facts[i].Importance > 1 {
-			facts[i].Importance = 1
+		if f.Importance > 1 {
+			f.Importance = 1
 		}
+		if !fieldsLookClean(f) {
+			continue // drop: model garbled a JSON fragment into a string field
+		}
+		clean = append(clean, f)
 	}
 
-	return facts, nil
+	return clean, nil
+}
+
+// fieldsLookClean rejects facts where title/content contain leftover JSON
+// syntax — observed failure mode on qwen3.5:2b-q4_K_M where the model
+// embeds a fragment of a second (malformed) object inside a string field
+// even when the top-level response is schema-valid JSON. A clean title is
+// short prose; one containing `{`, `}`, or a `":` key-value marker is not.
+func fieldsLookClean(f Fact) bool {
+	if len(f.Title) > 120 || len(f.Content) > 500 {
+		return false
+	}
+	for _, s := range []string{f.Title, f.Content} {
+		if strings.ContainsAny(s, "{}") || strings.Contains(s, "\":") {
+			return false
+		}
+	}
+	return true
 }
 
 func truncate(s string, n int) string {
@@ -196,6 +271,7 @@ type ollamaRequest struct {
 	Messages []ollamaMessage `json:"messages"`
 	Stream   bool            `json:"stream"`
 	Think    bool            `json:"think"`
+	Format   any             `json:"format,omitempty"`
 }
 
 type ollamaMessage struct {
