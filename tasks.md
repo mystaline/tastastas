@@ -29,10 +29,13 @@ tests exist and can drive concurrent requests.
       to actually exercise a race, if one exists)
 
 ## 3. `golangci-lint`
-Not installed or configured in this repo at all.
-- [ ] `go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest`
-- [ ] Add `.golangci.yml`
-- [ ] Run once, fix what it flags, wire into the standard verify command
+- [x] `.golangci.yml` added, enabled: errorlint, gocritic, unused, govet,
+      ineffassign, misspell, unconvert. errcheck suppressed for test files only.
+- [x] Run once, fix what it flags — caught: bare `err != context.Canceled`
+      (errors.Is fix), exitAfterDefer (db.Close before log.Fatalf), empty
+      error branch (ulid.go), unused func (docwalk_test.go). All fixed.
+- [x] Wire into standard verify command (golangci-lint run ./... passes clean)
+  See commit `1e1932f`.
 
 ## 4. Dedup threshold recalibration
 Current `dedupe.DefaultThreshold = 0.80` derived from a small sample (13
