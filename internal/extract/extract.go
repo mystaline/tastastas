@@ -24,9 +24,9 @@ type Fact struct {
 
 // Config holds extraction settings.
 type Config struct {
-	OllamaURL  string  // e.g. "http://localhost:11434"
-	Model      string  // e.g. "llama3.2"
-	MaxFacts   int     // 0 = use default (3)
+	OllamaURL     string  // e.g. "http://localhost:11434"
+	Model         string  // e.g. "qwen3.5:2b-q4_K_M"
+	MaxFacts      int     // 0 = use default (3)
 	MinImportance float64 // discard facts below this (0 = keep all)
 }
 
@@ -42,7 +42,7 @@ func New(cfg Config) *Extractor {
 		cfg.OllamaURL = "http://localhost:11434"
 	}
 	if cfg.Model == "" {
-		cfg.Model = "llama3.2"
+		cfg.Model = "qwen3.5:2b-q4_K_M"
 	}
 	if cfg.MaxFacts == 0 {
 		cfg.MaxFacts = 3
@@ -53,14 +53,12 @@ func New(cfg Config) *Extractor {
 	}
 }
 
-const systemPrompt = `You extract discrete, atomic facts from a conversation snippet for long-term memory storage. Output ONLY a JSON array, no prose. Each item:
-{
-  "kind": "fact" | "entity",
-  "title": "short label, <= 8 words",
-  "content": "one self-contained sentence, no pronouns referring outside itself",
-  "importance": 0.0-1.0  (0.9+ = identity/durable preference/hard constraint,
-                          0.5 = useful context, 0.2 = trivial/likely stale soon)
-}
+// systemPrompt asks for a JSON array with a worked example — the example is
+// required in practice: qwen3.5:2b-q4_K_M reliably drifts from the bare
+// schema description alone (emits nested/differently-shaped objects) but
+// matches the array-of-flat-objects shape when shown one concrete example.
+const systemPrompt = `You extract discrete, atomic facts from a conversation snippet for long-term memory storage. Output ONLY a JSON array (starting with [ and ending with ]), no prose, no markdown fences. Each array item must be an object with exactly these keys: kind ("fact" or "entity"), title (short label, <= 8 words), content (one self-contained sentence, no pronouns referring outside itself), importance (a number 0.0-1.0; 0.9+ = identity/durable preference/hard constraint, 0.5 = useful context, 0.2 = trivial/likely stale soon).
+Example output: [{"kind": "fact", "title": "UI preference: dark mode", "content": "User prefers dark mode in UI.", "importance": 0.6}, {"kind": "fact", "title": "Project DB version", "content": "This project uses Postgres 16.", "importance": 0.7}]
 Skip anything that is: a question, a task-in-progress, small talk, or already-obvious-from-context filler. Prefer 0-3 high quality facts over many weak ones.`
 
 // Extract runs the LLM against the given conversation snippet and returns
@@ -73,6 +71,10 @@ func (e *Extractor) Extract(ctx context.Context, conversation string) ([]Fact, e
 			{Role: "user", Content: conversation},
 		},
 		Stream: false,
+		// qwen3.5:2b-q4_K_M is a thinking model — without this it leaks
+		// chain-of-thought into a separate "thinking" field and leaves
+		// message.content empty/truncated. Always false for extraction.
+		Think: false,
 	}
 
 	body, err := json.Marshal(payload)
@@ -190,9 +192,10 @@ func truncate(s string, n int) string {
 // --- Ollama API types ---
 
 type ollamaRequest struct {
-	Model    string           `json:"model"`
-	Messages []ollamaMessage  `json:"messages"`
-	Stream   bool             `json:"stream"`
+	Model    string          `json:"model"`
+	Messages []ollamaMessage `json:"messages"`
+	Stream   bool            `json:"stream"`
+	Think    bool            `json:"think"`
 }
 
 type ollamaMessage struct {

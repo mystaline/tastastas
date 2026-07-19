@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/mystaline-dev/tastastas/internal/ingest/docwalk"
 	"github.com/mystaline-dev/tastastas/internal/store"
 )
 
@@ -32,8 +31,9 @@ func ServeHTTP(ctx context.Context, db store.Store, addr string) error {
 	// MCP endpoint — all MCP protocol traffic
 	mux.Handle("/mcp", mcpHandler)
 
-	// REST ingestion endpoints
-	mux.HandleFunc("POST /ingest/docwalk", handleIngestDocwalk(db))
+	// REST ingestion endpoints — POST /ingest/{adapter} dispatches to
+	// docwalk, gitrepo, or obsidian.
+	mux.HandleFunc("POST /ingest/{adapter}", handleIngest(db))
 	mux.HandleFunc("POST /ingest/webhook", handleIngestWebhook(db))
 
 	// Health check
@@ -44,7 +44,7 @@ func ServeHTTP(ctx context.Context, db store.Store, addr string) error {
 
 	log.Printf("tastastas HTTP server listening on %s", addr)
 	log.Printf("  MCP endpoint:   %s/mcp", addr)
-	log.Printf("  Ingest:         %s/ingest/docwalk", addr)
+	log.Printf("  Ingest:         %s/ingest/{docwalk,gitrepo,obsidian}", addr)
 	log.Printf("  Webhook:        %s/ingest/webhook", addr)
 
 	server := &http.Server{Addr: addr, Handler: mux}
@@ -56,10 +56,12 @@ func ServeHTTP(ctx context.Context, db store.Store, addr string) error {
 	return server.ListenAndServe()
 }
 
-// handleIngestDocwalk handles POST /ingest/docwalk with JSON body:
-// { "root": "/path/to/docs", "config_path": "/path/to/.memoryrc.yaml", "project_id": "..." }
-func handleIngestDocwalk(db store.Store) http.HandlerFunc {
+// handleIngest handles POST /ingest/{adapter} (docwalk, gitrepo, obsidian)
+// with JSON body: { "root": "/path", "config_path": "...", "project_id": "..." }
+// config_path only applies to the docwalk adapter.
+func handleIngest(db store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		adapter := r.PathValue("adapter")
 		var req struct {
 			Root       string `json:"root"`
 			ConfigPath string `json:"config_path"`
@@ -71,22 +73,9 @@ func handleIngestDocwalk(db store.Store) http.HandlerFunc {
 			return
 		}
 
-		var cfg docwalk.Config
-		if req.ConfigPath != "" {
-			var err error
-			cfg, err = docwalk.LoadConfig(req.ConfigPath)
-			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"error":"load config: %s"}`, err), http.StatusBadRequest)
-				return
-			}
-		}
-		if req.ProjectID != "" {
-			cfg.ProjectID = req.ProjectID
-		}
-
-		nodes, edges, err := docwalk.Ingest(req.Root, cfg)
+		nodes, edges, err := runIngestAdapter(adapter, req.Root, req.ConfigPath, req.ProjectID)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"ingest: %s"}`, err), http.StatusInternalServerError)
+			http.Error(w, fmt.Sprintf(`{"error":"ingest: %s"}`, err), http.StatusBadRequest)
 			return
 		}
 

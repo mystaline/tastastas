@@ -10,7 +10,12 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/mystaline-dev/tastastas/internal/dedupe"
+	"github.com/mystaline-dev/tastastas/internal/embed"
+	"github.com/mystaline-dev/tastastas/internal/extract"
 	"github.com/mystaline-dev/tastastas/internal/ingest/docwalk"
+	"github.com/mystaline-dev/tastastas/internal/ingest/gitrepo"
+	"github.com/mystaline-dev/tastastas/internal/ingest/obsidian"
 	"github.com/mystaline-dev/tastastas/internal/retrieve"
 	"github.com/mystaline-dev/tastastas/internal/store"
 )
@@ -27,9 +32,11 @@ func NewServer(db store.Store) *mcp.Server {
 	return srv
 }
 
-// registerTools adds all 6 MCP tools to the server.
+// registerTools adds all 7 MCP tools to the server.
 func registerTools(srv *mcp.Server, db store.Store) {
 	retriever := retrieve.New(db, retrieve.DefaultConfig())
+	extractor := extract.New(extract.Config{})
+	embedder := embed.New(embed.Config{})
 	// Tool 1: remember
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "remember",
@@ -151,23 +158,9 @@ func registerTools(srv *mcp.Server, db store.Store) {
 	// Tool 5: ingest
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ingest",
-		Description: "Ingest documents from a filesystem root using a named adapter. Only 'docwalk' is implemented as of Phase 3.",
+		Description: "Ingest documents from a filesystem root using a named adapter (docwalk, gitrepo, obsidian).",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args IngestInput) (*mcp.CallToolResult, IngestOutput, error) {
-		if args.Adapter != "docwalk" {
-			return errorResult(fmt.Errorf("adapter %q not implemented (only 'docwalk' available)", args.Adapter)),
-				IngestOutput{}, nil
-		}
-
-		var cfg docwalk.Config
-		var err error
-		if args.ConfigPath != "" {
-			cfg, err = docwalk.LoadConfig(args.ConfigPath)
-			if err != nil {
-				return errorResult(err), IngestOutput{}, nil
-			}
-		}
-
-		nodes, edges, err := docwalk.Ingest(args.Root, cfg)
+		nodes, edges, err := runIngestAdapter(args.Adapter, args.Root, args.ConfigPath, args.ProjectID)
 		if err != nil {
 			return errorResult(err), IngestOutput{}, nil
 		}
@@ -182,7 +175,6 @@ func registerTools(srv *mcp.Server, db store.Store) {
 				return errorResult(err), IngestOutput{}, nil
 			}
 		}
-
 
 		out := IngestOutput{NodesIngested: len(nodes), EdgesCreated: len(edges)}
 		return &mcp.CallToolResult{
@@ -212,6 +204,116 @@ func registerTools(srv *mcp.Server, db store.Store) {
 			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
 		}, out, nil
 	})
+
+	// Tool 7: extract_and_remember (Phase 4/6: extraction + dedupe pipeline).
+	// Distinct from `remember`: takes raw conversation text, runs it through
+	// the LLM extraction pipeline, dedupe-checks each fact against existing
+	// nodes of the same kind in the project (cosine similarity via
+	// SearchVector), merges above threshold instead of duplicate-inserting.
+	// `remember`'s direct-insert contract is untouched by this tool.
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "extract_and_remember",
+		Description: "Extract atomic facts/entities from raw conversation text via LLM, dedupe-check each against existing memory, and store (merge on near-duplicate, insert otherwise).",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args ExtractAndRememberInput) (*mcp.CallToolResult, ExtractAndRememberOutput, error) {
+		projectID := args.ProjectID
+		if projectID == "" {
+			projectID = "default"
+		}
+
+		facts, err := extractor.Extract(ctx, args.Conversation)
+		if err != nil {
+			return errorResult(err), ExtractAndRememberOutput{}, nil
+		}
+
+		results := make([]ExtractedFactResult, 0, len(facts))
+		for _, f := range facts {
+			vec, err := embedder.Embed(ctx, f.Content)
+			if err != nil {
+				return errorResult(err), ExtractAndRememberOutput{}, nil
+			}
+
+			// Cosine-search existing nodes of the same kind in this project.
+			// store.SearchVector's Score is exactly cosine similarity
+			// (sqlite backend: Score = 1 - vec_distance_cosine, and cosine
+			// distance IS 1 - cosine similarity) — so comparing it directly
+			// against dedupe.DefaultThreshold is equivalent to running
+			// dedupe.CosineSimilarity ourselves, without a redundant round
+			// trip to re-fetch raw vectors the store doesn't expose back.
+			candidates, err := db.SearchVector(ctx, projectID, vec, 5)
+			if err != nil {
+				return errorResult(err), ExtractAndRememberOutput{}, nil
+			}
+
+			id := ""
+			status := "created"
+			bestID, bestScore := "", -1.0
+			for _, c := range candidates {
+				if c.NodeType != f.Kind {
+					continue
+				}
+				if c.Score > bestScore {
+					bestID, bestScore = c.ID, c.Score
+				}
+			}
+			if bestID != "" && bestScore >= dedupe.DefaultThreshold {
+				id = bestID
+				status = "merged"
+			} else {
+				id = fmt.Sprintf("%s/%s/%s", projectID, f.Kind, genULID())
+			}
+
+			n := store.Node{
+				ID:            id,
+				ProjectID:     projectID,
+				NodeType:      f.Kind,
+				Title:         f.Title,
+				Content:       f.Content,
+				Importance:    f.Importance,
+				SourceAdapter: "extract_and_remember",
+				Embedding:     vec,
+			}
+			if err := db.UpsertNode(ctx, n); err != nil {
+				return errorResult(err), ExtractAndRememberOutput{}, nil
+			}
+			results = append(results, ExtractedFactResult{ID: id, Status: status})
+		}
+
+		out := ExtractAndRememberOutput{Facts: results}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
+		}, out, nil
+	})
+}
+
+// runIngestAdapter dispatches to the named ingest adapter and returns the
+// resulting nodes/edges (gitrepo returns no edges; obsidian/docwalk do).
+func runIngestAdapter(adapter, root, configPath, projectID string) ([]store.Node, []store.Edge, error) {
+	switch adapter {
+	case "docwalk":
+		var cfg docwalk.Config
+		var err error
+		if configPath != "" {
+			cfg, err = docwalk.LoadConfig(configPath)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		if projectID != "" {
+			cfg.ProjectID = projectID
+		}
+		return docwalk.Ingest(root, cfg)
+
+	case "gitrepo":
+		nodes, err := gitrepo.Ingest(gitrepo.Config{Root: root, ProjectID: projectID})
+		return nodes, nil, err
+
+	case "obsidian":
+		nodes, edges, err := obsidian.Ingest(obsidian.Config{Root: root, ProjectID: projectID})
+		return nodes, edges, err
+
+	default:
+		return nil, nil, fmt.Errorf("adapter %q not implemented (must be one of: docwalk, gitrepo, obsidian)", adapter)
+	}
 }
 
 // --- helpers (types in types.go) ---

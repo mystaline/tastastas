@@ -32,14 +32,8 @@ except ImportError:
 # Extraction prompt (mirrored from internal/extract/extract.go)
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You extract discrete, atomic facts from a conversation snippet for long-term memory storage. Output ONLY a JSON array, no prose. Each item:
-{
-  "kind": "fact" | "entity",
-  "title": "short label, <= 8 words",
-  "content": "one self-contained sentence, no pronouns referring outside itself",
-  "importance": 0.0-1.0  (0.9+ = identity/durable preference/hard constraint,
-                          0.5 = useful context, 0.2 = trivial/likely stale soon)
-}
+SYSTEM_PROMPT = """You extract discrete, atomic facts from a conversation snippet for long-term memory storage. Output ONLY a JSON array (starting with [ and ending with ]), no prose, no markdown fences. Each array item must be an object with exactly these keys: kind ("fact" or "entity"), title (short label, <= 8 words), content (one self-contained sentence, no pronouns referring outside itself), importance (a number 0.0-1.0; 0.9+ = identity/durable preference/hard constraint, 0.5 = useful context, 0.2 = trivial/likely stale soon).
+Example output: [{"kind": "fact", "title": "UI preference: dark mode", "content": "User prefers dark mode in UI.", "importance": 0.6}, {"kind": "fact", "title": "Project DB version", "content": "This project uses Postgres 16.", "importance": 0.7}]
 Skip anything that is: a question, a task-in-progress, small talk, or already-obvious-from-context filler. Prefer 0-3 high quality facts over many weak ones."""
 
 
@@ -58,6 +52,10 @@ def extract_facts(snippet: str, ollama_url: str, model: str) -> list[dict]:
                 {"role": "user", "content": snippet},
             ],
             "stream": False,
+            # qwen3.5:2b-q4_K_M is a thinking model — without this it leaks
+            # chain-of-thought into a separate "thinking" field and leaves
+            # message.content empty/truncated (see internal/extract/extract.go).
+            "think": False,
         },
         timeout=120,
     )
@@ -86,26 +84,21 @@ def extract_facts(snippet: str, ollama_url: str, model: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Embedding (local sentence-transformers)
+# Embedding (Ollama /api/embed — patched 2026-07-19: this environment runs
+# Ollama locally with nomic-embed-text pulled; sentence-transformers is not
+# installed and pulling it in is unnecessary extra prototype-dep weight when
+# the actual production embedder (internal/embed) already targets Ollama.
+# The --embed-model flag is now interpreted as an Ollama model name.
 # ---------------------------------------------------------------------------
 
-_model_cache = None
-
-def get_embedder(model_name: str = "all-MiniLM-L6-v2"):
-    global _model_cache
-    if _model_cache is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError:
-            sys.exit("Missing 'sentence-transformers'. Install: pip install sentence-transformers")
-        _model_cache = SentenceTransformer(model_name)
-    return _model_cache
-
-
-def embed_texts(texts: list[str], model_name: str = "all-MiniLM-L6-v2") -> list[list[float]]:
-    embedder = get_embedder(model_name)
-    vecs = embedder.encode(texts, normalize_embeddings=True)
-    return [v.tolist() for v in vecs]
+def embed_texts(texts: list[str], model_name: str = "nomic-embed-text", ollama_url: str = "http://localhost:11434") -> list[list[float]]:
+    resp = requests.post(
+        f"{ollama_url}/api/embed",
+        json={"model": model_name, "input": texts},
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()["embeddings"]
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +120,7 @@ def cosine(a: list[float], b: list[float]) -> float:
 # Threshold calibration
 # ---------------------------------------------------------------------------
 
-def calibrate(facts_by_snippet: list[list[dict]], model_name: str = "all-MiniLM-L6-v2"):
+def calibrate(facts_by_snippet: list[list[dict]], model_name: str = "nomic-embed-text", ollama_url: str = "http://localhost:11434"):
     """Compute intra-snippet and inter-snippet similarities to derive threshold."""
     # Flatten all fact contents
     all_contents = []
@@ -143,7 +136,7 @@ def calibrate(facts_by_snippet: list[list[dict]], model_name: str = "all-MiniLM-
         return
 
     print(f"Embedding {len(all_contents)} facts...")
-    embeddings = embed_texts(all_contents, model_name)
+    embeddings = embed_texts(all_contents, model_name, ollama_url)
 
     # Intra-snippet: facts from SAME snippet (should be distinct — low similarity)
     intra_sims = []
@@ -181,7 +174,7 @@ def calibrate(facts_by_snippet: list[list[dict]], model_name: str = "all-MiniLM-
         lo = i * 0.1
         hi = lo + 0.1
         bar = "#" * int(count)
-        print(f"  [{lo:.1f}-{hi:.1f}): {count:4d} {bar}")
+        print(f"  [{lo:.1f}-{hi:.1f}): {int(count):4d} {bar}")
 
     # Suggest threshold at 90th percentile of intra-snippet similarity
     if intra_sims:
@@ -223,8 +216,8 @@ def main():
     parser = argparse.ArgumentParser(description="Extraction + dedup calibration")
     parser.add_argument("--snippets", required=True, help="Path to JSONL file with conversation snippets")
     parser.add_argument("--ollama-url", default="http://localhost:11434", help="Ollama API URL")
-    parser.add_argument("--model", default="llama3.2", help="Ollama model name")
-    parser.add_argument("--embed-model", default="all-MiniLM-L6-v2", help="Sentence-transformers model")
+    parser.add_argument("--model", default="qwen3.5:2b-q4_K_M", help="Ollama model name")
+    parser.add_argument("--embed-model", default="nomic-embed-text", help="Ollama embedding model")
     parser.add_argument("--skip-extraction", action="store_true", help="Skip Ollama extraction, use cached facts")
     parser.add_argument("--facts-cache", default="prototype/extracted_facts.jsonl", help="Cache file for extracted facts")
     args = parser.parse_args()
@@ -276,7 +269,7 @@ def main():
     print(f"\n{sum(len(f) for f in non_empty)} total facts from {len(non_empty)} snippets")
 
     # Calibrate
-    calibrate(non_empty, args.embed_model)
+    calibrate(non_empty, args.embed_model, args.ollama_url)
 
 
 if __name__ == "__main__":

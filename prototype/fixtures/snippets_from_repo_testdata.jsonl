@@ -1,0 +1,8 @@
+{"text": "This is the main architecture doc. The system uses a layered architecture. See Database Design for the data layer. Also related to API Specification."}
+{"text": "PostgreSQL schema with full-text search is used for the data layer. No outgoing links from here."}
+{"text": "REST endpoints for the billing service are documented here. See Architecture Overview and Database Design for context."}
+{"text": "Users can redeem a coupon code against an order at checkout. This is the coupon redeem feature overview."}
+{"text": "A coupon has an expiry date after which it can no longer be redeemed. This describes the coupon expiry feature."}
+{"text": "Test cases for coupon redemption: valid coupon applies discount, expired coupon is rejected, invalid code is rejected."}
+{"text": "We use PostgreSQL as our database with full text search enabled for the data layer, exactly the same as described in the architecture."}
+{"text": "The coupon redemption feature lets a user apply a coupon code to their order during checkout, same as before."}

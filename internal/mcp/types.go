@@ -53,10 +53,23 @@ type IngestInput struct {
 	Adapter    string `json:"adapter"`
 	Root       string `json:"root"`
 	ConfigPath string `json:"config_path,omitempty"`
+	ProjectID  string `json:"project_id,omitempty"`
 }
 type IngestOutput struct {
 	NodesIngested int `json:"nodes_ingested"`
 	EdgesCreated  int `json:"edges_created"`
+}
+
+type ExtractAndRememberInput struct {
+	ProjectID    string `json:"project_id,omitempty"`
+	Conversation string `json:"conversation"`
+}
+type ExtractAndRememberOutput struct {
+	Facts []ExtractedFactResult `json:"facts"`
+}
+type ExtractedFactResult struct {
+	ID     string `json:"id"`
+	Status string `json:"status"` // "created" | "merged"
 }
 
 type CheckImpactInput struct {
