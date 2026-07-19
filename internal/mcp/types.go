@@ -58,3 +58,18 @@ type IngestOutput struct {
 	NodesIngested int `json:"nodes_ingested"`
 	EdgesCreated  int `json:"edges_created"`
 }
+
+type CheckImpactInput struct {
+	ChangedID string `json:"changed_id"`
+	MaxDepth  int    `json:"max_depth,omitempty"`
+}
+type CheckImpactOutput struct {
+	ChangedID string      `json:"changed_id"`
+	StaleCount int        `json:"stale_count"`
+	Stale     []StaleItem `json:"stale"`
+}
+type StaleItem struct {
+	ID       string `json:"id"`
+	NodeType string `json:"node_type"`
+	Status   string `json:"status"`
+}

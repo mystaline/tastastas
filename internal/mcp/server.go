@@ -13,6 +13,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/mystaline-dev/tastastas/internal/ingest/docwalk"
+	"github.com/mystaline-dev/tastastas/internal/retrieve"
 	"github.com/mystaline-dev/tastastas/internal/store"
 )
 
@@ -28,8 +29,9 @@ func NewServer(db store.Store) *mcp.Server {
 	return srv
 }
 
-// registerTools adds all 5 MCP tools to the server.
+// registerTools adds all 6 MCP tools to the server.
 func registerTools(srv *mcp.Server, db store.Store) {
+	retriever := retrieve.New(db, retrieve.DefaultConfig())
 	// Tool 1: remember
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "remember",
@@ -69,10 +71,10 @@ func registerTools(srv *mcp.Server, db store.Store) {
 		}, RememberOutput{ID: id, Status: "stored"}, nil
 	})
 
-	// Tool 2: recall
+	// Tool 2: recall (Phase 5: real scoring with recency + graph pull-in)
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "recall",
-		Description: "Search memory by lexical query. Phase 3 stub — returns FTS5 results with score=1.0. Replaced with real scoring (relevance*recency*importance + graph pull-in) in Phase 5.",
+		Description: "Search memory by lexical query. Returns scored results using relevance * recency * importance, with graph-neighbor pull-in for context enrichment.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args RecallInput) (*mcp.CallToolResult, RecallOutput, error) {
 		projectID := args.ProjectID
 		if projectID == "" {
@@ -83,19 +85,19 @@ func registerTools(srv *mcp.Server, db store.Store) {
 			limit = 10
 		}
 
-		results, err := db.SearchLexical(ctx, projectID, args.Query, limit)
+		scored, err := retriever.Recall(ctx, projectID, args.Query, limit)
 		if err != nil {
 			return errorResult(err), RecallOutput{}, nil
 		}
 
-		items := make([]RecallItem, 0, len(results))
-		for _, r := range results {
+		items := make([]RecallItem, 0, len(scored))
+		for _, s := range scored {
 			items = append(items, RecallItem{
-				ID:       r.ID,
-				Title:    r.Title,
-				Content:  r.Content,
-				NodeType: r.NodeType,
-				Score:    1.0, // stub score — Phase 5 replaces this
+				ID:       s.Node.ID,
+				Title:    s.Node.Title,
+				Content:  s.Node.Content,
+				NodeType: s.Node.NodeType,
+				Score:    s.Score,
 			})
 		}
 		return &mcp.CallToolResult{
@@ -185,6 +187,29 @@ func registerTools(srv *mcp.Server, db store.Store) {
 
 
 		out := IngestOutput{NodesIngested: len(nodes), EdgesCreated: len(edges)}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
+		}, out, nil
+	})
+
+	// Tool 6: check_impact
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "check_impact",
+		Description: "After updating a node, check which downstream nodes are affected. Returns list of nodes flagged stale by content change.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args CheckImpactInput) (*mcp.CallToolResult, CheckImpactOutput, error) {
+		maxDepth := args.MaxDepth
+		if maxDepth == 0 {
+			maxDepth = 2
+		}
+		stale, err := db.MarkStaleDownstream(ctx, args.ChangedID, maxDepth)
+		if err != nil {
+			return errorResult(err), CheckImpactOutput{}, nil
+		}
+		items := make([]StaleItem, 0, len(stale))
+		for _, n := range stale {
+			items = append(items, StaleItem{ID: n.ID, NodeType: n.NodeType, Status: n.Status})
+		}
+		out := CheckImpactOutput{ChangedID: args.ChangedID, StaleCount: len(items), Stale: items}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
 		}, out, nil
