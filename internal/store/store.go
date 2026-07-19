@@ -47,6 +47,7 @@ type ScoredNode struct {
 type Store interface {
 	UpsertNode(ctx context.Context, n Node) error
 	UpsertEdge(ctx context.Context, e Edge) error
+	DeleteNode(ctx context.Context, id string) error
 	GetNode(ctx context.Context, id string) (Node, error)
 
 	// SearchLexical runs an FTS5 (or equivalent) query scoped to a project.
