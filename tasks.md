@@ -8,12 +8,16 @@ No test spawns the compiled `tastastas` binary and talks to it over the real
 transport. Current tests call Go functions directly (Tier 1/2), which cannot
 catch wire-format bugs (this is exactly how the `check_impact` shape bug
 slipped through earlier). Need:
-- [ ] stdio: `os/exec` spawn binary, speak real MCP JSON-RPC framing over
-      stdin/stdout, assert on wire responses
+- [x] stdio: `os/exec` spawn binary, speak real MCP JSON-RPC framing over
+      stdin/stdout, assert on wire responses — `internal/e2e/stdio_test.go`,
+      full remember→recall→link→check_impact→forget sequence. Caught a real
+      bug on first run: `forget`'s not-found check used bare `==` against a
+      wrapped error, always false — fixed with `errors.Is`. (commit `38dc5be`)
 - [ ] HTTP: real `net/http` client against a real listening socket, hit
       `/mcp`, `/ingest/{adapter}`, health/webhook endpoints
 - Floor: one test per transport. Target: one full multi-tool-call sequence
-  per transport (remember→recall→link→check_impact→forget).
+  per transport (remember→recall→link→check_impact→forget). stdio floor+target
+  both met; HTTP not started.
 
 ## 2. `-race` coverage
 Never run in this repo. `go test -race ./...` needs to actually execute.
