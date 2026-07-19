@@ -1,0 +1,46 @@
+# tasks.md — remaining work
+
+Tracked as of 2026-07-20. See `~/Workspace/.hermes/plans/2026-07-19_agent-memory-v1-plan.md`
+Standing Rule 7 for the strict Definition of Done these are checked against.
+
+## 1. Tier-3 E2E tests
+No test spawns the compiled `tastastas` binary and talks to it over the real
+transport. Current tests call Go functions directly (Tier 1/2), which cannot
+catch wire-format bugs (this is exactly how the `check_impact` shape bug
+slipped through earlier). Need:
+- [ ] stdio: `os/exec` spawn binary, speak real MCP JSON-RPC framing over
+      stdin/stdout, assert on wire responses
+- [ ] HTTP: real `net/http` client against a real listening socket, hit
+      `/mcp`, `/ingest/{adapter}`, health/webhook endpoints
+- Floor: one test per transport. Target: one full multi-tool-call sequence
+  per transport (remember→recall→link→check_impact→forget).
+
+## 2. `-race` coverage
+Never run in this repo. `go test -race ./...` needs to actually execute.
+HTTP server + concurrent SQLite access is the real risk case once Tier-3 E2E
+tests exist and can drive concurrent requests.
+- [ ] Add `-race` to the standard verify command
+- [ ] Run once Tier-3 HTTP E2E tests exist (concurrent client requests needed
+      to actually exercise a race, if one exists)
+
+## 3. `golangci-lint`
+Not installed or configured in this repo at all.
+- [ ] `go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest`
+- [ ] Add `.golangci.yml`
+- [ ] Run once, fix what it flags, wire into the standard verify command
+
+## 4. Dedup threshold recalibration
+Current `dedupe.DefaultThreshold = 0.80` derived from a small sample (13
+facts, 78 pairs, 4 hand-identified known-dup pairs) built from repo test
+fixtures, not real conversation data — flagged as a v1 placeholder in
+`internal/dedupe/dedupe.go`'s doc comment.
+- [ ] Re-run `prototype/scoring.py` against a larger, more diverse
+      real-conversation corpus once available
+- [ ] Update `DefaultThreshold` + doc comment with the new derived value
+
+## 5. Phase 7 — docs + release
+Blocked on 1-4 being closed out per current sequencing (do the fill-in pass
+first, then finalize).
+- [ ] Full README rewrite: pitch, quickstart, architecture diagram, config
+      reference, roadmap
+- [ ] Tag `v0.1.0`

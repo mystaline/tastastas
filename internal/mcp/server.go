@@ -5,6 +5,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -116,7 +117,7 @@ func registerTools(srv *mcp.Server, db store.Store) {
 		Description: "Delete a node from memory by ID.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args ForgetInput) (*mcp.CallToolResult, ForgetOutput, error) {
 		err := db.DeleteNode(ctx, args.ID)
-		if err == store.ErrNotFound {
+		if errors.Is(err, store.ErrNotFound) {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: `{"status":"not_found"}`}},
 			}, ForgetOutput{Status: "not_found"}, nil
