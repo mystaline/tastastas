@@ -8,6 +8,8 @@ import (
 	"flag"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
 	mcpserver "github.com/mystaline-dev/tastastas/internal/mcp"
 	sqlitestore "github.com/mystaline-dev/tastastas/internal/store/sqlite"
@@ -15,7 +17,7 @@ import (
 )
 
 func main() {
-	serve := flag.Bool("serve", false, "run as HTTP server instead of stdio MCP")
+	serve := flag.String("serve", "", "run as HTTP server on given address (e.g. :8080)")
 	dbPath := flag.String("db", "memory.db", "path to SQLite database file")
 	embedDim := flag.Int("embed-dim", 384, "embedding vector dimension (must match your embedder)")
 	flag.Parse()
@@ -26,9 +28,14 @@ func main() {
 	}
 	defer db.Close()
 
-	if *serve {
-		// Phase 6: HTTP server mode — stub for now.
-		log.Fatal("--serve: HTTP mode not yet implemented (coming in Phase 6)")
+	if *serve != "" {
+		// HTTP server mode
+		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer cancel()
+		if err := mcpserver.ServeHTTP(ctx, db, *serve); err != nil && err != context.Canceled {
+			log.Fatalf("HTTP server: %v", err)
+		}
+		return
 	}
 
 	// Stdio MCP server mode (default)
