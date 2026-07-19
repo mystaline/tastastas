@@ -60,16 +60,13 @@ type IngestOutput struct {
 }
 
 type CheckImpactInput struct {
-	ChangedID string `json:"changed_id"`
-	MaxDepth  int    `json:"max_depth,omitempty"`
+	ID       string `json:"id"`
+	MaxDepth int    `json:"max_depth,omitempty"`
 }
 type CheckImpactOutput struct {
-	ChangedID string      `json:"changed_id"`
-	StaleCount int        `json:"stale_count"`
-	Stale     []StaleItem `json:"stale"`
+	StaleNodes []StaleNode `json:"stale_nodes"`
 }
-type StaleItem struct {
+type StaleNode struct {
 	ID       string `json:"id"`
 	NodeType string `json:"node_type"`
-	Status   string `json:"status"`
 }

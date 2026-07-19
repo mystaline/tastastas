@@ -4,8 +4,6 @@ package mcp
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -201,15 +199,15 @@ func registerTools(srv *mcp.Server, db store.Store) {
 		if maxDepth == 0 {
 			maxDepth = 2
 		}
-		stale, err := db.MarkStaleDownstream(ctx, args.ChangedID, maxDepth)
+		stale, err := db.MarkStaleDownstream(ctx, args.ID, maxDepth)
 		if err != nil {
 			return errorResult(err), CheckImpactOutput{}, nil
 		}
-		items := make([]StaleItem, 0, len(stale))
+		items := make([]StaleNode, 0, len(stale))
 		for _, n := range stale {
-			items = append(items, StaleItem{ID: n.ID, NodeType: n.NodeType, Status: n.Status})
+			items = append(items, StaleNode{ID: n.ID, NodeType: n.NodeType})
 		}
-		out := CheckImpactOutput{ChangedID: args.ChangedID, StaleCount: len(items), Stale: items}
+		out := CheckImpactOutput{StaleNodes: items}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
 		}, out, nil
@@ -223,14 +221,6 @@ func errorResult(err error) *mcp.CallToolResult {
 		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf(`{"error":"%s"}`, strings.ReplaceAll(err.Error(), `"`, `\"`))}},
 		IsError: true,
 	}
-}
-
-func genULID() string {
-	var b [10]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "0000000000"
-	}
-	return hex.EncodeToString(b[:])
 }
 
 func marshalJSON(v any) string {
