@@ -13,11 +13,12 @@ slipped through earlier). Need:
       full remember→recall→link→check_impact→forget sequence. Caught a real
       bug on first run: `forget`'s not-found check used bare `==` against a
       wrapped error, always false — fixed with `errors.Is`. (commit `38dc5be`)
-- [ ] HTTP: real `net/http` client against a real listening socket, hit
-      `/mcp`, `/ingest/{adapter}`, health/webhook endpoints
+- [x] HTTP: real `net/http` client against a real listening socket, hit
+      `/mcp`, `/ingest/{adapter}`, health/webhook endpoints —
+      `internal/e2e/http_test.go`, two tests: (1) health + webhook
+      REST wire shapes, (2) full tool sequence over StreamableClientTransport.
 - Floor: one test per transport. Target: one full multi-tool-call sequence
-  per transport (remember→recall→link→check_impact→forget). stdio floor+target
-  both met; HTTP not started.
+  per transport (remember→recall→link→check_impact→forget). Both met.
 
 ## 2. `-race` coverage
 Never run in this repo. `go test -race ./...` needs to actually execute.
