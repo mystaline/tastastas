@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	_ "modernc.org/sqlite"
+	_ "modernc.org/sqlite/vec"
+
 	"github.com/mystaline-dev/tastastas/internal/ingest/docwalk"
 	sqlitestore "github.com/mystaline-dev/tastastas/internal/store/sqlite"
 )

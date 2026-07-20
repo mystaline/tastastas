@@ -19,6 +19,9 @@ import (
 	"testing"
 	"time"
 
+	_ "modernc.org/sqlite"
+	_ "modernc.org/sqlite/vec"
+
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	mcpserver "github.com/mystaline-dev/tastastas/internal/mcp"
 	sqlitestore "github.com/mystaline-dev/tastastas/internal/store/sqlite"
@@ -129,8 +132,7 @@ func TestE2EHTTPHealthAndIngest(t *testing.T) {
 	}
 }
 
-// TestE2EHTTPMCPToolSequence drives the same remember->recall->link->
-// check_impact->forget sequence as the stdio E2E test, but over real
+// TestE2EHTTPMCPToolSequence drives the same remember->recall->link->check_impact->forget sequence as the stdio E2E test, but over real
 // MCP-over-HTTP (Streamable HTTP transport) against a real listening
 // socket — the third and last transport surface this repo exposes.
 func TestE2EHTTPMCPToolSequence(t *testing.T) {

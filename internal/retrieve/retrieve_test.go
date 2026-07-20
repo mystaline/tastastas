@@ -5,6 +5,9 @@ import (
 	"testing"
 	"time"
 
+	_ "modernc.org/sqlite"
+	_ "modernc.org/sqlite/vec"
+
 	"github.com/mystaline-dev/tastastas/internal/store"
 	"github.com/mystaline-dev/tastastas/internal/store/sqlite"
 )
@@ -22,7 +25,6 @@ func seedGraph(t *testing.T, st store.Store, ctx context.Context) {
 			Content: "ERD for coupon module with CouponCode and Redemption tables.", Importance: 0.5, UpdatedAt: now},
 		{ID: "test/coupon-redeem", ProjectID: "test", NodeType: "test-case", Title: "Coupon Redeem Tests",
 			Content: "E2E tests for coupon redeem flow including edge cases.", Importance: 0.4, UpdatedAt: now},
-		// Old fact — should have lower recency score
 		{ID: "fact/old", ProjectID: "test", NodeType: "fact", Title: "Old Fact",
 			Content: "An old fact about the coupon system that was relevant months ago.", Importance: 0.9,
 			UpdatedAt: now, CreatedAt: "2025-01-01T00:00:00.000Z"},
@@ -56,23 +58,23 @@ func TestRecallWithScoring(t *testing.T) {
 	seedGraph(t, st, ctx)
 
 	r := New(st, DefaultConfig())
-	results, err := r.Recall(ctx, "test", "coupon", 10)
+	result, err := r.Recall(ctx, RecallParams{ProjectID: "test", Query: "coupon", Limit: 10})
 	if err != nil {
 		t.Fatalf("Recall: %v", err)
 	}
-	if len(results) == 0 {
+	if len(result.Nodes) == 0 {
 		t.Fatal("expected at least 1 result")
 	}
 
 	t.Logf("Recall results (sorted by score):")
-	for _, s := range results {
-		t.Logf("  %s [score=%.4f] %s", s.Node.ID, s.Score, s.Node.Title)
+	for _, s := range result.Nodes {
+		t.Logf("  %s [score=%.4f] %s", s.ID, s.Score, s.Title)
 	}
 
-	// Highest importance node should score highest (both are recent)
-	if results[0].Node.Importance < results[len(results)-1].Importance {
+	if result.Nodes[0].Importance < result.Nodes[len(result.Nodes)-1].Importance {
 		t.Errorf("results not sorted by score: top=%s (%.2f) < bottom=%s (%.2f)",
-			results[0].Node.ID, results[0].Score, results[len(results)-1].Node.ID, results[len(results)-1].Score)
+			result.Nodes[0].ID, result.Nodes[0].Score,
+			result.Nodes[len(result.Nodes)-1].ID, result.Nodes[len(result.Nodes)-1].Score)
 	}
 }
 
@@ -89,24 +91,22 @@ func TestRecallPullsInNeighbors(t *testing.T) {
 		RecencyHalfLife: 7 * 24 * time.Hour,
 		NeighborDepth:   1,
 		MaxResults:      20,
+		Alpha:           1.0, // lexical-only for deterministic test
 	})
-	results, err := r.Recall(ctx, "test", "coupon", 10)
+	result, err := r.Recall(ctx, RecallParams{ProjectID: "test", Query: "coupon", Limit: 10})
 	if err != nil {
 		t.Fatalf("Recall: %v", err)
 	}
 
-	// Should include pulled-in neighbors (api, erd, test) even if they
-	// didn't match the query directly, because they're neighbors of the PRD
 	ids := map[string]bool{}
-	for _, s := range results {
-		ids[s.Node.ID] = true
+	for _, s := range result.Nodes {
+		ids[s.ID] = true
 	}
 
-	// At minimum: PRD matched directly + at least 2 of its neighbors pulled in
 	directHits := 0
 	pulledIn := 0
-	for _, s := range results {
-		if s.Node.NodeType == "prd" || s.Node.NodeType == "fact" {
+	for _, s := range result.Nodes {
+		if s.NodeType == "prd" || s.NodeType == "fact" {
 			directHits++
 		} else {
 			pulledIn++
@@ -121,19 +121,16 @@ func TestRecallPullsInNeighbors(t *testing.T) {
 func TestRecencyDecay(t *testing.T) {
 	r := New(nil, Config{RecencyHalfLife: 7 * 24 * time.Hour})
 
-	// Zero age = full score
 	d := r.recencyDecay(0)
 	if d != 1.0 {
 		t.Errorf("expected 1.0 for zero age, got %f", d)
 	}
 
-	// One half-life = 0.5
 	d = r.recencyDecay(7 * 24 * time.Hour)
 	if d < 0.49 || d > 0.51 {
 		t.Errorf("expected ~0.5 at one half-life, got %f", d)
 	}
 
-	// Two half-lives = 0.25
 	d = r.recencyDecay(14 * 24 * time.Hour)
 	if d < 0.24 || d > 0.26 {
 		t.Errorf("expected ~0.25 at two half-lives, got %f", d)
@@ -149,13 +146,12 @@ func TestCheckImpact(t *testing.T) {
 	ctx := context.Background()
 	seedGraph(t, st, ctx)
 
-	// Update PRD content → should flag downstream nodes as stale
 	prd, err := st.GetNode(ctx, "prd/coupon-redeem")
 	if err != nil {
 		t.Fatalf("GetNode: %v", err)
 	}
 	prd.Content = "Updated: users can now stack multiple coupon codes per order."
-	prd.ContentHash = "" // force change
+	prd.ContentHash = ""
 	if err := st.UpsertNode(ctx, prd); err != nil {
 		t.Fatalf("UpsertNode update: %v", err)
 	}
@@ -170,7 +166,6 @@ func TestCheckImpact(t *testing.T) {
 		t.Logf("  %s [%s] status=%s", n.ID, n.NodeType, n.Status)
 	}
 
-	// api, erd, test should all be stale
 	staleIDs := map[string]bool{}
 	for _, n := range stale {
 		staleIDs[n.ID] = true
@@ -181,9 +176,6 @@ func TestCheckImpact(t *testing.T) {
 		}
 	}
 
-	// Regression: the returned Node.Status must actually say "stale", not
-	// just the DB row (old code mutated a for-range loop copy, leaving the
-	// returned slice's Status field at its pre-update value).
 	for _, n := range stale {
 		if n.Status != "stale" {
 			t.Errorf("node %s: returned Status = %q, want \"stale\"", n.ID, n.Status)
@@ -191,11 +183,6 @@ func TestCheckImpact(t *testing.T) {
 	}
 }
 
-// TestNeighborsWithConfidenceMatchesEdge is a regression test: the old
-// retrieve.go code assumed neighbors[i] was discovered by edges[i], which
-// is false (Neighbors' node order comes from Go map iteration, edges is a
-// flat BFS-order list of unrelated length/order). NeighborsWithConfidence
-// must return the ACTUAL confidence of the edge that discovered each node.
 func TestNeighborsWithConfidenceMatchesEdge(t *testing.T) {
 	st, err := sqlite.Open(context.Background(), ":memory:", 4)
 	if err != nil {

@@ -24,13 +24,13 @@ import (
 // not a test artifact. If someone adds a field, renames a tag, or removes
 // one, this test breaks with a clear diff showing exactly what changed.
 var expectedWireShapes = map[string][]string{
-	"remember":           {"id", "status"},
-	"recall":             {"results"},
-	"forget":             {"status"},
-	"link":               {"status"},
-	"check_impact":       {"stale_nodes"},
+	"remember":             {"id", "status"},
+	"recall":               {"results"},
+	"forget":               {"status"},
+	"link":                 {"status"},
+	"check_impact":         {"stale_nodes"},
 	"extract_and_remember": {"facts"},
-	"ingest":             {"edges_created", "nodes_ingested"},
+	"ingest":               {"chunks_created", "edges_created", "nodes_ingested"},
 }
 
 // jsonFields extracts the sorted set of json struct tag names from a type.
@@ -73,13 +73,13 @@ func indexOf(s string, c byte) int {
 // a clear message showing what changed.
 func TestOutputWireContract(t *testing.T) {
 	toolTypes := map[string]reflect.Type{
-		"remember":               reflect.TypeOf(mcpserver.RememberOutput{}),
-		"recall":                 reflect.TypeOf(mcpserver.RecallOutput{}),
-		"forget":                 reflect.TypeOf(mcpserver.ForgetOutput{}),
-		"link":                   reflect.TypeOf(mcpserver.LinkOutput{}),
-		"check_impact":           reflect.TypeOf(mcpserver.CheckImpactOutput{}),
-		"extract_and_remember":   reflect.TypeOf(mcpserver.ExtractAndRememberOutput{}),
-		"ingest":                 reflect.TypeOf(mcpserver.IngestOutput{}),
+		"remember":             reflect.TypeOf(mcpserver.RememberOutput{}),
+		"recall":               reflect.TypeOf(mcpserver.RecallOutput{}),
+		"forget":               reflect.TypeOf(mcpserver.ForgetOutput{}),
+		"link":                 reflect.TypeOf(mcpserver.LinkOutput{}),
+		"check_impact":         reflect.TypeOf(mcpserver.CheckImpactOutput{}),
+		"extract_and_remember": reflect.TypeOf(mcpserver.ExtractAndRememberOutput{}),
+		"ingest":               reflect.TypeOf(mcpserver.IngestOutput{}),
 	}
 
 	for tool, expected := range expectedWireShapes {

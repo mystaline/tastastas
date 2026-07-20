@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 
+	_ "modernc.org/sqlite"
+
 	"github.com/mystaline-dev/tastastas/internal/store"
 )
 

@@ -4,6 +4,9 @@ import (
 	"context"
 	"testing"
 
+	_ "modernc.org/sqlite"
+	_ "modernc.org/sqlite/vec"
+
 	"github.com/mystaline-dev/tastastas/internal/dedupe"
 	"github.com/mystaline-dev/tastastas/internal/embed"
 	"github.com/mystaline-dev/tastastas/internal/extract"

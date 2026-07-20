@@ -8,9 +8,15 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+
+	sitter "github.com/tree-sitter/go-tree-sitter"
+	golang "github.com/tree-sitter/tree-sitter-go/bindings/go"
+	ts "github.com/tree-sitter/tree-sitter-typescript/bindings/go"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/mystaline-dev/tastastas/internal/chunker"
 	"github.com/mystaline-dev/tastastas/internal/dedupe"
 	"github.com/mystaline-dev/tastastas/internal/embed"
 	"github.com/mystaline-dev/tastastas/internal/extract"
@@ -20,6 +26,16 @@ import (
 	"github.com/mystaline-dev/tastastas/internal/retrieve"
 	"github.com/mystaline-dev/tastastas/internal/store"
 )
+
+// goLanguage is lazily initialized — tree-sitter grammars require CGo
+// and their Language() returns unsafe.Pointer from C.
+var goLanguage = sync.OnceValue(func() *sitter.Language {
+	return sitter.NewLanguage(golang.Language())
+})
+
+var tsLanguage = sync.OnceValue(func() *sitter.Language {
+	return sitter.NewLanguage(ts.LanguageTypescript())
+})
 
 // NewServer creates an MCP server with all tastastas tools registered.
 // The store is injected by the caller (cmd/tastastas/main.go) — no
@@ -61,12 +77,12 @@ func registerTools(srv *mcp.Server, db store.Store) {
 		}
 
 		n := store.Node{
-			ID:          id,
-			NodeType:    nodeType,
-			Title:       args.Title,
-			Content:     args.Content,
-			ProjectID:   projectID,
-			Importance:  importance,
+			ID:            id,
+			NodeType:      nodeType,
+			Title:         args.Title,
+			Content:       args.Content,
+			ProjectID:     projectID,
+			Importance:    importance,
 			SourceAdapter: "mcp",
 		}
 		if err := db.UpsertNode(ctx, n); err != nil {
@@ -77,10 +93,11 @@ func registerTools(srv *mcp.Server, db store.Store) {
 		}, RememberOutput{ID: id, Status: "stored"}, nil
 	})
 
-	// Tool 2: recall (Phase 5: real scoring with recency + graph pull-in)
+	// Tool 2: recall (Phase 5/6: real scoring with recency + graph pull-in,
+	// now with Phase B vector fusion when embedding is available).
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "recall",
-		Description: "Search memory by lexical query. Returns scored results using relevance * recency * importance, with graph-neighbor pull-in for context enrichment.",
+		Description: "Search memory by query. Flexes lexical (FTS5) or fused lexical+vector scoring depending on whether an embedder is configured. Returns scored results with graph-neighbor pull-in for context enrichment.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args RecallInput) (*mcp.CallToolResult, RecallOutput, error) {
 		projectID := args.ProjectID
 		if projectID == "" {
@@ -91,21 +108,39 @@ func registerTools(srv *mcp.Server, db store.Store) {
 			limit = 10
 		}
 
-		scored, err := retriever.Recall(ctx, projectID, args.Query, limit)
+		params := retrieve.RecallParams{
+			ProjectID: projectID,
+			Query:     args.Query,
+			Limit:     limit,
+		}
+
+		// If embedder is available, embed the query for vector fusion.
+		if embedder != nil {
+			vec, err := embedder.Embed(ctx, args.Query)
+			if err == nil {
+				params.Embedding = vec
+			}
+			// If embedding fails, proceed lexical-only — graceful degradation.
+		}
+
+		result, err := retriever.Recall(ctx, params)
 		if err != nil {
 			return errorResult(err), RecallOutput{}, nil
 		}
 
-		items := make([]RecallItem, 0, len(scored))
-		for _, s := range scored {
+		items := make([]RecallItem, 0, len(result.Nodes))
+		for _, s := range result.Nodes {
 			items = append(items, RecallItem{
-				ID:       s.Node.ID,
-				Title:    s.Node.Title,
-				Content:  s.Node.Content,
-				NodeType: s.Node.NodeType,
+				ID:       s.ID,
+				Title:    s.Title,
+				Content:  s.Content,
+				NodeType: s.NodeType,
 				Score:    s.Score,
 			})
 		}
+		// TODO: expose result.Chunks in RecallOutput when RecallItem gains ChunkItems.
+		_ = result.Chunks
+
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(items)}},
 		}, RecallOutput{Results: items}, nil
@@ -177,7 +212,34 @@ func registerTools(srv *mcp.Server, db store.Store) {
 			}
 		}
 
-		out := IngestOutput{NodesIngested: len(nodes), EdgesCreated: len(edges)}
+		// Chunk and embed ingested nodes if embedder is available
+		chunkCount := 0
+		if embedder != nil {
+			var allChunks []store.Chunk
+			goLang := goLanguage()
+			tsLang := tsLanguage()
+			for _, n := range nodes {
+				chunks := chunkForNode(n, chunker.DefaultConfig(), goLang, tsLang)
+				for _, c := range chunks {
+					vec, err := embedder.Embed(ctx, c.Content)
+					if err != nil {
+						// Log but continue
+						fmt.Printf("embed chunk %s: %v\n", c.ID, err)
+						continue
+					}
+					c.Embedding = vec
+					allChunks = append(allChunks, c)
+				}
+			}
+			if len(allChunks) > 0 {
+				if err := db.UpsertChunks(ctx, allChunks); err != nil {
+					return errorResult(err), IngestOutput{}, nil
+				}
+				chunkCount = len(allChunks)
+			}
+		}
+
+		out := IngestOutput{NodesIngested: len(nodes), EdgesCreated: len(edges), ChunksCreated: chunkCount}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
 		}, out, nil
@@ -321,7 +383,9 @@ func runIngestAdapter(adapter, root, configPath, projectID string) ([]store.Node
 
 func errorResult(err error) *mcp.CallToolResult {
 	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf(`{"error":"%s"}`, strings.ReplaceAll(err.Error(), `"`, `\"`))}},
+		Content: []mcp.Content{
+			&mcp.TextContent{Text: fmt.Sprintf(`{"error":"%s"}`, strings.ReplaceAll(err.Error(), `"`, `\"`))},
+		},
 		IsError: true,
 	}
 }

@@ -13,6 +13,9 @@ import (
 	"testing"
 	"time"
 
+	_ "modernc.org/sqlite"
+	_ "modernc.org/sqlite/vec"
+
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 

@@ -14,12 +14,14 @@ CREATE TABLE IF NOT EXISTS nodes (
     source_adapter TEXT NOT NULL DEFAULT '', -- gitrepo, obsidian, docwalk, conversation, manual
     source_path   TEXT NOT NULL DEFAULT '',
     importance    REAL NOT NULL DEFAULT 0.5, -- 0..1, used in retrieval scoring
+    language      TEXT NOT NULL DEFAULT '',  -- programming language for code files (go, python, etc.)
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_nodes_project_type ON nodes(project_id, node_type);
 CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);
+CREATE INDEX IF NOT EXISTS idx_nodes_language ON nodes(language);
 
 CREATE TABLE IF NOT EXISTS edges (
     from_id     TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,

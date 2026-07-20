@@ -12,6 +12,9 @@ import (
 	"os/signal"
 	"syscall"
 
+	_ "modernc.org/sqlite"
+	_ "modernc.org/sqlite/vec"
+
 	mcpserver "github.com/mystaline-dev/tastastas/internal/mcp"
 	sqlitestore "github.com/mystaline-dev/tastastas/internal/store/sqlite"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
