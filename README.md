@@ -1,220 +1,206 @@
 # tastastas
 
-Agentic memory engine: a typed graph+vector+lexical hybrid store for AI
-agents, with automatic conversation-derived memory, pluggable document
-ingestion (git repos, Obsidian vaults, structured doc trees like
-PRD/API-spec/ERD/test-case sets), and cross-doc/cross-service
-**change-impact detection** — when a doc or service changes, tastastas tells
-you what else might now be stale.
+**Agentic memory for AI agents.** Typed graph + vector + lexical hybrid
+store, single Go binary, SQLite, runs fully offline.
 
-Single Go binary. SQLite by default. Runs fully offline. No accounts, no
-tenancy, no server required unless you want one.
+> Store facts, recall them by relevance/recency/importance, and get
+> automatic "this might be stale now" alerts when connected docs change.
 
 ## Why not just RAG
 
-Flat chunk+cosine retrieval has no entity identity (same fact re-embedded and
-duplicated), no decay, and no graph structure — it can't answer "what connects
-to X" or "what's now stale because Y changed." tastastas keeps typed nodes and
-typed edges (`implements`, `tests`, `specifies`, `depends-on`, ...) so recall
-is `relevance * recency * importance`, not just top-k similarity, and doc/graph
-changes propagate a "possibly stale" signal to connected nodes automatically.
+Flat chunk+cosine retrieval can't tell two mentions of the same fact apart,
+doesn't decay, and has no graph — it can't answer "what connects to X" or
+"what's stale because Y changed." tastastas keeps typed nodes/edges so
+recall = `relevance * recency * importance`, and changes propagate a
+"possibly stale" flag to connected docs automatically.
 
-## Quickstart
-
-Requires a local [Ollama](https://ollama.com) for extraction/embedding tools
-(`remember`/`recall`/`link`/`forget`/`ingest`/`check_impact` work with zero
-LLM dependency; only `extract_and_remember` needs Ollama).
+## Install & run
 
 ```bash
 go build -o tastastas ./cmd/tastastas
 
-# stdio mode (default) — for embedding into an MCP client (Claude Desktop,
-# Claude Code, any MCP-compatible agent). Point your MCP client config at
-# the compiled binary; it speaks MCP over stdin/stdout.
+# stdio — for MCP clients (Claude Desktop, Claude Code, any MCP agent)
 ./tastastas --db memory.db --embed-dim 768
 
-# HTTP mode — shared team instance + webhook ingestion.
+# HTTP — shared team instance + webhook ingestion
 ./tastastas --db memory.db --embed-dim 768 --serve :8080
 ```
 
-`--embed-dim` must match your embedder's output dimension (768 for
-`nomic-embed-text`, 384 for many `sentence-transformers` models). Vectors of
-the wrong dimension are rejected at insert time.
+`--embed-dim` must match your embedder (768 = `nomic-embed-text`, 384 =
+many `sentence-transformers`). Wrong-dim vectors are rejected at insert.
 
-### Point it at a doc tree
+Everything works with zero external dependencies except
+`extract_and_remember`, which needs a local [Ollama](https://ollama.com).
+
+## First run (5 minutes, from fresh clone)
+
+### What you actually need
+
+| Thing | Why | Mandatory? |
+|---|---|---|
+| Go 1.23+ | builds the binary | Yes |
+| [Ollama](https://ollama.com) | only for `extract_and_remember` tool; the other 6 tools (remember, recall, forget, link, ingest, check_impact) work without it | **No** — skip if you don't need LLM fact extraction |
+| 768-dim embedding model in Ollama (e.g. `nomic-embed-text`) | only for `extract_and_remember`'s dedupe step; `recall` uses FTS5 (lexical), not vectors | **No** — skip same as above |
+
+### Steps with explanations
+
+**1. Build the binary** (mandatory)
 
 ```bash
-# via HTTP
-curl -X POST localhost:8080/ingest/docwalk \
-  -d '{"root": "/path/to/docs", "config_path": ".memoryrc.yaml", "project_id": "my-project"}'
-
-# or via the "ingest" MCP tool from your agent client, same fields
+git clone <your-fork-or-this-repo>
+cd tastastas
+go build -o tastastas ./cmd/tastastas
 ```
 
-### Recall
+*This compiles everything into a single `tastastas` binary. Nothing else to install.*
+
+**2. Start the server** (mandatory — the whole thing runs as a server)
+
+Pick one mode:
+
+```bash
+# HTTP mode (easiest for trying things — you can curl it from another terminal)
+./tastastas --db memory.db --embed-dim 768 --serve :8080
+# Keep this terminal open. The server logs here.
+
+# OR: stdio mode (for connecting your MCP client — Claude Desktop, Claude Code, etc.)
+./tastastas --db memory.db --embed-dim 768
+# No port. This talks MCP over stdin/stdout — point your client config at this binary.
+```
+
+*Why two modes? HTTP mode lets you hit it with curl to try things. Stdio mode is how an AI agent connects to it — no port, no network, just pipes. You don't need both; pick one for now.*
+
+**3. Check it's alive** (skippable — just confirmation)
+
+```bash
+curl -s localhost:8080/health
+# → {"status":"ok","version":"0.1.0"}
+```
+
+*If you see this, the server is running. (Stdio mode has no health endpoint — it's alive if your MCP client connected.)*
+
+**4. Give it some content** (mandatory if you want something to search)
+
+```bash
+curl -s -X POST localhost:8080/ingest/docwalk \
+  -d '{"root": "/path/to/your/docs", "project_id": "my-project"}'
+# → {"nodes_ingested":118,"edges_created":0}
+```
+
+*This walks a folder, reads every markdown file, and stores each one as a searchable node. `project_id` is just a namespace — think "which project does this content belong to." No config file needed; without one, everything becomes a generic doc (still fully searchable).*
+
+*If your docs are structured (PRD/API spec/ERD folders with a naming convention), add a `.memoryrc.yaml` config to get typed nodes + automatic cross-linking. See [Ingesting docs](#ingesting-docs) below.*
+
+**5. Search it** (the payoff)
+
+```bash
+# First, initialize an MCP session — this is how the MCP protocol works.
+# You get back a session ID you reuse for all follow-up calls.
+curl -s -i -X POST localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"demo","version":"1.0"}}}'
+# → look for "Mcp-Session-Id: <some-long-string>" in the response headers
+#   copy that string
+
+SESSION="<paste-it-here>"
+
+# Now ask a question
+curl -s -X POST localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Mcp-Session-Id: $SESSION" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"recall","arguments":{"project_id":"my-project","query":"your search terms"}}}'
+# → returns scored results (title, content, node_type, score)
+```
+
+*Why the session dance? This is MCP (Model Context Protocol) — the standard way AI agents talk to tools. Every call after `initialize` reuses the same session ID. If you connect tastastas to an MCP client (next section), the client handles all of this for you — you just talk to your agent normally.*
+
+### Skip the HTTP dance entirely — connect an MCP client
+
+If you have Claude Desktop or Claude Code, add this to your MCP config:
+
+```json
+{
+  "mcpServers": {
+    "tastastas": {
+      "command": "/full/path/to/tastastas",
+      "args": ["--db", "memory.db", "--embed-dim", "768"]
+    }
+  }
+}
+```
+
+Restart your client. Now just talk to your agent normally:
+
+> "remember I prefer dark mode"
+
+> "recall what you know about coupon redemption"
+
+> "ingest my project docs from ~/Workspace/my-project"
+
+No curl, no session IDs, no JSON-RPC — the client handles it.
+
+## The 7 tools
+
+| Tool | Does | Needs Ollama? |
+|---|---|---|
+| `remember` | Store/update a fact directly | No |
+| `recall` | Search by relevance × recency × importance | No |
+| `forget` | Delete by ID | No |
+| `link` | Connect two nodes with a typed edge | No |
+| `ingest` | Pull in a doc tree (docwalk / gitrepo / obsidian) | No |
+| `check_impact` | "What's now stale because this changed?" | No |
+| `extract_and_remember` | Pull facts out of raw conversation text | **Yes** |
+
+Ask your MCP-connected agent things like "remember I prefer dark mode" or
+"recall what you know about coupon redemption" — it calls the tools for you.
+Or hit them directly:
 
 ```bash
 curl -X POST localhost:8080/mcp -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"recall","arguments":{"project_id":"my-project","query":"coupon redemption"}}}'
 ```
 
-Or just ask your MCP-connected agent to "recall what you know about coupon
-redemption" — it calls the tool for you.
+## Ingesting docs
 
-## Architecture
+Three adapters — point one at a folder and it becomes searchable memory:
 
-```
-                    ┌─────────────────────────┐
-  MCP client  ──────▶  stdio or /mcp (HTTP)    │
- (agent/IDE)         │  7 tools: remember,      │
-                    │  recall, forget, link,   │
-                    │  ingest, check_impact,   │
-                    │  extract_and_remember    │
-                    └────────────┬─────────────┘
-                                 │
-        ┌────────────────────────┼────────────────────────┐
-        │                        │                        │
-  ┌─────▼─────┐          ┌───────▼──────┐         ┌───────▼───────┐
-  │  extract   │          │   retrieve   │         │  dedupe/embed  │
-  │ (Ollama    │          │ (relevance × │         │ (cosine sim on │
-  │  LLM call) │          │  recency ×   │         │  nomic-embed-  │
-  │            │          │  importance, │         │  text vectors) │
-  │            │          │  N-hop graph │         │                │
-  │            │          │  pull-in)    │         │                │
-  └─────┬──────┘          └───────┬──────┘         └───────┬────────┘
-        │                         │                        │
-        └────────────────┬────────┴────────────┬───────────┘
-                          │                     │
-                   ┌──────▼─────────────────────▼──────┐
-                   │   store (SQLite: FTS5 + sqlite-vec) │
-                   │   nodes (typed) + edges (typed)     │
-                   └──────┬───────────────────────────────┘
-                          │
-        ┌──────────────────┼──────────────────┐
-        │                  │                  │
-  ┌─────▼─────┐    ┌───────▼──────┐    ┌──────▼───────┐
-  │  docwalk   │    │   gitrepo    │    │   obsidian    │
-  │ (structured │    │ (MEMORY.md   │    │ (frontmatter  │
-  │  doc trees, │    │  files)      │    │  + wikilinks) │
-  │  PRD/API/   │    │              │    │               │
-  │  ERD/...)   │    │              │    │               │
-  └─────────────┘    └──────────────┘    └───────────────┘
+- **`docwalk`** — structured doc trees (PRD/APISpec/ERD/...) via a
+  `.memoryrc.yaml` glob→type config. Auto cross-links same-feature docs.
+- **`gitrepo`** — walks a tree for `MEMORY.md`-style files.
+- **`obsidian`** — vault frontmatter + `[[wikilinks]]` become typed nodes/edges.
+
+```bash
+curl -X POST localhost:8080/ingest/docwalk \
+  -d '{"root": "/path/to/docs", "config_path": ".memoryrc.yaml", "project_id": "my-project"}'
 ```
 
-**Store**: typed nodes (fact, entity, prd, api-spec, erd, test-case,
-generic-doc, ...) and typed directed edges (`implements`, `tests`,
-`specifies`, `depends-on`, `related`, ...). Backed by SQLite: FTS5 for
-lexical search, `sqlite-vec` for cosine similarity, both pure-Go
-(`modernc.org/sqlite`, no cgo).
-
-**Retrieve**: `recall` scores candidates by
-`relevance * recency_decay(2^(-age/halfLife)) * importance`, then pulls in
-N-hop graph neighbors with an edge-confidence boost — so recalling one fact
-also surfaces what it's connected to.
-
-**Change impact**: `check_impact` walks outgoing edges of impact-bearing
-types (`implements`, `tests`, `specifies`, `depends-on`) from a changed node
-and marks reachable nodes `status: stale` — the automatic "what might now be
-wrong" signal.
-
-**Dedup**: `extract_and_remember` embeds each extracted fact, cosine-searches
-existing nodes of the same kind in the project, and merges (reuses the
-existing ID) above a calibrated similarity threshold instead of inserting a
-duplicate. See `internal/dedupe/dedupe.go`'s package doc for the empirical
-calibration this threshold is derived from.
-
-## MCP tools
-
-| Tool | Purpose | Ollama required? |
-|---|---|---|
-| `remember` | Store/update a fact or entity directly (explicit content, no LLM) | No |
-| `recall` | Lexical search with relevance × recency × importance scoring + graph pull-in | No |
-| `forget` | Delete a node by ID | No |
-| `link` | Create a typed, directed edge between two nodes | No |
-| `ingest` | Ingest documents from a filesystem root via a named adapter | No |
-| `check_impact` | Mark downstream nodes stale after a change | No |
-| `extract_and_remember` | Extract facts from raw conversation text, dedupe, store | **Yes** |
-
-## Ingestion adapters
-
-- **`docwalk`** — structured doc trees matching a configurable glob→type
-  mapping (e.g. `{Module}/PRD/{feature}/*.md`, `{Module}/APISpec/*.md`, ...).
-  Config: `.memoryrc.yaml` (see `internal/ingest/docwalk/testdata/acme-style/.memoryrc.yaml`
-  for a worked example). Cross-links same-feature docs automatically via a
-  named regex capture group.
-- **`gitrepo`** — walks a directory tree for `MEMORY.md` files (or a
-  configurable glob), skipping `.git`/`node_modules`.
-- **`obsidian`** — Obsidian vault: YAML frontmatter + `[[wikilink]]` edge
-  extraction.
-
-## `.memoryrc.yaml` config reference (docwalk adapter)
+`.memoryrc.yaml` example:
 
 ```yaml
 project_id: my-project
 mappings:
-  - path_glob: "*/PRD/**/*.md"        # glob relative to ingest root
-    type: prd                          # node_type assigned to matches
-    group_by: "^[^/]+/PRD/(?P<feature>[^/]+)/"  # optional: named regex
-                                        # group used to cross-link docs
-                                        # sharing the same feature slug
+  - path_glob: "*/PRD/**/*.md"
+    type: prd
+    group_by: "^[^/]+/PRD/(?P<feature>[^/]+)/"   # cross-links same-feature docs
   - path_glob: "*/APISpec/*.md"
     type: api-spec
     group_by: "^[^/]+/APISpec/(?P<feature>[^.]+)\\.md$"
 ```
 
-Every mapping's matched files become nodes of `type`; files sharing the same
-`group_by` capture across different `type`s get cross-linked with an
-impact-bearing edge automatically (e.g. a PRD and its API spec for the same
-feature).
-
-## HTTP server mode
+## HTTP routes (`--serve` mode)
 
 ```
-POST /mcp                     — MCP protocol over Streamable HTTP
-POST /ingest/{adapter}        — REST ingest: {"root", "config_path", "project_id"}
-POST /ingest/webhook          — generic doc-push: {"path", "content", "project_id", ...}
-GET  /health                  — {"status": "ok", "version": "0.1.0"}
+POST /mcp                — MCP protocol (Streamable HTTP)
+POST /ingest/{adapter}    — {"root", "config_path", "project_id"}
+POST /ingest/webhook      — {"path", "content", "project_id", ...}
+GET  /health              — {"status": "ok", "version": "0.1.0"}
 ```
-
-## Development
-
-```bash
-go vet ./... && go build ./... && go test ./... -count=1   # unit + integration
-go test ./... -race -count=1                                # race detector
-golangci-lint run ./...                                     # lint (errorlint,
-                                                              # gocritic, etc.)
-go test ./internal/e2e/... -v -count=1                       # E2E: spawns the
-                                                              # real binary,
-                                                              # speaks real
-                                                              # MCP wire
-                                                              # protocol
-                                                              # (stdio + HTTP)
-```
-
-Requires local Ollama for the `extract_and_remember` integration test and the
-E2E suite's tool-sequence tests (`qwen3.5:2b-q4_K_M` or similar for
-extraction, `nomic-embed-text` for embeddings). Other tests need no external
-services.
-
-## Roadmap
-
-- **pgvector backend** — optional Postgres store for teams already running
-  Postgres, as an alternative to SQLite. Not required for OSS/solo use.
-- **Kuzu backend** — optional embedded graph DB for larger graphs where
-  SQLite's edge-walk queries become the bottleneck. Not required for OSS use.
-- **Auth (opt-in)** — HTTP server mode currently has no auth layer; fine for
-  a trusted local network or single-tenant internal deployment, not yet
-  suitable for exposing publicly. Explicitly deferred: not required for the
-  primary solo/offline and trusted-team use cases this v0.1.0 targets.
-- **Larger dedup calibration corpus** — current threshold (`internal/dedupe`)
-  is derived from a real but small sample (22 facts, one project, one
-  author); re-calibrate against a larger, more diverse real-conversation
-  corpus as usage grows.
 
 ## Status
 
-v0.1.0 — functional: all 7 MCP tools, 3 ingestion adapters, stdio + HTTP
-transport, retrieval scoring, change-impact detection, extract+dedupe
-pipeline. See `tasks.md` for what's still open beyond this release.
+v0.1.0 — functional. See `DEVELOPMENT.md` for architecture, dev/verify
+commands, and roadmap. `tasks.md` tracks what's open past this release.
 
 ## License
 

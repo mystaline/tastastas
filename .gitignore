@@ -7,3 +7,4 @@ prototype/.venv/
 prototype/**/.ipynb_checkpoints/
 __pycache__/
 .env
+tastastas
