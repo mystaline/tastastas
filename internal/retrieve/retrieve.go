@@ -47,6 +47,11 @@ type Config struct {
 
 	// MaxChunks caps the number of chunk results returned. Default: 5.
 	MaxChunks int
+
+	// CrossSourceThreshold is the minimum cosine similarity between two
+	// chunks from different source adapters to surface as an implicit
+	// semantic link. Default: 0.85.
+	CrossSourceThreshold float64
 }
 
 // DefaultConfig returns sensible defaults.
@@ -59,6 +64,7 @@ func DefaultConfig() Config {
 		Alpha:           0.4,
 		IncludeChunks:   true,
 		MaxChunks:       5,
+		CrossSourceThreshold: 0.85,
 	}
 }
 
@@ -70,10 +76,20 @@ type RecallParams struct {
 	Limit     int
 }
 
-// RecallResult groups nodes and chunks returned by Recall.
+// ImplicitLink represents a cross-source semantic link between two chunks
+// whose embeddings have cosine similarity above a threshold but share no
+// explicit graph edge. Surfaces as metadata in recall results.
+type ImplicitLink struct {
+	FromChunkID string  `json:"from_chunk_id"`
+	ToChunkID   string  `json:"to_chunk_id"`
+	Cosine      float64 `json:"cosine"`
+}
+
+// RecallResult groups nodes, chunks, and implicit links returned by Recall.
 type RecallResult struct {
-	Nodes  []ScoredNode
-	Chunks []store.ScoredChunk
+	Nodes  []ScoredNode      `json:"nodes"`
+	Chunks []store.ScoredChunk `json:"chunks"`
+	Links  []ImplicitLink    `json:"links,omitempty"`
 }
 
 // ScoredNode is a node with its computed retrieval score.
@@ -101,6 +117,9 @@ func New(st store.Store, cfg Config) *Retriever {
 	}
 	if cfg.MaxChunks == 0 {
 		cfg.MaxChunks = 5
+	}
+	if cfg.CrossSourceThreshold == 0 {
+		cfg.CrossSourceThreshold = 0.85
 	}
 	return &Retriever{store: st, cfg: cfg}
 }
@@ -232,7 +251,14 @@ func (r *Retriever) Recall(ctx context.Context, params RecallParams) (*RecallRes
 		}
 	}
 
-	return &RecallResult{Nodes: scored, Chunks: chunkResults}, nil
+	// 8. Cross-source implicit links: compare chunks pairwise by cosine
+	// similarity when they come from different source adapters.
+	var links []ImplicitLink
+	if len(chunkResults) > 1 {
+		links = findCrossSourceLinks(chunkResults, r.cfg.CrossSourceThreshold)
+	}
+
+	return &RecallResult{Nodes: scored, Chunks: chunkResults, Links: links}, nil
 }
 
 // fuseScore combines lexical relevance and vector cosine similarity.
@@ -293,4 +319,102 @@ func sortByScore(s []ScoredNode) {
 		}
 		s[j+1] = key
 	}
+}
+
+// findCrossSourceLinks compares chunk embeddings pairwise and returns
+// implicit links for chunks from different source adapters whose cosine
+// similarity exceeds the threshold.
+func findCrossSourceLinks(chunks []store.ScoredChunk, threshold float64) []ImplicitLink {
+	if len(chunks) < 2 {
+		return nil
+	}
+
+	// Group chunks by source adapter (derived from ParentNodeID prefix)
+	sourceOf := func(id string) string {
+		// Chunk IDs are parent_node_id/chunk_N; parent_node_id pattern:
+		// project/adapter/path...  e.g. "default/docwalk/README.md",
+		// "default/gitrepo/cmd/main.go", "default/obsidian/note.md"
+		parts := splitN(id, "/", 3)
+		if len(parts) >= 2 {
+			return parts[1] // adapter name
+		}
+		return "unknown"
+	}
+
+	type idxVec struct {
+		idx  int
+		vec  []float32
+		src  string
+	}
+	items := make([]idxVec, 0, len(chunks))
+	for i, c := range chunks {
+		if len(c.Embedding) == 0 {
+			continue
+		}
+		src := sourceOf(c.ParentNodeID)
+		items = append(items, idxVec{idx: i, vec: c.Embedding, src: src})
+	}
+
+	var links []ImplicitLink
+	for i := 0; i < len(items); i++ {
+		for j := i + 1; j < len(items); j++ {
+			a, b := items[i], items[j]
+			if a.src == b.src {
+				continue // same adapter — not cross-source
+			}
+			cos := cosineSimilarity(a.vec, b.vec)
+			if cos < threshold {
+				continue
+			}
+			links = append(links, ImplicitLink{
+				FromChunkID: chunks[a.idx].ID,
+				ToChunkID:   chunks[b.idx].ID,
+				Cosine:      cos,
+			})
+		}
+	}
+	return links
+}
+
+// splitN splits s by sep and returns at most n parts.
+func splitN(s, sep string, n int) []string {
+	parts := make([]string, 0, n)
+	rest := s
+	for i := 0; i < n-1; i++ {
+		idx := indexOf(rest, sep)
+		if idx < 0 {
+			parts = append(parts, rest)
+			return parts
+		}
+		parts = append(parts, rest[:idx])
+		rest = rest[idx+len(sep):]
+	}
+	parts = append(parts, rest)
+	return parts
+}
+
+func indexOf(s, sep string) int {
+	for i := 0; i <= len(s)-len(sep); i++ {
+		if s[i:i+len(sep)] == sep {
+			return i
+		}
+	}
+	return -1
+}
+
+// cosineSimilarity computes the cosine similarity between two float32 vectors.
+func cosineSimilarity(a, b []float32) float64 {
+	if len(a) != len(b) || len(a) == 0 {
+		return 0
+	}
+	var dot, normA, normB float64
+	for i := range a {
+		dot += float64(a[i]) * float64(b[i])
+		normA += float64(a[i]) * float64(a[i])
+		normB += float64(b[i]) * float64(b[i])
+	}
+	if normA == 0 || normB == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
 }

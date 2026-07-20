@@ -25,7 +25,7 @@ import (
 // one, this test breaks with a clear diff showing exactly what changed.
 var expectedWireShapes = map[string][]string{
 	"remember":             {"id", "status"},
-	"recall":               {"results"},
+	"recall":               {"links", "results"},
 	"forget":               {"status"},
 	"link":                 {"status"},
 	"check_impact":         {"stale_nodes"},

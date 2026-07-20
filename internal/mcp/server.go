@@ -138,12 +138,20 @@ func registerTools(srv *mcp.Server, db store.Store) {
 				Score:    s.Score,
 			})
 		}
-		// TODO: expose result.Chunks in RecallOutput when RecallItem gains ChunkItems.
-		_ = result.Chunks
+
+		links := make([]ImplicitMCPLink, 0, len(result.Links))
+		for _, l := range result.Links {
+			links = append(links, ImplicitMCPLink{
+				FromChunkID: l.FromChunkID,
+				ToChunkID:   l.ToChunkID,
+				Cosine:      l.Cosine,
+			})
+		}
+		_ = result.Chunks // TODO: expose in RecallOutput when needed
 
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(items)}},
-		}, RecallOutput{Results: items}, nil
+			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(RecallOutput{Results: items, Links: links})}},
+		}, RecallOutput{Results: items, Links: links}, nil
 	})
 
 	// Tool 3: forget

@@ -28,15 +28,22 @@ type RecallInput struct {
 	Query     string `json:"query"`
 	Limit     int    `json:"limit,omitempty"`
 }
-type RecallOutput struct {
-	Results []RecallItem `json:"results"`
-}
 type RecallItem struct {
 	ID       string  `json:"id"`
 	Title    string  `json:"title"`
 	Content  string  `json:"content"`
 	NodeType string  `json:"node_type"`
 	Score    float64 `json:"score"`
+}
+type RecallOutput struct {
+	Results []RecallItem       `json:"results"`
+	Links   []ImplicitMCPLink  `json:"links,omitempty"`
+}
+
+type ImplicitMCPLink struct {
+	FromChunkID string  `json:"from_chunk_id"`
+	ToChunkID   string  `json:"to_chunk_id"`
+	Cosine      float64 `json:"cosine"`
 }
 
 type ForgetInput struct {
