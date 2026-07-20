@@ -112,6 +112,8 @@ func Ingest(root string, cfg Config) ([]store.Node, []store.Edge, error) {
 			Title:         filepath.Base(rel),
 			Content:       string(content),
 			ContentHash:   hex.EncodeToString(hash[:]),
+			Status:        "current",
+			Importance:    0.5,
 			SourceAdapter: "docwalk",
 			SourcePath:    rel,
 		}

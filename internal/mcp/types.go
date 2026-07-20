@@ -1,6 +1,13 @@
 // --- Input/Output types (Go types auto-generate MCP JSON schema) ---
 package mcp
 
+import (
+	sitter "github.com/tree-sitter/go-tree-sitter"
+
+	"github.com/mystaline-dev/tastastas/internal/chunker"
+	"github.com/mystaline-dev/tastastas/internal/store"
+)
+
 // --- Input/Output types (Go types auto-generate MCP JSON schema) ---
 
 type RememberInput struct {
@@ -58,6 +65,7 @@ type IngestInput struct {
 type IngestOutput struct {
 	NodesIngested int `json:"nodes_ingested"`
 	EdgesCreated  int `json:"edges_created"`
+	ChunksCreated int `json:"chunks_created"`
 }
 
 type ExtractAndRememberInput struct {
@@ -82,4 +90,74 @@ type CheckImpactOutput struct {
 type StaleNode struct {
 	ID       string `json:"id"`
 	NodeType string `json:"node_type"`
+}
+
+// chunkForNode splits a node's content into chunks suitable for embedding.
+// For Go code nodes, uses tree-sitter to split by function/type declarations.
+// For Markdown-like nodes, uses heading-based chunking.
+// All other types get a single chunk.
+func chunkForNode(n store.Node, cfg chunker.Config, goLang, tsLang *sitter.Language) []store.Chunk {
+	switch n.NodeType {
+	case "prd", "api-spec", "erd", "test-case", "generic-doc", "obsidian-note":
+		chunks, _ := chunker.ChunkMarkdown(n.ID, n.Content, cfg)
+		result := make([]store.Chunk, len(chunks))
+		for i, c := range chunks {
+			result[i] = store.Chunk{
+				ID:           c.ID,
+				ParentNodeID: c.ParentNodeID,
+				ChunkIndex:   c.ChunkIndex,
+				Type:         string(c.Type),
+				HeadingPath:  c.HeadingPath,
+				Content:      c.Content,
+				Language:     c.Language,
+			}
+		}
+		return result
+
+	case "go":
+		if goLang != nil {
+			chunks, err := chunker.ChunkGoCode(n.ID, n.Content, goLang, cfg)
+			if err == nil && len(chunks) > 0 {
+				return chunkSlice(n.ID, chunks)
+			}
+		}
+		fallthrough
+
+	case "typescript", "javascript":
+		if tsLang != nil {
+			chunks, err := chunker.ChunkTypeScript(n.ID, n.Content, tsLang, cfg)
+			if err == nil && len(chunks) > 0 {
+				return chunkSlice(n.ID, chunks)
+			}
+		}
+		fallthrough
+
+	default:
+		return []store.Chunk{{
+			ID:           n.ID + "/chunk/0",
+			ParentNodeID: n.ID,
+			ChunkIndex:   0,
+			Type:         "conversation_fact",
+			HeadingPath:  []string{},
+			Content:      n.Content,
+			Language:     "text",
+		}}
+	}
+}
+
+// chunkSlice converts chunker.Chunk slice to store.Chunk slice.
+func chunkSlice(parentID string, chunks []chunker.Chunk) []store.Chunk {
+	result := make([]store.Chunk, len(chunks))
+	for i, c := range chunks {
+		result[i] = store.Chunk{
+			ID:           c.ID,
+			ParentNodeID: c.ParentNodeID,
+			ChunkIndex:   c.ChunkIndex,
+			Type:         string(c.Type),
+			HeadingPath:  c.HeadingPath,
+			Content:      c.Content,
+			Language:     c.Language,
+		}
+	}
+	return result
 }

@@ -5,6 +5,9 @@ import (
 	"errors"
 	"testing"
 
+	_ "modernc.org/sqlite"
+	_ "modernc.org/sqlite/vec"
+
 	"github.com/mystaline-dev/tastastas/internal/store"
 )
 

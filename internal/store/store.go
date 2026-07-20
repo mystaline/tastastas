@@ -25,6 +25,7 @@ type Node struct {
 	SourcePath    string
 	Importance    float64
 	Embedding     []float32 // optional; nil if not embedded yet
+	Language      string    // programming language for code files (go, python, etc.)
 	CreatedAt     string
 	UpdatedAt     string
 }
@@ -43,6 +44,24 @@ type ScoredNode struct {
 	Score float64
 }
 
+// Chunk represents a chunk of content from a parent node.
+type Chunk struct {
+	ID           string
+	ParentNodeID string
+	ChunkIndex   int
+	Type         string
+	HeadingPath  []string
+	Content      string
+	Language     string
+	Embedding    []float32
+}
+
+// ScoredChunk is a Chunk with a retrieval score attached.
+type ScoredChunk struct {
+	Chunk
+	Score float64
+}
+
 // Store is the full persistence surface tastastas depends on.
 type Store interface {
 	UpsertNode(ctx context.Context, n Node) error
@@ -50,11 +69,17 @@ type Store interface {
 	DeleteNode(ctx context.Context, id string) error
 	GetNode(ctx context.Context, id string) (Node, error)
 
-	// SearchLexical runs an FTS5 (or equivalent) query scoped to a project.
-	SearchLexical(ctx context.Context, projectID, query string, limit int) ([]Node, error)
+	// SearchLexical runs an FTS5 query scoped to a project.
+	// Returns scored nodes where Score is the FTS5 BM25 rank (lower = better match).
+	SearchLexical(ctx context.Context, projectID, query string, limit int) ([]ScoredNode, error)
 
 	// SearchVector runs a nearest-neighbor query scoped to a project.
 	SearchVector(ctx context.Context, projectID string, embedding []float32, limit int) ([]ScoredNode, error)
+
+	// Chunk operations for unified embeddings
+	UpsertChunks(ctx context.Context, chunks []Chunk) error
+	DeleteChunksByParent(ctx context.Context, parentNodeID string) error
+	SearchChunks(ctx context.Context, projectID string, embedding []float32, limit int) ([]ScoredChunk, error)
 
 	// Neighbors walks typed edges out to depth hops from id.
 	Neighbors(ctx context.Context, id string, edgeTypes []string, depth int) ([]Node, []Edge, error)
@@ -64,7 +89,12 @@ type Store interface {
 	// walk — for callers that need to know how strongly a neighbor is
 	// actually connected (e.g. retrieval's edge-confidence boost), rather
 	// than guessing via unrelated index alignment between two slices.
-	NeighborsWithConfidence(ctx context.Context, id string, edgeTypes []string, depth int) ([]Node, map[string]float64, error)
+	NeighborsWithConfidence(
+		ctx context.Context,
+		id string,
+		edgeTypes []string,
+		depth int,
+	) ([]Node, map[string]float64, error)
 
 	// MarkStaleDownstream flags nodes reachable from changedID (via impact
 	// edge types) as status=stale, up to maxDepth hops, and returns them.

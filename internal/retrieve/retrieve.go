@@ -1,5 +1,14 @@
 // Package retrieve provides scored retrieval: relevance * recency * importance
 // with graph-neighbor pull-in for context enrichment.
+//
+// When an embedding is provided via RecallParams.Embedding, Retrieve fuses
+// lexical (FTS5 BM25) and vector (cosine similarity) scores:
+//
+//	fused = alpha * lexical_relevance + (1-alpha) * cosine_similarity
+//
+// Default alpha = 0.4 (weight lexical lower — BM25 keyword match is a weaker
+// signal than semantic proximity for natural-language queries).
+// When embedding is nil, operates in pure lexical mode (no embedder needed).
 package retrieve
 
 import (
@@ -25,6 +34,19 @@ type Config struct {
 
 	// MaxResults caps the final returned count after scoring + pull-in.
 	MaxResults int
+
+	// Alpha is the weight given to lexical (FTS5) score in the fused score.
+	// (1-alpha) goes to vector (cosine similarity) score.
+	// Default: 0.4 (favor semantic over keyword).
+	Alpha float64
+
+	// IncludeChunks, when true, searches chunk vectors in addition to node
+	// vectors. Chunks are returned alongside nodes, tagged with their
+	// ParentNodeID so the caller can reconstruct context.
+	IncludeChunks bool
+
+	// MaxChunks caps the number of chunk results returned. Default: 5.
+	MaxChunks int
 }
 
 // DefaultConfig returns sensible defaults.
@@ -32,9 +54,26 @@ func DefaultConfig() Config {
 	return Config{
 		RecencyHalfLife: 7 * 24 * time.Hour,
 		NeighborDepth:   1,
-		NeighborTypes:   nil, // all
+		NeighborTypes:   nil,
 		MaxResults:      20,
+		Alpha:           0.4,
+		IncludeChunks:   true,
+		MaxChunks:       5,
 	}
+}
+
+// RecallParams is the input to Recall.
+type RecallParams struct {
+	ProjectID string
+	Query     string
+	Embedding []float32 // optional; nil = lexical-only mode
+	Limit     int
+}
+
+// RecallResult groups nodes and chunks returned by Recall.
+type RecallResult struct {
+	Nodes  []ScoredNode
+	Chunks []store.ScoredChunk
 }
 
 // ScoredNode is a node with its computed retrieval score.
@@ -57,57 +96,119 @@ func New(st store.Store, cfg Config) *Retriever {
 	if cfg.MaxResults == 0 {
 		cfg.MaxResults = 20
 	}
+	if cfg.Alpha == 0 {
+		cfg.Alpha = 0.4
+	}
+	if cfg.MaxChunks == 0 {
+		cfg.MaxChunks = 5
+	}
 	return &Retriever{store: st, cfg: cfg}
 }
 
-// Recall performs scored retrieval: FTS search + scoring + graph pull-in.
-// This replaces the Phase 3 stub that returned score=1.0 for all results.
-func (r *Retriever) Recall(ctx context.Context, projectID, query string, limit int) ([]ScoredNode, error) {
+// Recall performs scored retrieval with optional semantic (vector) fusion.
+//
+// Always runs lexical (FTS5) search. When params.Embedding is non-nil,
+// also runs vector search over node vectors and chunk vectors, then fuses
+// scores. Graph neighbor pull-in follows.
+func (r *Retriever) Recall(ctx context.Context, params RecallParams) (*RecallResult, error) {
+	limit := params.Limit
 	if limit <= 0 {
 		limit = r.cfg.MaxResults
 	}
 
-	// 1. FTS search — get initial candidates
-	hits, err := r.store.SearchLexical(ctx, projectID, query, limit*3) // over-fetch for scoring
+	// 1. Lexical search — always runs (fast, no external deps)
+	lexHits, err := r.store.SearchLexical(ctx, params.ProjectID, params.Query, limit*3)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. Score each hit
-	now := time.Now()
-	scored := make([]ScoredNode, 0, len(hits))
-	seen := map[string]bool{}
-	for _, h := range hits {
-		if seen[h.ID] {
-			continue
-		}
-		seen[h.ID] = true
-		scored = append(scored, ScoredNode{
-			Node:  h,
-			Score: r.score(h, now),
-		})
+	// Build a map of node ID → lexical relevance for fusion later.
+	lexScores := make(map[string]float64, len(lexHits))
+	for _, h := range lexHits {
+		lexScores[h.ID] = rankToRelevance(h.Score)
 	}
 
-	// 3. Graph pull-in: for top hits, fetch N-hop neighbors
+	// 2. Vector search (only if embedding provided)
+	var vecScores map[string]float64
+	if len(params.Embedding) > 0 {
+		vecNodes, err := r.store.SearchVector(ctx, params.ProjectID, params.Embedding, limit*2)
+		if err == nil {
+			vecScores = make(map[string]float64, len(vecNodes))
+			for _, v := range vecNodes {
+				vecScores[v.ID] = v.Score // cosine similarity already in [0,1]
+			}
+		}
+		// On error, proceed lexical-only — graceful degradation.
+	}
+
+	// 3. Collect all candidate node IDs (union of lexical + vector hits)
+	candidateIDs := make(map[string]bool, len(lexScores)+len(vecScores))
+	for id := range lexScores {
+		candidateIDs[id] = true
+	}
+	for id := range vecScores {
+		candidateIDs[id] = true
+	}
+
+	// 4. Score each candidate: fuse lexical + vector, then × recency × importance
+	now := time.Now()
+	scored := make([]ScoredNode, 0, len(candidateIDs))
+	seen := map[string]bool{}
+
+	for id := range candidateIDs {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+
+		node, err := r.store.GetNode(ctx, id)
+		if err != nil {
+			continue // node deleted between search and get
+		}
+
+		lexRel := lexScores[id] // 0 if not in lexical results
+		vecSim := vecScores[id] // 0 if not in vector results
+		if vecScores == nil {
+			vecSim = 0
+		}
+
+		// Fuse: if we have vector scores, use alpha-weighted fusion,
+		// otherwise pure lexical (vecSim stays 0, alpha effectively 1.0).
+		fused := fuseScore(lexRel, vecSim, r.cfg.Alpha, vecScores != nil)
+
+		recency := r.recencyDecay(now.Sub(parseTime(node)))
+		score := fused * recency * node.Importance
+		if score > 0 {
+			scored = append(scored, ScoredNode{
+				Node:  node,
+				Score: score,
+			})
+		}
+	}
+
+	// 5. Graph pull-in: for top hits, fetch N-hop neighbors
 	if r.cfg.NeighborDepth > 0 && len(scored) > 0 {
-		// Only pull in from top 5 hits (or fewer) to avoid explosion
 		pullFrom := scored
 		if len(pullFrom) > 5 {
 			pullFrom = pullFrom[:5]
 		}
 		for _, s := range pullFrom {
-			neighbors, confidence, err := r.store.NeighborsWithConfidence(ctx, s.Node.ID, r.cfg.NeighborTypes, r.cfg.NeighborDepth)
+			neighbors, confidence, err := r.store.NeighborsWithConfidence(
+				ctx,
+				s.Node.ID,
+				r.cfg.NeighborTypes,
+				r.cfg.NeighborDepth,
+			)
 			if err != nil {
-				continue // non-fatal
+				continue
 			}
 			for _, n := range neighbors {
 				if seen[n.ID] {
 					continue
 				}
 				seen[n.ID] = true
-				// Neighbor score: original score * 0.5 (pulled in, not directly matched)
-				ns := r.score(n, now) * 0.5
-				// Boost if connected by a strong edge (confidence > 0.8)
+				recency := r.recencyDecay(now.Sub(parseTime(n)))
+				ns := 0.5 * recency * n.Importance
 				if confidence[n.ID] > 0.8 {
 					ns *= 1.2
 				}
@@ -116,26 +217,57 @@ func (r *Retriever) Recall(ctx context.Context, projectID, query string, limit i
 		}
 	}
 
-	// 4. Sort by score descending, cap at limit
+	// 6. Sort by score descending, cap at limit
 	sortByScore(scored)
 	if len(scored) > limit {
 		scored = scored[:limit]
 	}
 
-	return scored, nil
+	// 7. Chunk search (optional, only if embedding provided + IncludeChunks)
+	var chunkResults []store.ScoredChunk
+	if r.cfg.IncludeChunks && len(params.Embedding) > 0 {
+		chunks, err := r.store.SearchChunks(ctx, params.ProjectID, params.Embedding, r.cfg.MaxChunks)
+		if err == nil {
+			chunkResults = chunks
+		}
+	}
+
+	return &RecallResult{Nodes: scored, Chunks: chunkResults}, nil
 }
 
-// score computes: relevance (1.0 for FTS hits) * recency_decay * importance
-func (r *Retriever) score(n store.Node, now time.Time) float64 {
-	var t time.Time
+// fuseScore combines lexical relevance and vector cosine similarity.
+// When no vectors are available (vecAvailable=false), returns pure lexical.
+func fuseScore(lexRel, vecSim, alpha float64, vecAvailable bool) float64 {
+	if !vecAvailable || vecSim == 0 {
+		return lexRel
+	}
+	if lexRel == 0 {
+		return vecSim
+	}
+	return alpha*lexRel + (1-alpha)*vecSim
+}
+
+// rankToRelevance normalizes FTS5 BM25 rank (negative, lower = better)
+// into a [0,1] relevance factor using a sigmoid-like decay.
+func rankToRelevance(rank float64) float64 {
+	return 1.0 / (1.0 + math.Exp(rank/2.0))
+}
+
+// parseTime extracts the UpdatedAt timestamp from a node, falling back
+// to CreatedAt, returning zero time if both are empty/invalid.
+func parseTime(n store.Node) time.Time {
+	const layout = "2006-01-02T15:04:05.000Z"
 	if n.UpdatedAt != "" {
-		t, _ = time.Parse("2006-01-02T15:04:05.000Z", n.UpdatedAt)
+		if t, err := time.Parse(layout, n.UpdatedAt); err == nil {
+			return t
+		}
 	}
-	if t.IsZero() && n.CreatedAt != "" {
-		t, _ = time.Parse("2006-01-02T15:04:05.000Z", n.CreatedAt)
+	if n.CreatedAt != "" {
+		if t, err := time.Parse(layout, n.CreatedAt); err == nil {
+			return t
+		}
 	}
-	recency := r.recencyDecay(now.Sub(t))
-	return recency * n.Importance
+	return time.Time{}
 }
 
 // recencyDecay returns a factor in (0, 1] based on how old the fact is.
@@ -152,7 +284,6 @@ func (r *Retriever) recencyDecay(age time.Duration) float64 {
 }
 
 func sortByScore(s []ScoredNode) {
-	// Insertion sort — fine for small slices (typically < 100)
 	for i := 1; i < len(s); i++ {
 		key := s[i]
 		j := i - 1
