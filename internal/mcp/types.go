@@ -29,11 +29,12 @@ type RecallInput struct {
 	Limit     int    `json:"limit,omitempty"`
 }
 type RecallItem struct {
-	ID       string  `json:"id"`
-	Title    string  `json:"title"`
-	Content  string  `json:"content"`
-	NodeType string  `json:"node_type"`
-	Score    float64 `json:"score"`
+	ID        string  `json:"id"`
+	Title     string  `json:"title"`
+	Content   string  `json:"content"`
+	NodeType  string  `json:"node_type"`
+	Score     float64 `json:"score"`
+	MatchType string  `json:"match_type"`
 }
 type RecallOutput struct {
 	Results []RecallItem       `json:"results"`

@@ -131,11 +131,12 @@ func registerTools(srv *mcp.Server, db store.Store) {
 		items := make([]RecallItem, 0, len(result.Nodes))
 		for _, s := range result.Nodes {
 			items = append(items, RecallItem{
-				ID:       s.ID,
-				Title:    s.Title,
-				Content:  s.Content,
-				NodeType: s.NodeType,
-				Score:    s.Score,
+				ID:        s.ID,
+				Title:     s.Title,
+				Content:   s.Content,
+				NodeType:  s.NodeType,
+				Score:     s.Score,
+				MatchType: s.MatchType,
 			})
 		}
 
@@ -220,25 +221,37 @@ func registerTools(srv *mcp.Server, db store.Store) {
 			}
 		}
 
-		// Chunk and embed ingested nodes if embedder is available
+		// Chunk and embed ingested nodes if embedder is available.
+		// Batched in groups of 32 to amortize HTTP overhead per Ollama call.
 		chunkCount := 0
 		if embedder != nil {
 			var allChunks []store.Chunk
 			goLang := goLanguage()
 			tsLang := tsLanguage()
 			for _, n := range nodes {
-				chunks := chunkForNode(n, chunker.DefaultConfig(), goLang, tsLang)
-				for _, c := range chunks {
-					vec, err := embedder.Embed(ctx, c.Content)
-					if err != nil {
-						// Log but continue
-						fmt.Printf("embed chunk %s: %v\n", c.ID, err)
-						continue
-					}
-					c.Embedding = vec
-					allChunks = append(allChunks, c)
+				allChunks = append(allChunks, chunkForNode(n, chunker.DefaultConfig(), goLang, tsLang)...)
+			}
+
+			const batchSize = 32
+			for i := 0; i < len(allChunks); i += batchSize {
+				end := i + batchSize
+				if end > len(allChunks) {
+					end = len(allChunks)
+				}
+				batch := allChunks[i:end]
+				texts := make([]string, len(batch))
+				for j, c := range batch {
+					texts[j] = c.Content
+				}
+				vecs, err := embedder.EmbedBatch(ctx, texts)
+				if err != nil {
+					return errorResult(fmt.Errorf("embed batch %d-%d: %w", i, end, err)), IngestOutput{}, nil
+				}
+				for j := range batch {
+					allChunks[i+j].Embedding = vecs[j]
 				}
 			}
+
 			if len(allChunks) > 0 {
 				if err := db.UpsertChunks(ctx, allChunks); err != nil {
 					return errorResult(err), IngestOutput{}, nil

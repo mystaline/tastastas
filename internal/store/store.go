@@ -26,6 +26,7 @@ type Node struct {
 	Importance    float64
 	Embedding     []float32 // optional; nil if not embedded yet
 	Language      string    // programming language for code files (go, python, etc.)
+	HasChunks     bool      // true if this node has been chunked+embedded
 	CreatedAt     string
 	UpdatedAt     string
 }

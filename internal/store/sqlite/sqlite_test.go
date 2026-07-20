@@ -64,6 +64,38 @@ func TestGetNodeNotFound(t *testing.T) {
 	}
 }
 
+func TestGetNodeHasChunks(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+
+	n := store.Node{ID: "acme/doc/readme", NodeType: "generic-doc", Content: "hello world"}
+	if err := s.UpsertNode(ctx, n); err != nil {
+		t.Fatalf("UpsertNode: %v", err)
+	}
+
+	got, err := s.GetNode(ctx, n.ID)
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	if got.HasChunks {
+		t.Error("expected HasChunks=false before chunking, got true")
+	}
+
+	if err := s.UpsertChunks(ctx, []store.Chunk{
+		{ID: n.ID + "/chunk/0", ParentNodeID: n.ID, ChunkIndex: 0, Type: "markdown_section", Content: "hello"},
+	}); err != nil {
+		t.Fatalf("UpsertChunks: %v", err)
+	}
+
+	got, err = s.GetNode(ctx, n.ID)
+	if err != nil {
+		t.Fatalf("GetNode after chunking: %v", err)
+	}
+	if !got.HasChunks {
+		t.Error("expected HasChunks=true after chunking, got false")
+	}
+}
+
 func TestSearchLexical(t *testing.T) {
 	s := openTest(t)
 	ctx := context.Background()

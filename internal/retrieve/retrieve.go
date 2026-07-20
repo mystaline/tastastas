@@ -95,7 +95,8 @@ type RecallResult struct {
 // ScoredNode is a node with its computed retrieval score.
 type ScoredNode struct {
 	store.Node
-	Score float64
+	Score     float64
+	MatchType string // "lexical" | "semantic" | "hybrid" | "graph"
 }
 
 // Retriever scores and retrieves facts from the store.
@@ -194,13 +195,15 @@ func (r *Retriever) Recall(ctx context.Context, params RecallParams) (*RecallRes
 		// Fuse: if we have vector scores, use alpha-weighted fusion,
 		// otherwise pure lexical (vecSim stays 0, alpha effectively 1.0).
 		fused := fuseScore(lexRel, vecSim, r.cfg.Alpha, vecScores != nil)
+		matchType := matchTypeOf(lexRel, vecSim)
 
 		recency := r.recencyDecay(now.Sub(parseTime(node)))
 		score := fused * recency * node.Importance
 		if score > 0 {
 			scored = append(scored, ScoredNode{
-				Node:  node,
-				Score: score,
+				Node:      node,
+				Score:     score,
+				MatchType: matchType,
 			})
 		}
 	}
@@ -231,7 +234,7 @@ func (r *Retriever) Recall(ctx context.Context, params RecallParams) (*RecallRes
 				if confidence[n.ID] > 0.8 {
 					ns *= 1.2
 				}
-				scored = append(scored, ScoredNode{Node: n, Score: ns})
+				scored = append(scored, ScoredNode{Node: n, Score: ns, MatchType: "graph"})
 			}
 		}
 	}
@@ -271,6 +274,19 @@ func fuseScore(lexRel, vecSim, alpha float64, vecAvailable bool) float64 {
 		return vecSim
 	}
 	return alpha*lexRel + (1-alpha)*vecSim
+}
+
+// matchTypeOf classifies how a result was found: lexical-only, semantic-only,
+// or hybrid (both signals contributed).
+func matchTypeOf(lexRel, vecSim float64) string {
+	switch {
+	case lexRel > 0 && vecSim > 0:
+		return "hybrid"
+	case vecSim > 0:
+		return "semantic"
+	default:
+		return "lexical"
+	}
 }
 
 // rankToRelevance normalizes FTS5 BM25 rank (negative, lower = better)

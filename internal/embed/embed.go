@@ -40,8 +40,8 @@ func New(cfg Config) *Embedder {
 }
 
 type embedRequest struct {
-	Model string `json:"model"`
-	Input string `json:"input"`
+	Model string   `json:"model"`
+	Input []string `json:"input"`
 }
 
 type embedResponse struct {
@@ -50,7 +50,27 @@ type embedResponse struct {
 
 // Embed returns the embedding vector for text.
 func (e *Embedder) Embed(ctx context.Context, text string) ([]float32, error) {
-	body, err := json.Marshal(embedRequest{Model: e.cfg.Model, Input: text})
+	vecs, err := e.EmbedBatch(ctx, []string{text})
+	if err != nil {
+		return nil, err
+	}
+	if len(vecs) == 0 {
+		return nil, fmt.Errorf("embed: no embeddings returned")
+	}
+	return vecs[0], nil
+}
+
+// EmbedBatch embeds up to 32 texts in a single Ollama call, amortizing HTTP
+// overhead. Callers with more than 32 texts must chunk themselves.
+func (e *Embedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	if len(texts) == 0 {
+		return nil, nil
+	}
+	if len(texts) > 32 {
+		return nil, fmt.Errorf("embed: batch size %d exceeds max 32", len(texts))
+	}
+
+	body, err := json.Marshal(embedRequest{Model: e.cfg.Model, Input: texts})
 	if err != nil {
 		return nil, fmt.Errorf("embed: marshal request: %w", err)
 	}
@@ -77,8 +97,8 @@ func (e *Embedder) Embed(ctx context.Context, text string) ([]float32, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("embed: decode response: %w", err)
 	}
-	if len(out.Embeddings) == 0 {
-		return nil, fmt.Errorf("embed: no embeddings returned")
+	if len(out.Embeddings) != len(texts) {
+		return nil, fmt.Errorf("embed: expected %d embeddings, got %d", len(texts), len(out.Embeddings))
 	}
-	return out.Embeddings[0], nil
+	return out.Embeddings, nil
 }

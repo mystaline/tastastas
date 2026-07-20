@@ -174,7 +174,8 @@ func (s *Store) DeleteNode(ctx context.Context, id string) error {
 
 func (s *Store) GetNode(ctx context.Context, id string) (store.Node, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, project_id, node_type, title, content, content_hash, status, source_adapter, source_path, importance, language, created_at, updated_at
+		SELECT id, project_id, node_type, title, content, content_hash, status, source_adapter, source_path, importance, language, created_at, updated_at,
+		       EXISTS(SELECT 1 FROM chunks WHERE parent_node_id = nodes.id)
 		FROM nodes WHERE id = ?
 	`, id)
 	var n store.Node
@@ -192,6 +193,7 @@ func (s *Store) GetNode(ctx context.Context, id string) (store.Node, error) {
 		&n.Language,
 		&n.CreatedAt,
 		&n.UpdatedAt,
+		&n.HasChunks,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return store.Node{}, fmt.Errorf("sqlite: node %s: %w", id, store.ErrNotFound)
@@ -284,22 +286,22 @@ func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 		parentIDs[c.ParentNodeID] = true
 	}
 	for pid := range parentIDs {
-		_, err := tx.ExecContext(ctx, `DELETE FROM chunks WHERE parent_node_id = ?`, pid)
-		if err != nil {
-			return fmt.Errorf("sqlite: delete old chunks for %s: %w", pid, err)
-		}
-		_, err = tx.ExecContext(
+		_, err := tx.ExecContext(
 			ctx,
-			`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE parent_node_id = ?)`,
+			`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE parent_node_id = ?)`,
 			pid,
 		)
 		if err != nil {
 			return fmt.Errorf("sqlite: delete old chunk vectors for %s: %w", pid, err)
 		}
+		_, err = tx.ExecContext(ctx, `DELETE FROM chunks WHERE parent_node_id = ?`, pid)
+		if err != nil {
+			return fmt.Errorf("sqlite: delete old chunks for %s: %w", pid, err)
+		}
 	}
 
 	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO chunks (chunk_id, parent_node_id, chunk_index, chunk_type, heading_path, content, language)
+		INSERT INTO chunks (id, parent_node_id, chunk_index, chunk_type, heading_path, content, language)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
@@ -348,17 +350,17 @@ func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 }
 
 func (s *Store) DeleteChunksByParent(ctx context.Context, parentNodeID string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM chunks WHERE parent_node_id = ?`, parentNodeID)
-	if err != nil {
-		return fmt.Errorf("sqlite: delete chunks for %s: %w", parentNodeID, err)
-	}
-	_, err = s.db.ExecContext(
+	_, err := s.db.ExecContext(
 		ctx,
-		`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE parent_node_id = ?)`,
+		`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE parent_node_id = ?)`,
 		parentNodeID,
 	)
 	if err != nil {
 		return fmt.Errorf("sqlite: delete chunk vectors for %s: %w", parentNodeID, err)
+	}
+	_, err = s.db.ExecContext(ctx, `DELETE FROM chunks WHERE parent_node_id = ?`, parentNodeID)
+	if err != nil {
+		return fmt.Errorf("sqlite: delete chunks for %s: %w", parentNodeID, err)
 	}
 	return nil
 }
@@ -377,10 +379,10 @@ func (s *Store) SearchChunks(
 		return nil, fmt.Errorf("sqlite: marshal query embedding: %w", err)
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT c.chunk_id, c.parent_node_id, c.chunk_index, c.chunk_type, c.heading_path, c.content, c.language,
+		SELECT c.id, c.parent_node_id, c.chunk_index, c.chunk_type, c.heading_path, c.content, c.language,
 		       vec_distance_cosine(v.embedding, vec_f32(?)) AS distance
 		FROM chunk_vectors v
-		JOIN chunks c ON c.chunk_id = v.chunk_id
+		JOIN chunks c ON c.id = v.chunk_id
 		JOIN nodes n ON n.id = c.parent_node_id
 		WHERE n.project_id = ?
 		ORDER BY distance
