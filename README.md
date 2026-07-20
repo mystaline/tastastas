@@ -228,6 +228,15 @@ GET  /health              — {"status": "ok", "version": "0.1.0"}
 v0.1.0 — functional. See `DEVELOPMENT.md` for architecture, dev/verify
 commands, and roadmap. `tasks.md` tracks what's open past this release.
 
+## Releases
+
+Pushing a `v*` tag triggers `.github/workflows/release.yml`: builds the
+ONNX sidecar + tastastas binary (sidecar baked in via `go:embed`) for
+linux/amd64, linux/arm64, macOS/amd64, macOS/arm64, windows/amd64, and
+attaches them to a GitHub Release. No manual `scripts/build-sidecar.sh`
+step needed for released binaries — that script is for building from
+source locally.
+
 ## License
 
 MIT — see `LICENSE`.
