@@ -96,11 +96,11 @@ func (r *Retriever) Recall(ctx context.Context, projectID, query string, limit i
 			pullFrom = pullFrom[:5]
 		}
 		for _, s := range pullFrom {
-			neighbors, edges, err := r.store.Neighbors(ctx, s.Node.ID, r.cfg.NeighborTypes, r.cfg.NeighborDepth)
+			neighbors, confidence, err := r.store.NeighborsWithConfidence(ctx, s.Node.ID, r.cfg.NeighborTypes, r.cfg.NeighborDepth)
 			if err != nil {
 				continue // non-fatal
 			}
-			for i, n := range neighbors {
+			for _, n := range neighbors {
 				if seen[n.ID] {
 					continue
 				}
@@ -108,7 +108,7 @@ func (r *Retriever) Recall(ctx context.Context, projectID, query string, limit i
 				// Neighbor score: original score * 0.5 (pulled in, not directly matched)
 				ns := r.score(n, now) * 0.5
 				// Boost if connected by a strong edge (confidence > 0.8)
-				if i < len(edges) && edges[i].Confidence > 0.8 {
+				if confidence[n.ID] > 0.8 {
 					ns *= 1.2
 				}
 				scored = append(scored, ScoredNode{Node: n, Score: ns})

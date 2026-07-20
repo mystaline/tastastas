@@ -180,4 +180,58 @@ func TestCheckImpact(t *testing.T) {
 			t.Errorf("expected %s to be marked stale", expected)
 		}
 	}
+
+	// Regression: the returned Node.Status must actually say "stale", not
+	// just the DB row (old code mutated a for-range loop copy, leaving the
+	// returned slice's Status field at its pre-update value).
+	for _, n := range stale {
+		if n.Status != "stale" {
+			t.Errorf("node %s: returned Status = %q, want \"stale\"", n.ID, n.Status)
+		}
+	}
+}
+
+// TestNeighborsWithConfidenceMatchesEdge is a regression test: the old
+// retrieve.go code assumed neighbors[i] was discovered by edges[i], which
+// is false (Neighbors' node order comes from Go map iteration, edges is a
+// flat BFS-order list of unrelated length/order). NeighborsWithConfidence
+// must return the ACTUAL confidence of the edge that discovered each node.
+func TestNeighborsWithConfidenceMatchesEdge(t *testing.T) {
+	st, err := sqlite.Open(context.Background(), ":memory:", 4)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	nodes := []store.Node{
+		{ID: "root", ProjectID: "test", NodeType: "prd", Title: "Root"},
+		{ID: "low-conf", ProjectID: "test", NodeType: "api-spec", Title: "Low"},
+		{ID: "high-conf", ProjectID: "test", NodeType: "erd", Title: "High"},
+	}
+	for _, n := range nodes {
+		if err := st.UpsertNode(ctx, n); err != nil {
+			t.Fatalf("UpsertNode %s: %v", n.ID, err)
+		}
+	}
+	edges := []store.Edge{
+		{FromID: "root", ToID: "low-conf", EdgeType: "related", Confidence: 0.3},
+		{FromID: "root", ToID: "high-conf", EdgeType: "related", Confidence: 0.95},
+	}
+	for _, e := range edges {
+		if err := st.UpsertEdge(ctx, e); err != nil {
+			t.Fatalf("UpsertEdge: %v", err)
+		}
+	}
+
+	_, confidence, err := st.NeighborsWithConfidence(ctx, "root", nil, 1)
+	if err != nil {
+		t.Fatalf("NeighborsWithConfidence: %v", err)
+	}
+	if confidence["low-conf"] != 0.3 {
+		t.Errorf("low-conf: confidence = %v, want 0.3", confidence["low-conf"])
+	}
+	if confidence["high-conf"] != 0.95 {
+		t.Errorf("high-conf: confidence = %v, want 0.95", confidence["high-conf"])
+	}
 }

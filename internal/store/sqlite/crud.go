@@ -157,12 +157,33 @@ func (s *Store) SearchVector(ctx context.Context, projectID string, embedding []
 }
 
 // Neighbors does a breadth-first walk over `edges` up to depth hops,
-// optionally restricted to edgeTypes (nil/empty = all types).
+// optionally restricted to edgeTypes (nil/empty = all types). The returned
+// edges slice is NOT positionally correlated with the returned nodes slice
+// (BFS visits nodes in map-iteration order, discovers them via arbitrary
+// edges) — callers needing "what edge reached this node" should use
+// NeighborsWithConfidence instead.
 func (s *Store) Neighbors(ctx context.Context, id string, edgeTypes []string, depth int) ([]store.Node, []store.Edge, error) {
+	nodes, edges, _, err := s.neighborsBFS(ctx, id, edgeTypes, depth)
+	return nodes, edges, err
+}
+
+// NeighborsWithConfidence is like Neighbors but also returns, per node ID,
+// the confidence of the edge that first discovered it during the BFS walk
+// (the highest-confidence edge if a node is reachable via multiple paths
+// at the same depth is not guaranteed — first-discovery wins, matching BFS
+// semantics). Used by internal/retrieve to boost pulled-in neighbors by the
+// edge that actually connects them, instead of guessing via index alignment.
+func (s *Store) NeighborsWithConfidence(ctx context.Context, id string, edgeTypes []string, depth int) ([]store.Node, map[string]float64, error) {
+	nodes, _, confidence, err := s.neighborsBFS(ctx, id, edgeTypes, depth)
+	return nodes, confidence, err
+}
+
+func (s *Store) neighborsBFS(ctx context.Context, id string, edgeTypes []string, depth int) ([]store.Node, []store.Edge, map[string]float64, error) {
 	if depth < 1 {
 		depth = 1
 	}
 	visited := map[string]bool{id: true}
+	reachedBy := map[string]float64{} // nodeID -> confidence of the edge that first discovered it
 	frontier := []string{id}
 	var allEdges []store.Edge
 
@@ -175,17 +196,18 @@ func (s *Store) Neighbors(ctx context.Context, id string, edgeTypes []string, de
 			queryArgs := append([]any{fromID}, args...)
 			rows, err := s.db.QueryContext(ctx, q, queryArgs...)
 			if err != nil {
-				return nil, nil, fmt.Errorf("sqlite: neighbors query: %w", err)
+				return nil, nil, nil, fmt.Errorf("sqlite: neighbors query: %w", err)
 			}
 			for rows.Next() {
 				var e store.Edge
 				if err := rows.Scan(&e.FromID, &e.ToID, &e.EdgeType, &e.Confidence); err != nil {
 					rows.Close()
-					return nil, nil, fmt.Errorf("sqlite: scan edge: %w", err)
+					return nil, nil, nil, fmt.Errorf("sqlite: scan edge: %w", err)
 				}
 				allEdges = append(allEdges, e)
 				if !visited[e.ToID] {
 					visited[e.ToID] = true
+					reachedBy[e.ToID] = e.Confidence
 					next = append(next, e.ToID)
 				}
 			}
@@ -203,7 +225,7 @@ func (s *Store) Neighbors(ctx context.Context, id string, edgeTypes []string, de
 		}
 		nodes = append(nodes, n)
 	}
-	return nodes, allEdges, nil
+	return nodes, allEdges, reachedBy, nil
 }
 
 // MarkStaleDownstream flags nodes reachable from changedID via impact-bearing
@@ -214,11 +236,11 @@ func (s *Store) MarkStaleDownstream(ctx context.Context, changedID string, maxDe
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: mark stale downstream: %w", err)
 	}
-	for _, n := range nodes {
-		if _, err := s.db.ExecContext(ctx, `UPDATE nodes SET status = 'stale', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`, n.ID); err != nil {
-			return nil, fmt.Errorf("sqlite: mark stale %s: %w", n.ID, err)
+	for i := range nodes {
+		if _, err := s.db.ExecContext(ctx, `UPDATE nodes SET status = 'stale', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`, nodes[i].ID); err != nil {
+			return nil, fmt.Errorf("sqlite: mark stale %s: %w", nodes[i].ID, err)
 		}
-		n.Status = "stale"
+		nodes[i].Status = "stale"
 	}
 	return nodes, nil
 }

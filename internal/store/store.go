@@ -59,6 +59,13 @@ type Store interface {
 	// Neighbors walks typed edges out to depth hops from id.
 	Neighbors(ctx context.Context, id string, edgeTypes []string, depth int) ([]Node, []Edge, error)
 
+	// NeighborsWithConfidence is like Neighbors but also returns, per node
+	// ID, the confidence of the edge that first discovered it during the
+	// walk — for callers that need to know how strongly a neighbor is
+	// actually connected (e.g. retrieval's edge-confidence boost), rather
+	// than guessing via unrelated index alignment between two slices.
+	NeighborsWithConfidence(ctx context.Context, id string, edgeTypes []string, depth int) ([]Node, map[string]float64, error)
+
 	// MarkStaleDownstream flags nodes reachable from changedID (via impact
 	// edge types) as status=stale, up to maxDepth hops, and returns them.
 	MarkStaleDownstream(ctx context.Context, changedID string, maxDepth int) ([]Node, error)

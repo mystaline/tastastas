@@ -36,6 +36,18 @@ func TestIngestGitrepo(t *testing.T) {
 		t.Fatalf("expected 3 nodes, got %d", len(nodes))
 	}
 
+	// Regression: project-a/MEMORY.md and project-a/cmd/server/MEMORY.md
+	// must NOT collide on the same node ID (old pathToID used only the
+	// top-level directory segment, silently merging nested MEMORY.md files
+	// at upsert time even though this in-memory slice still had 3 items).
+	seenIDs := map[string]bool{}
+	for _, n := range nodes {
+		if seenIDs[n.ID] {
+			t.Fatalf("duplicate node ID %q — nested MEMORY.md files collided", n.ID)
+		}
+		seenIDs[n.ID] = true
+	}
+
 	// Verify node properties
 	for _, n := range nodes {
 		if n.ProjectID != "test" {

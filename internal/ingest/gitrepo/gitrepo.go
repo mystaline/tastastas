@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/mystaline-dev/tastastas/internal/store"
 )
@@ -85,23 +84,25 @@ func Ingest(cfg Config) ([]store.Node, error) {
 	return nodes, err
 }
 
-// pathToID converts a relative file path to a qualified node ID.
-// Example: "sandbox/cmd/server/MEMORY.md" → "project/sandbox/memory"
+// pathToID converts a relative file path to a qualified node ID, using the
+// full parent directory path (not just the top-level segment) to avoid
+// collisions when multiple matching files exist at different depths under
+// the same top-level directory (e.g. "repoA/MEMORY.md" and
+// "repoA/sub/MEMORY.md" must not both map to the same node).
+// Example: "sandbox/cmd/server/MEMORY.md" -> "project/sandbox/cmd/server/memory"
 func pathToID(projectID, rel string) string {
-	parts := strings.Split(rel, string(filepath.Separator))
-	// Drop the filename, use parent dir as "repo" name
-	if len(parts) < 2 {
-		return fmt.Sprintf("%s/%s/memory", projectID, parts[0])
+	dir := filepath.ToSlash(filepath.Dir(rel))
+	if dir == "." {
+		return fmt.Sprintf("%s/memory", projectID)
 	}
-	repo := parts[0]
-	return fmt.Sprintf("%s/%s/memory", projectID, repo)
+	return fmt.Sprintf("%s/%s/memory", projectID, dir)
 }
 
 // deriveTitle extracts a readable title from the relative path.
 func deriveTitle(rel string) string {
-	parts := strings.Split(rel, string(filepath.Separator))
-	if len(parts) >= 2 {
-		return parts[0] + " memory"
+	dir := filepath.ToSlash(filepath.Dir(rel))
+	if dir == "." {
+		return "memory"
 	}
-	return "memory"
+	return dir + " memory"
 }
