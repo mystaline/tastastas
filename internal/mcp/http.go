@@ -10,19 +10,20 @@ import (
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/mystaline-dev/tastastas/internal/embed"
 	"github.com/mystaline-dev/tastastas/internal/store"
 )
 
 // ServeHTTP starts the HTTP server with MCP-over-HTTP + REST ingestion endpoints.
 // addr is the listen address (e.g. ":8080").
-func ServeHTTP(ctx context.Context, db store.Store, addr string) error {
+func ServeHTTP(ctx context.Context, db store.Store, embedder embed.EmbedderBackend, addr string) error {
 	// MCP-over-HTTP via Streamable HTTP handler
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
 		srv := mcp.NewServer(&mcp.Implementation{
 			Name:    "tastastas",
 			Version: "0.1.0",
 		}, nil)
-		registerTools(srv, db)
+		registerTools(srv, db, embedder)
 		return srv
 	}, nil)
 

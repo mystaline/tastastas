@@ -13,6 +13,14 @@ import (
 	"time"
 )
 
+// EmbedderBackend is the common interface both the Ollama HTTP embedder and
+// the baked ONNX sidecar embedder satisfy. Callers (internal/mcp) depend on
+// this instead of a concrete type so the backend is swappable at startup.
+type EmbedderBackend interface {
+	Embed(ctx context.Context, text string) ([]float32, error)
+	EmbedBatch(ctx context.Context, texts []string) ([][]float32, error)
+}
+
 // Config holds embedder settings.
 type Config struct {
 	OllamaURL string // e.g. "http://localhost:11434"

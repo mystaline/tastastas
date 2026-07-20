@@ -38,22 +38,22 @@ var tsLanguage = sync.OnceValue(func() *sitter.Language {
 })
 
 // NewServer creates an MCP server with all tastastas tools registered.
-// The store is injected by the caller (cmd/tastastas/main.go) — no
-// lazy init, no import cycle, clean dependency injection.
-func NewServer(db store.Store) *mcp.Server {
+// The store and embedder are injected by the caller (cmd/tastastas/main.go)
+// — no lazy init, no import cycle, clean dependency injection. Pass a nil
+// embedder to run in lexical-only mode (no embedding-dependent features).
+func NewServer(db store.Store, embedder embed.EmbedderBackend) *mcp.Server {
 	srv := mcp.NewServer(&mcp.Implementation{
 		Name:    "tastastas",
 		Version: "0.1.0",
 	}, nil)
-	registerTools(srv, db)
+	registerTools(srv, db, embedder)
 	return srv
 }
 
 // registerTools adds all 7 MCP tools to the server.
-func registerTools(srv *mcp.Server, db store.Store) {
+func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBackend) {
 	retriever := retrieve.New(db, retrieve.DefaultConfig())
 	extractor := extract.New(extract.Config{})
-	embedder := embed.New(embed.Config{})
 	// Tool 1: remember
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "remember",

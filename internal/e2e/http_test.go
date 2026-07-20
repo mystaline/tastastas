@@ -48,7 +48,7 @@ func startHTTPServer(t *testing.T) (addr string) {
 		port := 20000 + rand.Intn(20000)
 		addr = fmt.Sprintf("127.0.0.1:%d", port)
 		errCh := make(chan error, 1)
-		go func() { errCh <- mcpserver.ServeHTTP(ctx, db, addr) }()
+		go func() { errCh <- mcpserver.ServeHTTP(ctx, db, nil, addr) }()
 
 		// Poll /health with backoff; a bind failure surfaces almost
 		// immediately on errCh, a success means /health starts responding
