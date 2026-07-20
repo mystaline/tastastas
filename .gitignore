@@ -8,3 +8,8 @@ prototype/**/.ipynb_checkpoints/
 __pycache__/
 .env
 tastastas
+sidecar/target/
+sidecar/assets/*.onnx
+sidecar/assets/tokenizer.json
+internal/embed/bin/*
+!internal/embed/bin/README.txt
