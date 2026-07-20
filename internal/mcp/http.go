@@ -34,7 +34,7 @@ func ServeHTTP(ctx context.Context, db store.Store, embedder embed.EmbedderBacke
 
 	// REST ingestion endpoints — POST /ingest/{adapter} dispatches to
 	// docwalk, gitrepo, or obsidian.
-	mux.HandleFunc("POST /ingest/{adapter}", handleIngest(db))
+	mux.HandleFunc("POST /ingest/{adapter}", handleIngest(db, embedder))
 	mux.HandleFunc("POST /ingest/webhook", handleIngestWebhook(db))
 
 	// Health check
@@ -59,8 +59,9 @@ func ServeHTTP(ctx context.Context, db store.Store, embedder embed.EmbedderBacke
 
 // handleIngest handles POST /ingest/{adapter} (docwalk, gitrepo, obsidian)
 // with JSON body: { "root": "/path", "config_path": "...", "project_id": "..." }
-// config_path only applies to the docwalk adapter.
-func handleIngest(db store.Store) http.HandlerFunc {
+// config_path only applies to the docwalk adapter. Chunks + embeds ingested
+// nodes when embedder is non-nil (mirrors the MCP "ingest" tool behavior).
+func handleIngest(db store.Store, embedder embed.EmbedderBackend) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		adapter := r.PathValue("adapter")
 		var req struct {
@@ -94,8 +95,14 @@ func handleIngest(db store.Store) http.HandlerFunc {
 			}
 		}
 
+		chunkCount, err := chunkAndEmbedNodes(ctx, db, embedder, nodes)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"chunk/embed: %s"}`, err), http.StatusInternalServerError)
+			return
+		}
+
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"nodes_ingested":%d,"edges_created":%d}`, len(nodes), len(edges))
+		fmt.Fprintf(w, `{"nodes_ingested":%d,"edges_created":%d,"chunks_created":%d}`, len(nodes), len(edges), chunkCount)
 	}
 }
 

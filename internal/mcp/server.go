@@ -37,6 +37,53 @@ var tsLanguage = sync.OnceValue(func() *sitter.Language {
 	return sitter.NewLanguage(ts.LanguageTypescript())
 })
 
+// chunkAndEmbedNodes chunks the given nodes (markdown headings / tree-sitter
+// for Go+TS) and embeds each chunk in batches of 32, storing them via
+// db.UpsertChunks. No-op (returns 0, nil) if embedder is nil — callers
+// degrade gracefully to lexical-only search. Shared by the MCP "ingest"
+// tool and the HTTP POST /ingest/{adapter} handler so both paths get
+// chunking+embedding instead of just one.
+func chunkAndEmbedNodes(ctx context.Context, db store.Store, embedder embed.EmbedderBackend, nodes []store.Node) (int, error) {
+	if embedder == nil {
+		return 0, nil
+	}
+
+	var allChunks []store.Chunk
+	goLang := goLanguage()
+	tsLang := tsLanguage()
+	for _, n := range nodes {
+		allChunks = append(allChunks, chunkForNode(n, chunker.DefaultConfig(), goLang, tsLang)...)
+	}
+	if len(allChunks) == 0 {
+		return 0, nil
+	}
+
+	const batchSize = 32
+	for i := 0; i < len(allChunks); i += batchSize {
+		end := i + batchSize
+		if end > len(allChunks) {
+			end = len(allChunks)
+		}
+		batch := allChunks[i:end]
+		texts := make([]string, len(batch))
+		for j, c := range batch {
+			texts[j] = c.Content
+		}
+		vecs, err := embedder.EmbedBatch(ctx, texts)
+		if err != nil {
+			return 0, fmt.Errorf("embed batch %d-%d: %w", i, end, err)
+		}
+		for j := range batch {
+			allChunks[i+j].Embedding = vecs[j]
+		}
+	}
+
+	if err := db.UpsertChunks(ctx, allChunks); err != nil {
+		return 0, err
+	}
+	return len(allChunks), nil
+}
+
 // NewServer creates an MCP server with all tastastas tools registered.
 // The store and embedder are injected by the caller (cmd/tastastas/main.go)
 // — no lazy init, no import cycle, clean dependency injection. Pass a nil
@@ -222,42 +269,9 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 		}
 
 		// Chunk and embed ingested nodes if embedder is available.
-		// Batched in groups of 32 to amortize HTTP overhead per Ollama call.
-		chunkCount := 0
-		if embedder != nil {
-			var allChunks []store.Chunk
-			goLang := goLanguage()
-			tsLang := tsLanguage()
-			for _, n := range nodes {
-				allChunks = append(allChunks, chunkForNode(n, chunker.DefaultConfig(), goLang, tsLang)...)
-			}
-
-			const batchSize = 32
-			for i := 0; i < len(allChunks); i += batchSize {
-				end := i + batchSize
-				if end > len(allChunks) {
-					end = len(allChunks)
-				}
-				batch := allChunks[i:end]
-				texts := make([]string, len(batch))
-				for j, c := range batch {
-					texts[j] = c.Content
-				}
-				vecs, err := embedder.EmbedBatch(ctx, texts)
-				if err != nil {
-					return errorResult(fmt.Errorf("embed batch %d-%d: %w", i, end, err)), IngestOutput{}, nil
-				}
-				for j := range batch {
-					allChunks[i+j].Embedding = vecs[j]
-				}
-			}
-
-			if len(allChunks) > 0 {
-				if err := db.UpsertChunks(ctx, allChunks); err != nil {
-					return errorResult(err), IngestOutput{}, nil
-				}
-				chunkCount = len(allChunks)
-			}
+		chunkCount, err := chunkAndEmbedNodes(ctx, db, embedder, nodes)
+		if err != nil {
+			return errorResult(err), IngestOutput{}, nil
 		}
 
 		out := IngestOutput{NodesIngested: len(nodes), EdgesCreated: len(edges), ChunksCreated: chunkCount}

@@ -15,6 +15,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -23,6 +24,7 @@ import (
 	_ "modernc.org/sqlite/vec"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/mystaline-dev/tastastas/internal/embed"
 	mcpserver "github.com/mystaline-dev/tastastas/internal/mcp"
 	sqlitestore "github.com/mystaline-dev/tastastas/internal/store/sqlite"
 )
@@ -33,8 +35,16 @@ import (
 // production code) and waits for /health to respond before returning.
 func startHTTPServer(t *testing.T) (addr string) {
 	t.Helper()
+	return startHTTPServerWithEmbedder(t, nil, 8)
+}
+
+// startHTTPServerWithEmbedder is startHTTPServer with an injected embedder
+// and explicit vector dimension — used by tests that need real chunk
+// embedding (e.g. the sidecar-backed /ingest/{adapter} test).
+func startHTTPServerWithEmbedder(t *testing.T, embedder embed.EmbedderBackend, dim int) (addr string) {
+	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "e2e-http.db")
-	db, err := sqlitestore.Open(context.Background(), dbPath, 8)
+	db, err := sqlitestore.Open(context.Background(), dbPath, dim)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -48,7 +58,7 @@ func startHTTPServer(t *testing.T) (addr string) {
 		port := 20000 + rand.Intn(20000)
 		addr = fmt.Sprintf("127.0.0.1:%d", port)
 		errCh := make(chan error, 1)
-		go func() { errCh <- mcpserver.ServeHTTP(ctx, db, nil, addr) }()
+		go func() { errCh <- mcpserver.ServeHTTP(ctx, db, embedder, addr) }()
 
 		// Poll /health with backoff; a bind failure surfaces almost
 		// immediately on errCh, a success means /health starts responding
@@ -80,6 +90,63 @@ func startHTTPServer(t *testing.T) (addr string) {
 	}
 	t.Fatalf("could not start HTTP server after 10 attempts: %v", lastErr)
 	return ""
+}
+
+// TestE2EHTTPIngestChunksAndEmbeds proves POST /ingest/{adapter} chunks and
+// embeds ingested nodes exactly like the MCP "ingest" tool does (this was a
+// real gap: the REST path used to only upsert nodes, never call the
+// embedder). Uses the real ONNX sidecar so this is genuine embedding, not a
+// mock — skips gracefully if no baked sidecar binary exists for this
+// platform.
+func TestE2EHTTPIngestChunksAndEmbeds(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping E2E HTTP test in -short mode")
+	}
+	sc, err := embed.NewSidecar()
+	if err != nil {
+		t.Skipf("sidecar unavailable on this platform: %v", err)
+	}
+	defer sc.Close()
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "notes.md"), []byte(
+		"# Auth Notes\n\nJWT validation happens in the middleware layer.\n\n"+
+			"## Token Parsing\n\nBearer tokens are parsed from the Authorization header.\n",
+	), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	addr := startHTTPServerWithEmbedder(t, sc, 384)
+	base := "http://" + addr
+
+	body, _ := json.Marshal(map[string]any{
+		"root":       root,
+		"project_id": "e2e-ingest-chunks",
+	})
+	resp, err := http.Post(base+"/ingest/docwalk", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /ingest/docwalk: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("POST /ingest/docwalk: status %d: %s", resp.StatusCode, b)
+	}
+
+	var out struct {
+		NodesIngested int `json:"nodes_ingested"`
+		EdgesCreated  int `json:"edges_created"`
+		ChunksCreated int `json:"chunks_created"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode /ingest/docwalk: %v", err)
+	}
+	if out.NodesIngested == 0 {
+		t.Fatalf("expected >=1 node ingested, got %+v", out)
+	}
+	if out.ChunksCreated == 0 {
+		t.Fatalf("expected chunks_created > 0 — REST ingest path did not chunk/embed, got %+v", out)
+	}
 }
 
 func TestE2EHTTPHealthAndIngest(t *testing.T) {
