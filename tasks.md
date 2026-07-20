@@ -41,13 +41,19 @@ slipped through earlier). Need:
   See commit `1e1932f`.
 
 ## 4. Dedup threshold recalibration
-Current `dedupe.DefaultThreshold = 0.80` derived from a small sample (13
-facts, 78 pairs, 4 hand-identified known-dup pairs) built from repo test
-fixtures, not real conversation data — flagged as a v1 placeholder in
-`internal/dedupe/dedupe.go`'s doc comment.
-- [ ] Re-run `prototype/scoring.py` against a larger, more diverse
-      real-conversation corpus once available
-- [ ] Update `DefaultThreshold` + doc comment with the new derived value
+- [x] Re-ran calibration against real data: 22 facts from a personal
+      side-project's Claude Code session memory (Regista, no NDA concerns).
+      Each fact has 2 independently-authored terse phrasings (MEMORY.md
+      index line + frontmatter description) — genuine same-register
+      same-fact-reworded pairs, not invented paraphrases.
+- [x] Same-register true-pos (n=22): min=0.641 median=0.877 max=0.939.
+      Same-register true-neg (n=231): min=0.340 median=0.532 p95=0.647
+      max=0.710. Clean separation, much better than v1's noisy
+      mismatched-register synthetic run.
+- [x] `DefaultThreshold` updated 0.80 → 0.71 (0.8% error rate on this
+      sample, zero wrong-merges). Doc comment in `dedupe.go` fully
+      documents both v1 and v2 calibration runs.
+  See commit `578e2f4`.
 
 ## 5. Phase 7 — docs + release
 Blocked on 1-4 being closed out per current sequencing (do the fill-in pass
