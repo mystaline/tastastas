@@ -21,12 +21,15 @@ slipped through earlier). Need:
   per transport (remember→recall→link→check_impact→forget). Both met.
 
 ## 2. `-race` coverage
-Never run in this repo. `go test -race ./...` needs to actually execute.
-HTTP server + concurrent SQLite access is the real risk case once Tier-3 E2E
-tests exist and can drive concurrent requests.
-- [ ] Add `-race` to the standard verify command
-- [ ] Run once Tier-3 HTTP E2E tests exist (concurrent client requests needed
-      to actually exercise a race, if one exists)
+- [x] Added `internal/e2e/concurrent_test.go`: real concurrent load (20
+      webhook-ingest + 20 health-check requests interleaved) against a real
+      running HTTP server, run under `go test -race`.
+- [x] Full suite (11 packages) passes clean under `go test ./... -race -count=1`,
+      run 3x back to back, zero races detected. `internal/store/sqlite`
+      already caps `SetMaxOpenConns(1)` (avoids SQLITE_BUSY), which serializes
+      DB access at the connection-pool layer — this test confirms nothing
+      above that layer (HTTP handlers, MCP tool closures) introduces a race.
+  See commit `34bc19d`.
 
 ## 3. `golangci-lint`
 - [x] `.golangci.yml` added, enabled: errorlint, gocritic, unused, govet,
