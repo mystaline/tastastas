@@ -56,8 +56,12 @@ slipped through earlier). Need:
   See commit `578e2f4`.
 
 ## 5. Phase 7 — docs + release
-Blocked on 1-4 being closed out per current sequencing (do the fill-in pass
-first, then finalize).
-- [ ] Full README rewrite: pitch, quickstart, architecture diagram, config
-      reference, roadmap
-- [ ] Tag `v0.1.0`
+- [x] Full README rewrite: pitch, quickstart (build/run commands verified
+      against actual `--help` output), architecture diagram, MCP tool
+      table, adapter list, `.memoryrc.yaml` config reference (verified
+      against real testdata fixture), HTTP route table (verified against
+      `http.go` source), dev/verify commands, roadmap.
+      See commit `adc1fea`.
+- [x] Tagged `v0.1.0`.
+
+All 5 items closed. v0.1.0 shipped.
