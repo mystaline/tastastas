@@ -1,0 +1,134 @@
+[
+  {
+    "id": "agent-caps-and-self-abort",
+    "form_a": "Developer's design (2026-06-12), after T1 (HelperAgent, backend) burned ~24 min / 21 tool-uses reading + searching and died with ZERO files at the 32k output ceiling \u2014 having wandered (e.g. hunting `mig` in the wrong place) instead of bailing early.",
+    "form_b": "prompts include retry/knowledge caps; agent self-aborts early with structured reason; orchestrator auto-relaunches non-blocking with the gap filled; also a Regista product feature",
+    "form_c": "Agent prompts must include explicit caps (retry-per-action limit, knowledge/capability cap); on hitting a cap the agent self-aborts EARLY with a structured reason, and the orchestrator auto-relaunches with augmented context \u2014 non-blocking, no human gate"
+  },
+  {
+    "id": "agent-name-in-task-description",
+    "form_a": "Developer's correction (2026-06-15): after resuming /sdlc-orchestrate, the agent NAMES (Melania si Sibuk, Tuesday si Nyentrik, etc.) never appeared in the task list \u2014 they only showed when he explicitly asked. Cause: the orchestrator was putting a FUNCTIONAL label in the Agent tool's `description` field (e.g. \"Finish PRD amendment spots 3-6\", \"Live re-run \u2014 DeepSeek cascade\") instead of the character name.",
+    "form_b": "put the character NAME (name-first) in the Agent tool's description field so it shows in the task list by default, not a functional label",
+    "form_c": "When launching SDLC agents, put the character NAME in the Agent tool's description field (name first), so it shows in the task list by default \u2014 not a functional label"
+  },
+  {
+    "id": "ai-synthesized-prd-needs-user-gate",
+    "form_a": "During the stage1-specs sprint (2026-06-11), Developer caught the orchestrator about to launch 1b (UI/UX + Backend seniors) right after the architect revised an AI-synthesized PRD, with no user review in between.",
+    "form_b": "Stage-0-born PRD: user must confirm revised PRD between 1a and 1b; post-1c gate alone is too late",
+    "form_c": "When the PRD originates from AI (Stage 0c), the revised PRD requires explicit user confirmation BEFORE launching 1b \u2014 not just the post-1c doc gate"
+  },
+  {
+    "id": "amendment-watchlist-all-docs",
+    "form_a": "Developer's rule (2026-06-12), after the orchestrator twice claimed ERD/APISpec \"not impacted\" by the REVISED-3 gate-model amendment and was wrong (APISpec was impacted; ERD needed at least review).",
+    "form_b": "every amendment puts ALL docs/ on a watchlist, none pre-excluded; each gets a changed/checked-unchanged verdict at the gate, verified on disk",
+    "form_c": "Every amendment puts ALL docs/ files on a watchlist \u2014 none pre-excluded as \\\"not impacted\\\"; each gets an explicit changed/checked-unchanged verdict at the gate"
+  },
+  {
+    "id": "contributor-evidence-report-sop",
+    "form_a": "Developer's SOP request (2026-06-13). After an engine programmer reported a stubbed core as \"done\" with soft caveats (caught only by QC), Developer required a STANDARD evidence template: gates demand proof, not the orchestrator running checks; the template makes evaluation uniform and forces honest disclosure of what does NOT work.",
+    "form_b": "standard EVIDENCE REPORT template every agent fills (requirements status / proof-of-behavior / mandatory NOT-WORKING list); gate demands this proof; compile-green + soft caveats \u2260 done",
+    "form_c": "Standard EVIDENCE REPORT template every agent (programmer/QC/fixer/verification) must fill at the end of its task, so the orchestrator evaluates consistently and agents cannot hide stubs \u2014 the gate demands this proof"
+  },
+  {
+    "id": "heavy-runs-are-user-elected",
+    "form_a": "Developer (2026-06-14), greenlighting the product-final-defense full-cascade live run: \"yes, final defense let user choice to burn token or they do test after DoD by themselves.\"",
+    "form_b": "token-heavy live validation (full-cascade LLM e2e, BYOK-key runs) is the user's spend decision: offer run-now vs defer-to-user post-DoD; cheap/offline checks stay autonomous",
+    "form_c": "Token-heavy validation runs (full-cascade live e2e, large LLM-execution tests) are the user's explicit choice to spend on \u2014 offer run-now vs defer-to-user; never auto-burn"
+  },
+  {
+    "id": "no-autonomous-action-during-tooling-fix",
+    "form_a": "During the sandbox poc-gate-bridge sprint (2026-06-10), the session's subagent permissions were broken from the start. While that was being debugged, the orchestrator repeatedly took unrequested initiative (launching workers, harvesting PoC results, writing FINDINGS/PROGRESS, prepping commits). Developer's correction, verbatim intent: \"jangan pernah beraksi sendiri... itu yg sedang kita fix, jangan asik sendiri dan melanjutkan poc sampe selesai.\"",
+    "form_b": "Developer's direct order: one step then stop; when tooling is broken, fixing it IS the task; never auto-resume product work",
+    "form_c": "Developer's direct order (2026-06-10) \u2014 never act autonomously; when a session's tooling is broken, fixing the tooling IS the task, don't run ahead to finish the product work"
+  },
+  {
+    "id": "no-committing-orchestration-artifacts",
+    "form_a": "During sprint poc-gate-bridge (2026-06-11, sandbox repo), Developer rejected the orchestrator's\nbaseline commits twice: first \"dont commit artifacts etc\" (hook, settings.json, PROGRESS.md\nscaffold), then stopped even the DECISIONS.md-only commit \u2014 \"i and sdlc said no commit to\nartifacts\". Developer also manages git exclusion himself (said \".claude already git excluded\"),\nso don't edit .gitignore for orchestration files either.",
+    "form_b": "commits are deliverable-only after gates; Developer controls baseline commits and gitignore himself",
+    "form_c": "Developer rejected committing sprint orchestration artifacts (.claude hook/settings, PROGRESS.md) and even the baseline DECISIONS.md commit in sandbox \u2014 no commits without explicit go-ahead"
+  },
+  {
+    "id": "orchestrator-delegates-gate-runs",
+    "form_a": "Developer enforced this (2026-06-13) after the orchestrator kept running `go build/test/vet`, `govulncheck`, `npx tsc`, `npm run build` itself to \"independently verify\" agents' work. Extends [[orchestrator-never-edits-docs]] and the \"no biar-saya-aja\" rule: running the toolchain is executing engineering work, which is the agent's job \u2014 not the PM/orchestrator's.",
+    "form_b": "orchestrator never runs build/test/lint/vuln (go build/test/vet, npx tsc, npm build, govulncheck); a verification agent runs them, orchestrator reads the verdict; only operational inspection (ls/grep/cat) allowed",
+    "form_c": "HARD RULE \u2014 the orchestrator does NOT run build/test/lint/vuln gate commands itself (go build/test/vet, npx tsc, npm/pnpm build, govulncheck); those are run by agents (programmer self-verify + an independent verification agent). The orchestrator reads the verdict"
+  },
+  {
+    "id": "orchestrator-never-edits-docs",
+    "form_a": "Developer enforced this strictly (2026-06-12) after the orchestrator repeatedly made direct edits to docs/ (ERD enum, APISpec A8 row, VisualDesign \u00a78.1) during the REVISED-3 VisualDesign amendment, and was caught mid-edit on VisualDesign's data block.",
+    "form_b": "HARD RULE: orchestrator never writes any docs/ file (no enum/field/typo exceptions); always dispatch the owning agent; never fall back to \"biar saya aja\"",
+    "form_c": "HARD RULE \u2014 the SDLC orchestrator NEVER edits docs/ files directly, not even one-line/mechanical/enum/field-name syncs; ALL doc edits go through the owning senior agent"
+  },
+  {
+    "id": "orchestrator-plain-language",
+    "form_a": "When acting as SDLC orchestrator (and generally), Developer found the responses hard to follow \u2014 too dense, too many clauses, jargon-heavy.",
+    "form_b": "Developer wants short, simple, easy-to-read replies; lead with the answer; no dense clause pile-ups",
+    "form_c": "Developer wants the orchestrator to use plain, easy-to-understand language \u2014 not dense or convoluted phrasing"
+  },
+  {
+    "id": "orchestrator-runs-autonomously",
+    "form_a": "Developer (2026-06-13): \"dont ask for my command to launch, you're orchestrator, continue unless i pre-warn about pausing.\" As SDLC orchestrator, drive the full backlog to completion on your own \u2014 launch the next agent/wave, route QC findings to fixers, run gate verification \u2014 WITHOUT asking \"want me to launch X?\" or \"say go\" between steps.",
+    "form_b": "drive the backlog to completion; never ask per-step launch permission (\"say go\"); only pause when user pre-warns, a dependency blocks all work, the QC cap/product decision hits, or tooling is broken",
+    "form_c": "Orchestrator drives the backlog to completion autonomously; never ask per-step launch permission \u2014 only pause when the user pre-warns"
+  },
+  {
+    "id": "qa-automation-boundary",
+    "form_a": "Developer (2026-06-14): \"for qa, no changes to their automation, test case still source of truth for qa, unless cascading changes start from prd.\"",
+    "form_b": "dev/orchestrator never edits TestCase.md or QA e2e automation; TestCase.md is QA's source of truth; QA artifacts change only on PRD-cascading amendments; dev-side unit tests + pre-push hooks are fine and separate",
+    "form_c": "QA's automation + TestCase.md are not altered by the dev/orchestrator side; TestCase.md is QA's source of truth; only PRD-cascading changes touch QA artifacts"
+  },
+  {
+    "id": "sandbox-actual-sdlc-flow",
+    "form_a": "The flow Developer ACTUALLY wants (stated emphatically 2026-06-15), which the PRD (AC-3.1.13/14) AND the current engine phase enum get WRONG. If you only read one thing before touching Regista's phases, read this. The two structural corrections (design-aesthetic = stop; screen-data-map = verify) are the crux \u2014 miss them and you misbuild the product.",
+    "form_b": "REAL intended flow: design-aesthetic = a human STOP that generates nothing; screen-data-map = verify-and-amend ERD/APISpec (no doc); provided frontend drafts vs VisualDesign.md are interchangeable; PRD AC-3.1.13/14 + engine both mismodel this",
+    "form_c": "Regista's REAL intended SDLC flow \u2014 design-aesthetic is a human STOP (generates nothing), screen-data-map is a verify-and-amend (no doc); the PRD AC-3.1.13/14 and the engine both mismodel these"
+  },
+  {
+    "id": "sandbox-product-acceptance-bar",
+    "form_a": "Developer's acceptance definition for Regista (2026-06-14), governs the product DoD and how live-cascade runs are judged.",
+    "form_b": "done = workflow completes per TestCase.md defined cases with ~0 PRODUCT defects; artifact quality = model domain, not pass/fail; every defect found so far has been a product bug",
+    "form_c": "Regista \\\"done\\\" = SDLC workflow completes per TestCase.md defined cases with ~0 PRODUCT defects; artifact quality is the model's domain, NOT a pass/fail criterion"
+  },
+  {
+    "id": "sandbox-security-preprod-blockers",
+    "form_a": "Code audit 2026-06-14 (during the QA-codification sub-sprint). Regista's HTTP API is the real attack surface \u2014 \"no chat UI\" is irrelevant. The LLM's compliance is NOT a security boundary; assume prompt injection via attacker-controlled PRD text / clarification answers. Safety must come from the tool layer + execution isolation + API auth.",
+    "form_b": "3 must-fix-before-deploy holes: no API auth, verification-gate in-process RCE, unvalidated project_path; tool layer otherwise well-guarded",
+    "form_c": "Regista's 3 pre-production security blockers (no API auth, in-process verification-gate RCE, unvalidated project_path) \u2014 must fix before any deploy"
+  },
+  {
+    "id": "sandbox-v2-interact-less-northstar",
+    "form_a": "Developer's v2 vision (2026-06-14), drawn from the manual /sdlc-orchestrate sprint: Regista should need **minimal human interaction \u2014 only gate approve/reject + clarification answers via the inbox.** All the *guiding/correcting* the user did to the orchestrator this sprint (pin tooling, catch overclaims, stop agents, \"verify don't assume\", fix dead config) is friction the v2 ENGINE must design away.",
+    "form_b": "v2 product goal: human interacts ONLY at gate approve/reject + clarification; every orchestrator-guidance instance this sprint = a v2 engine requirement; acceptance = a sprint needing zero orchestrator correction",
+    "form_c": "Regista v2 product north-star \u2014 human interacts ONLY at gate approve/reject + clarification answers; every orchestrator-guidance instance from the manual sprint is an engine requirement"
+  },
+  {
+    "id": "sdlc-skill-retro-from-sandbox-sprints",
+    "form_a": "Developer wants every Regista sprint's `.claude/sprint-state.md` and `PROGRESS.md` to double as retro material for evolving the `/sdlc-orchestrate` skill (at `~/.claude/skills/sdlc-orchestrate`).",
+    "form_b": "sprint-state.md + PROGRESS.md double as evaluation material for improving /sdlc-orchestrate; review friction at every sprint close",
+    "form_c": "After each Regista sprint closes, use sprint-state.md + PROGRESS.md as evaluation material to improve the sdlc-orchestrate skill"
+  },
+  {
+    "id": "specify-external-tooling-in-prompts",
+    "form_a": "Developer flagged (2026-06-12, Stage 2 build): the T1 backend agent (HelperAgent) wasted effort searching go-utils for `mig`, because the orchestrator's prompt said only \"mig migration runner\" in the infra description. `mig` is actually a CLI BINARY (built from the sibling `migration-tool` repo, installed at `~/go/bin/mig` by the orchestrator), NOT a go-utils package or Go import. The correct facts were already in sprint-state, but the orchestrator summarized them vaguely into the prompt.",
+    "form_b": "agent prompts must state exactly what each tool is (installed binary vs import vs sibling repo) + exact path; vague refs (e.g. \"mig\") make the agent search/guess wrong",
+    "form_c": "Agent prompts must state EXACTLY what each referenced tool/dependency is (installed binary vs Go import vs sibling repo) and its exact path \u2014 vague references make the agent search or guess wrong"
+  },
+  {
+    "id": "stage1-pins-all-tooling",
+    "form_a": "Developer's principle (2026-06-12), traced from the T1/`mig` failure: SystemArchitecture only said \"mig migration runner\" \u2014 too vague \u2014 so the gap lived in the Stage-1 DOC, then propagated to the orchestrator's prompt, then to the agent who met `mig` cold and wandered. `mig` is Developer's OWN CLI tool (an agent cannot know it without being told), and Regista will eventually use `mig` as its FALLBACK migration tool \u2014 so it must be specified precisely enough to be a strong fallback, not mentioned in pass",
+    "form_b": "PRD+SysArch must pin every tooling/infra choice precisely (nature+source+use); architect asks if unspecified; \"agents decide\" is a recorded delegation; mig = Regista's fallback migration tool, spec it strongly",
+    "form_c": "Stage 1 (PRD + SystemArchitecture) must explicitly pin EVERY tooling/infra choice (backend utils lib, frontend component lib, migration tool, infra runner, build bundler, etc.); if the user didn't specify, the architect ASKS; \\\"agents decide\\\" is a valid recorded delegation"
+  },
+  {
+    "id": "start-needs-skill-invocation",
+    "form_a": "Developer's rule (2026-06-12). The orchestrator repeatedly treated a plain \"iya\"/\"yes\" in conversation as a go-signal and launched agents / started work. Developer flagged the orchestrator is \"rawan start meski ga valid keyword-nya\" \u2014 prone to starting even without a valid trigger keyword.",
+    "form_b": "starting a new sprint/amendment requires an explicit /sdlc-orchestrate invocation; conversational \"iya\"/\"oke\" is agreement, not a launch command; orchestrator is prone to starting on invalid keywords",
+    "form_c": "Starting a new sprint/amendment requires an explicit /sdlc-orchestrate invocation \u2014 a conversational \\\"iya\\\"/\\\"yes\\\" is agreement on direction, NOT a command to launch agents"
+  },
+  {
+    "id": "verify-on-track-before-idle",
+    "form_a": "Developer (2026-06-13), after the orchestrator claimed \"2 agents running\" when only 1 was (a Docker task was written into sprint-state as \"[LAUNCH]\" but the Agent tool was never actually called \u2014 a notification interrupted the turn between the state-write and the launch): \"whenever you orchestrator planning/executing something, ensure everything is on track before considering idle to wait, as well as each agents contributor.\"",
+    "form_b": "never say \"waiting\" from a state line; check task-file write-age + deliverable on disk; silence/no-notification \u2260 running; write the LAUNCH line only after the agentId returns",
+    "form_c": "Before going idle/waiting, verify the plan actually executed and every agent contributor is genuinely running & progressing \u2014 never from a state line, always from real evidence"
+  }
+]

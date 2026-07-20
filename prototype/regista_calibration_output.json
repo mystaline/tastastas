@@ -1,0 +1,1018 @@
+{
+  "tp_same_register": [
+    [
+      "agent-caps-and-self-abort",
+      0.8994917828339213
+    ],
+    [
+      "agent-name-in-task-description",
+      0.9135508296388001
+    ],
+    [
+      "ai-synthesized-prd-needs-user-gate",
+      0.8512998668401016
+    ],
+    [
+      "amendment-watchlist-all-docs",
+      0.9334719565468264
+    ],
+    [
+      "contributor-evidence-report-sop",
+      0.8549048397699525
+    ],
+    [
+      "heavy-runs-are-user-elected",
+      0.9162508380255553
+    ],
+    [
+      "no-autonomous-action-during-tooling-fix",
+      0.9092723999430243
+    ],
+    [
+      "no-committing-orchestration-artifacts",
+      0.7288007297375259
+    ],
+    [
+      "orchestrator-delegates-gate-runs",
+      0.9030591709182588
+    ],
+    [
+      "orchestrator-never-edits-docs",
+      0.7573309802741514
+    ],
+    [
+      "orchestrator-plain-language",
+      0.6943762117504727
+    ],
+    [
+      "orchestrator-runs-autonomously",
+      0.7880602704738343
+    ],
+    [
+      "qa-automation-boundary",
+      0.9281621344046639
+    ],
+    [
+      "sandbox-actual-sdlc-flow",
+      0.7866188782621348
+    ],
+    [
+      "sandbox-product-acceptance-bar",
+      0.9139704797350947
+    ],
+    [
+      "sandbox-security-preprod-blockers",
+      0.8386890621285158
+    ],
+    [
+      "sandbox-v2-interact-less-northstar",
+      0.8772417658544904
+    ],
+    [
+      "sdlc-skill-retro-from-sandbox-sprints",
+      0.8698132204420128
+    ],
+    [
+      "specify-external-tooling-in-prompts",
+      0.9388036666521461
+    ],
+    [
+      "stage1-pins-all-tooling",
+      0.8489738872061142
+    ],
+    [
+      "start-needs-skill-invocation",
+      0.9229350218791313
+    ],
+    [
+      "verify-on-track-before-idle",
+      0.6411474469155445
+    ]
+  ],
+  "tn_same_register": [
+    [
+      "agent-caps-and-self-abort vs agent-name-in-task-description",
+      0.5169154008959936
+    ],
+    [
+      "agent-caps-and-self-abort vs ai-synthesized-prd-needs-user-gate",
+      0.5405136858417241
+    ],
+    [
+      "agent-caps-and-self-abort vs amendment-watchlist-all-docs",
+      0.4718210841420153
+    ],
+    [
+      "agent-caps-and-self-abort vs contributor-evidence-report-sop",
+      0.5950619411713621
+    ],
+    [
+      "agent-caps-and-self-abort vs heavy-runs-are-user-elected",
+      0.5431742634691913
+    ],
+    [
+      "agent-caps-and-self-abort vs no-autonomous-action-during-tooling-fix",
+      0.6225858392566069
+    ],
+    [
+      "agent-caps-and-self-abort vs no-committing-orchestration-artifacts",
+      0.506139046436861
+    ],
+    [
+      "agent-caps-and-self-abort vs orchestrator-delegates-gate-runs",
+      0.5418394152005539
+    ],
+    [
+      "agent-caps-and-self-abort vs orchestrator-never-edits-docs",
+      0.6365425417827864
+    ],
+    [
+      "agent-caps-and-self-abort vs orchestrator-plain-language",
+      0.531226078480199
+    ],
+    [
+      "agent-caps-and-self-abort vs orchestrator-runs-autonomously",
+      0.6489594968528634
+    ],
+    [
+      "agent-caps-and-self-abort vs qa-automation-boundary",
+      0.5807488673249832
+    ],
+    [
+      "agent-caps-and-self-abort vs sandbox-actual-sdlc-flow",
+      0.5064090202504957
+    ],
+    [
+      "agent-caps-and-self-abort vs sandbox-product-acceptance-bar",
+      0.5285000667663723
+    ],
+    [
+      "agent-caps-and-self-abort vs sandbox-security-preprod-blockers",
+      0.5709634440560154
+    ],
+    [
+      "agent-caps-and-self-abort vs sandbox-v2-interact-less-northstar",
+      0.6475072345933076
+    ],
+    [
+      "agent-caps-and-self-abort vs sdlc-skill-retro-from-sandbox-sprints",
+      0.5138389378270876
+    ],
+    [
+      "agent-caps-and-self-abort vs specify-external-tooling-in-prompts",
+      0.6700883526693546
+    ],
+    [
+      "agent-caps-and-self-abort vs stage1-pins-all-tooling",
+      0.5971588646301837
+    ],
+    [
+      "agent-caps-and-self-abort vs start-needs-skill-invocation",
+      0.5930318739098913
+    ],
+    [
+      "agent-caps-and-self-abort vs verify-on-track-before-idle",
+      0.6301237547195323
+    ],
+    [
+      "agent-name-in-task-description vs ai-synthesized-prd-needs-user-gate",
+      0.40589580639239387
+    ],
+    [
+      "agent-name-in-task-description vs amendment-watchlist-all-docs",
+      0.34822939938770264
+    ],
+    [
+      "agent-name-in-task-description vs contributor-evidence-report-sop",
+      0.48004859643813386
+    ],
+    [
+      "agent-name-in-task-description vs heavy-runs-are-user-elected",
+      0.4216638361727281
+    ],
+    [
+      "agent-name-in-task-description vs no-autonomous-action-during-tooling-fix",
+      0.5110724234325987
+    ],
+    [
+      "agent-name-in-task-description vs no-committing-orchestration-artifacts",
+      0.44309820171982556
+    ],
+    [
+      "agent-name-in-task-description vs orchestrator-delegates-gate-runs",
+      0.4263808773492144
+    ],
+    [
+      "agent-name-in-task-description vs orchestrator-never-edits-docs",
+      0.5011212236969012
+    ],
+    [
+      "agent-name-in-task-description vs orchestrator-plain-language",
+      0.3399362805840333
+    ],
+    [
+      "agent-name-in-task-description vs orchestrator-runs-autonomously",
+      0.48348056216193924
+    ],
+    [
+      "agent-name-in-task-description vs qa-automation-boundary",
+      0.4329576464803315
+    ],
+    [
+      "agent-name-in-task-description vs sandbox-actual-sdlc-flow",
+      0.4531185970305548
+    ],
+    [
+      "agent-name-in-task-description vs sandbox-product-acceptance-bar",
+      0.44182108437571593
+    ],
+    [
+      "agent-name-in-task-description vs sandbox-security-preprod-blockers",
+      0.45985344211365015
+    ],
+    [
+      "agent-name-in-task-description vs sandbox-v2-interact-less-northstar",
+      0.47879269174050637
+    ],
+    [
+      "agent-name-in-task-description vs sdlc-skill-retro-from-sandbox-sprints",
+      0.3680627737504909
+    ],
+    [
+      "agent-name-in-task-description vs specify-external-tooling-in-prompts",
+      0.6151142255253513
+    ],
+    [
+      "agent-name-in-task-description vs stage1-pins-all-tooling",
+      0.5100586165259392
+    ],
+    [
+      "agent-name-in-task-description vs start-needs-skill-invocation",
+      0.4522492790262845
+    ],
+    [
+      "agent-name-in-task-description vs verify-on-track-before-idle",
+      0.5332849569471486
+    ],
+    [
+      "ai-synthesized-prd-needs-user-gate vs amendment-watchlist-all-docs",
+      0.5109080449365733
+    ],
+    [
+      "ai-synthesized-prd-needs-user-gate vs contributor-evidence-report-sop",
+      0.5315386209968721
+    ],
+    [
+      "ai-synthesized-prd-needs-user-gate vs heavy-runs-are-user-elected",
+      0.5632638553104725
+    ],
+    [
+      "ai-synthesized-prd-needs-user-gate vs no-autonomous-action-during-tooling-fix",
+      0.47024294293526403
+    ],
+    [
+      "ai-synthesized-prd-needs-user-gate vs no-committing-orchestration-artifacts",
+      0.5435234106752
+    ],
+    [
+      "ai-synthesized-prd-needs-user-gate vs orchestrator-delegates-gate-runs",
+      0.4436158974308426
+    ],
+    [
+      "ai-synthesized-prd-needs-user-gate vs orchestrator-never-edits-docs",
+      0.4622652789398804
+    ],
+    [
+      "ai-synthesized-prd-needs-user-gate vs orchestrator-plain-language",
+      0.38935636164562903
+    ],
+    [
+      "ai-synthesized-prd-needs-user-gate vs orchestrator-runs-autonomously",
+      0.5351404357377032
+    ],
+    [
+      "ai-synthesized-prd-needs-user-gate vs qa-automation-boundary",
+      0.5204953682299439
+    ],
+    [
+      "ai-synthesized-prd-needs-user-gate vs sandbox-actual-sdlc-flow",
+      0.5457405201207214
+    ],
+    [
+      "ai-synthesized-prd-needs-user-gate vs sandbox-product-acceptance-bar",
+      0.5105608715095546
+    ],
+    [
+      "ai-synthesized-prd-needs-user-gate vs sandbox-security-preprod-blockers",
+      0.5538917271719503
+    ],
+    [
+      "ai-synthesized-prd-needs-user-gate vs sandbox-v2-interact-less-northstar",
+      0.5682772554314587
+    ],
+    [
+      "ai-synthesized-prd-needs-user-gate vs sdlc-skill-retro-from-sandbox-sprints",
+      0.46912521068998997
+    ],
+    [
+      "ai-synthesized-prd-needs-user-gate vs specify-external-tooling-in-prompts",
+      0.4872375107976527
+    ],
+    [
+      "ai-synthesized-prd-needs-user-gate vs stage1-pins-all-tooling",
+      0.5192727055783223
+    ],
+    [
+      "ai-synthesized-prd-needs-user-gate vs start-needs-skill-invocation",
+      0.46390347585056785
+    ],
+    [
+      "ai-synthesized-prd-needs-user-gate vs verify-on-track-before-idle",
+      0.5226408668104168
+    ],
+    [
+      "amendment-watchlist-all-docs vs contributor-evidence-report-sop",
+      0.571562251197422
+    ],
+    [
+      "amendment-watchlist-all-docs vs heavy-runs-are-user-elected",
+      0.543257537474706
+    ],
+    [
+      "amendment-watchlist-all-docs vs no-autonomous-action-during-tooling-fix",
+      0.4663808848763001
+    ],
+    [
+      "amendment-watchlist-all-docs vs no-committing-orchestration-artifacts",
+      0.5356830291132054
+    ],
+    [
+      "amendment-watchlist-all-docs vs orchestrator-delegates-gate-runs",
+      0.5450621516432892
+    ],
+    [
+      "amendment-watchlist-all-docs vs orchestrator-never-edits-docs",
+      0.5267220387411665
+    ],
+    [
+      "amendment-watchlist-all-docs vs orchestrator-plain-language",
+      0.4268728466951496
+    ],
+    [
+      "amendment-watchlist-all-docs vs orchestrator-runs-autonomously",
+      0.5353555998272537
+    ],
+    [
+      "amendment-watchlist-all-docs vs qa-automation-boundary",
+      0.5919962250391783
+    ],
+    [
+      "amendment-watchlist-all-docs vs sandbox-actual-sdlc-flow",
+      0.5062558301832839
+    ],
+    [
+      "amendment-watchlist-all-docs vs sandbox-product-acceptance-bar",
+      0.563977037181706
+    ],
+    [
+      "amendment-watchlist-all-docs vs sandbox-security-preprod-blockers",
+      0.5035375979602931
+    ],
+    [
+      "amendment-watchlist-all-docs vs sandbox-v2-interact-less-northstar",
+      0.49838264206658095
+    ],
+    [
+      "amendment-watchlist-all-docs vs sdlc-skill-retro-from-sandbox-sprints",
+      0.48835012710396564
+    ],
+    [
+      "amendment-watchlist-all-docs vs specify-external-tooling-in-prompts",
+      0.4766092628556338
+    ],
+    [
+      "amendment-watchlist-all-docs vs stage1-pins-all-tooling",
+      0.5110896604305283
+    ],
+    [
+      "amendment-watchlist-all-docs vs start-needs-skill-invocation",
+      0.4462746971231255
+    ],
+    [
+      "amendment-watchlist-all-docs vs verify-on-track-before-idle",
+      0.4965900208201575
+    ],
+    [
+      "contributor-evidence-report-sop vs heavy-runs-are-user-elected",
+      0.5273002666690766
+    ],
+    [
+      "contributor-evidence-report-sop vs no-autonomous-action-during-tooling-fix",
+      0.5004537140165686
+    ],
+    [
+      "contributor-evidence-report-sop vs no-committing-orchestration-artifacts",
+      0.5489683356362557
+    ],
+    [
+      "contributor-evidence-report-sop vs orchestrator-delegates-gate-runs",
+      0.5444351468051474
+    ],
+    [
+      "contributor-evidence-report-sop vs orchestrator-never-edits-docs",
+      0.5677823587954999
+    ],
+    [
+      "contributor-evidence-report-sop vs orchestrator-plain-language",
+      0.5065409020729287
+    ],
+    [
+      "contributor-evidence-report-sop vs orchestrator-runs-autonomously",
+      0.5323415417397322
+    ],
+    [
+      "contributor-evidence-report-sop vs qa-automation-boundary",
+      0.556636513949654
+    ],
+    [
+      "contributor-evidence-report-sop vs sandbox-actual-sdlc-flow",
+      0.5427780973673777
+    ],
+    [
+      "contributor-evidence-report-sop vs sandbox-product-acceptance-bar",
+      0.5846930096818543
+    ],
+    [
+      "contributor-evidence-report-sop vs sandbox-security-preprod-blockers",
+      0.5757121340966168
+    ],
+    [
+      "contributor-evidence-report-sop vs sandbox-v2-interact-less-northstar",
+      0.5745982515496784
+    ],
+    [
+      "contributor-evidence-report-sop vs sdlc-skill-retro-from-sandbox-sprints",
+      0.5242864756676798
+    ],
+    [
+      "contributor-evidence-report-sop vs specify-external-tooling-in-prompts",
+      0.6005321417947972
+    ],
+    [
+      "contributor-evidence-report-sop vs stage1-pins-all-tooling",
+      0.5564854251210938
+    ],
+    [
+      "contributor-evidence-report-sop vs start-needs-skill-invocation",
+      0.49365181763900157
+    ],
+    [
+      "contributor-evidence-report-sop vs verify-on-track-before-idle",
+      0.537972428973539
+    ],
+    [
+      "heavy-runs-are-user-elected vs no-autonomous-action-during-tooling-fix",
+      0.500883135708387
+    ],
+    [
+      "heavy-runs-are-user-elected vs no-committing-orchestration-artifacts",
+      0.5644756705446927
+    ],
+    [
+      "heavy-runs-are-user-elected vs orchestrator-delegates-gate-runs",
+      0.5543644252598531
+    ],
+    [
+      "heavy-runs-are-user-elected vs orchestrator-never-edits-docs",
+      0.4725910026251449
+    ],
+    [
+      "heavy-runs-are-user-elected vs orchestrator-plain-language",
+      0.4637250912940933
+    ],
+    [
+      "heavy-runs-are-user-elected vs orchestrator-runs-autonomously",
+      0.5965212530823554
+    ],
+    [
+      "heavy-runs-are-user-elected vs qa-automation-boundary",
+      0.5445880627710012
+    ],
+    [
+      "heavy-runs-are-user-elected vs sandbox-actual-sdlc-flow",
+      0.5321346310016305
+    ],
+    [
+      "heavy-runs-are-user-elected vs sandbox-product-acceptance-bar",
+      0.47820245512562315
+    ],
+    [
+      "heavy-runs-are-user-elected vs sandbox-security-preprod-blockers",
+      0.5684810754849078
+    ],
+    [
+      "heavy-runs-are-user-elected vs sandbox-v2-interact-less-northstar",
+      0.5592642801208135
+    ],
+    [
+      "heavy-runs-are-user-elected vs sdlc-skill-retro-from-sandbox-sprints",
+      0.47257929016869205
+    ],
+    [
+      "heavy-runs-are-user-elected vs specify-external-tooling-in-prompts",
+      0.534446871395594
+    ],
+    [
+      "heavy-runs-are-user-elected vs stage1-pins-all-tooling",
+      0.5368508712416379
+    ],
+    [
+      "heavy-runs-are-user-elected vs start-needs-skill-invocation",
+      0.5095556178951274
+    ],
+    [
+      "heavy-runs-are-user-elected vs verify-on-track-before-idle",
+      0.5037987108559476
+    ],
+    [
+      "no-autonomous-action-during-tooling-fix vs no-committing-orchestration-artifacts",
+      0.6038533328006497
+    ],
+    [
+      "no-autonomous-action-during-tooling-fix vs orchestrator-delegates-gate-runs",
+      0.492914482248178
+    ],
+    [
+      "no-autonomous-action-during-tooling-fix vs orchestrator-never-edits-docs",
+      0.6211855968088543
+    ],
+    [
+      "no-autonomous-action-during-tooling-fix vs orchestrator-plain-language",
+      0.6360605913835162
+    ],
+    [
+      "no-autonomous-action-during-tooling-fix vs orchestrator-runs-autonomously",
+      0.7098202533704787
+    ],
+    [
+      "no-autonomous-action-during-tooling-fix vs qa-automation-boundary",
+      0.5119078662364885
+    ],
+    [
+      "no-autonomous-action-during-tooling-fix vs sandbox-actual-sdlc-flow",
+      0.4987333764279618
+    ],
+    [
+      "no-autonomous-action-during-tooling-fix vs sandbox-product-acceptance-bar",
+      0.5569296462503063
+    ],
+    [
+      "no-autonomous-action-during-tooling-fix vs sandbox-security-preprod-blockers",
+      0.5398805189214851
+    ],
+    [
+      "no-autonomous-action-during-tooling-fix vs sandbox-v2-interact-less-northstar",
+      0.5391600284355531
+    ],
+    [
+      "no-autonomous-action-during-tooling-fix vs sdlc-skill-retro-from-sandbox-sprints",
+      0.44964560328181846
+    ],
+    [
+      "no-autonomous-action-during-tooling-fix vs specify-external-tooling-in-prompts",
+      0.5662704975519794
+    ],
+    [
+      "no-autonomous-action-during-tooling-fix vs stage1-pins-all-tooling",
+      0.5382634783959298
+    ],
+    [
+      "no-autonomous-action-during-tooling-fix vs start-needs-skill-invocation",
+      0.5144919092370538
+    ],
+    [
+      "no-autonomous-action-during-tooling-fix vs verify-on-track-before-idle",
+      0.6013787021790682
+    ],
+    [
+      "no-committing-orchestration-artifacts vs orchestrator-delegates-gate-runs",
+      0.5299506873371439
+    ],
+    [
+      "no-committing-orchestration-artifacts vs orchestrator-never-edits-docs",
+      0.5498609035256941
+    ],
+    [
+      "no-committing-orchestration-artifacts vs orchestrator-plain-language",
+      0.5853054802920391
+    ],
+    [
+      "no-committing-orchestration-artifacts vs orchestrator-runs-autonomously",
+      0.5701731320299943
+    ],
+    [
+      "no-committing-orchestration-artifacts vs qa-automation-boundary",
+      0.5116224435014122
+    ],
+    [
+      "no-committing-orchestration-artifacts vs sandbox-actual-sdlc-flow",
+      0.45660389439416177
+    ],
+    [
+      "no-committing-orchestration-artifacts vs sandbox-product-acceptance-bar",
+      0.48358610575057753
+    ],
+    [
+      "no-committing-orchestration-artifacts vs sandbox-security-preprod-blockers",
+      0.561856042301509
+    ],
+    [
+      "no-committing-orchestration-artifacts vs sandbox-v2-interact-less-northstar",
+      0.5725410943108362
+    ],
+    [
+      "no-committing-orchestration-artifacts vs sdlc-skill-retro-from-sandbox-sprints",
+      0.4746422492189237
+    ],
+    [
+      "no-committing-orchestration-artifacts vs specify-external-tooling-in-prompts",
+      0.46892172204792276
+    ],
+    [
+      "no-committing-orchestration-artifacts vs stage1-pins-all-tooling",
+      0.49876968056219945
+    ],
+    [
+      "no-committing-orchestration-artifacts vs start-needs-skill-invocation",
+      0.5262544932261225
+    ],
+    [
+      "no-committing-orchestration-artifacts vs verify-on-track-before-idle",
+      0.5233849730531952
+    ],
+    [
+      "orchestrator-delegates-gate-runs vs orchestrator-never-edits-docs",
+      0.6675273952075811
+    ],
+    [
+      "orchestrator-delegates-gate-runs vs orchestrator-plain-language",
+      0.36286257826944424
+    ],
+    [
+      "orchestrator-delegates-gate-runs vs orchestrator-runs-autonomously",
+      0.5480147604415357
+    ],
+    [
+      "orchestrator-delegates-gate-runs vs qa-automation-boundary",
+      0.669669596611995
+    ],
+    [
+      "orchestrator-delegates-gate-runs vs sandbox-actual-sdlc-flow",
+      0.48102896133421597
+    ],
+    [
+      "orchestrator-delegates-gate-runs vs sandbox-product-acceptance-bar",
+      0.5406593506354908
+    ],
+    [
+      "orchestrator-delegates-gate-runs vs sandbox-security-preprod-blockers",
+      0.5815452083054363
+    ],
+    [
+      "orchestrator-delegates-gate-runs vs sandbox-v2-interact-less-northstar",
+      0.6174321189772691
+    ],
+    [
+      "orchestrator-delegates-gate-runs vs sdlc-skill-retro-from-sandbox-sprints",
+      0.43861397363218135
+    ],
+    [
+      "orchestrator-delegates-gate-runs vs specify-external-tooling-in-prompts",
+      0.544299012965618
+    ],
+    [
+      "orchestrator-delegates-gate-runs vs stage1-pins-all-tooling",
+      0.5568020688489497
+    ],
+    [
+      "orchestrator-delegates-gate-runs vs start-needs-skill-invocation",
+      0.5457242934596361
+    ],
+    [
+      "orchestrator-delegates-gate-runs vs verify-on-track-before-idle",
+      0.5496333414067297
+    ],
+    [
+      "orchestrator-never-edits-docs vs orchestrator-plain-language",
+      0.5250808868416468
+    ],
+    [
+      "orchestrator-never-edits-docs vs orchestrator-runs-autonomously",
+      0.5801757793920304
+    ],
+    [
+      "orchestrator-never-edits-docs vs qa-automation-boundary",
+      0.6570162299463752
+    ],
+    [
+      "orchestrator-never-edits-docs vs sandbox-actual-sdlc-flow",
+      0.5088334325106862
+    ],
+    [
+      "orchestrator-never-edits-docs vs sandbox-product-acceptance-bar",
+      0.5274534092047025
+    ],
+    [
+      "orchestrator-never-edits-docs vs sandbox-security-preprod-blockers",
+      0.5149348515469019
+    ],
+    [
+      "orchestrator-never-edits-docs vs sandbox-v2-interact-less-northstar",
+      0.6545669644142014
+    ],
+    [
+      "orchestrator-never-edits-docs vs sdlc-skill-retro-from-sandbox-sprints",
+      0.4354620277118102
+    ],
+    [
+      "orchestrator-never-edits-docs vs specify-external-tooling-in-prompts",
+      0.5777274340860133
+    ],
+    [
+      "orchestrator-never-edits-docs vs stage1-pins-all-tooling",
+      0.5987930853867108
+    ],
+    [
+      "orchestrator-never-edits-docs vs start-needs-skill-invocation",
+      0.6016917258999471
+    ],
+    [
+      "orchestrator-never-edits-docs vs verify-on-track-before-idle",
+      0.6318024470043297
+    ],
+    [
+      "orchestrator-plain-language vs orchestrator-runs-autonomously",
+      0.4450232305324893
+    ],
+    [
+      "orchestrator-plain-language vs qa-automation-boundary",
+      0.3861724635178564
+    ],
+    [
+      "orchestrator-plain-language vs sandbox-actual-sdlc-flow",
+      0.3747953541693316
+    ],
+    [
+      "orchestrator-plain-language vs sandbox-product-acceptance-bar",
+      0.3861962865263129
+    ],
+    [
+      "orchestrator-plain-language vs sandbox-security-preprod-blockers",
+      0.3724328365045028
+    ],
+    [
+      "orchestrator-plain-language vs sandbox-v2-interact-less-northstar",
+      0.48690637193773934
+    ],
+    [
+      "orchestrator-plain-language vs sdlc-skill-retro-from-sandbox-sprints",
+      0.4161613170031133
+    ],
+    [
+      "orchestrator-plain-language vs specify-external-tooling-in-prompts",
+      0.4831757573616164
+    ],
+    [
+      "orchestrator-plain-language vs stage1-pins-all-tooling",
+      0.4117116801865733
+    ],
+    [
+      "orchestrator-plain-language vs start-needs-skill-invocation",
+      0.4406825332095145
+    ],
+    [
+      "orchestrator-plain-language vs verify-on-track-before-idle",
+      0.4474704432547886
+    ],
+    [
+      "orchestrator-runs-autonomously vs qa-automation-boundary",
+      0.5837582446917807
+    ],
+    [
+      "orchestrator-runs-autonomously vs sandbox-actual-sdlc-flow",
+      0.5186025880042605
+    ],
+    [
+      "orchestrator-runs-autonomously vs sandbox-product-acceptance-bar",
+      0.5855351353564994
+    ],
+    [
+      "orchestrator-runs-autonomously vs sandbox-security-preprod-blockers",
+      0.6029431665980474
+    ],
+    [
+      "orchestrator-runs-autonomously vs sandbox-v2-interact-less-northstar",
+      0.601779360324999
+    ],
+    [
+      "orchestrator-runs-autonomously vs sdlc-skill-retro-from-sandbox-sprints",
+      0.478311328551385
+    ],
+    [
+      "orchestrator-runs-autonomously vs specify-external-tooling-in-prompts",
+      0.5568558207818854
+    ],
+    [
+      "orchestrator-runs-autonomously vs stage1-pins-all-tooling",
+      0.5755094118587488
+    ],
+    [
+      "orchestrator-runs-autonomously vs start-needs-skill-invocation",
+      0.5550855545848282
+    ],
+    [
+      "orchestrator-runs-autonomously vs verify-on-track-before-idle",
+      0.6495471513232233
+    ],
+    [
+      "qa-automation-boundary vs sandbox-actual-sdlc-flow",
+      0.6292815440486653
+    ],
+    [
+      "qa-automation-boundary vs sandbox-product-acceptance-bar",
+      0.6955654089120974
+    ],
+    [
+      "qa-automation-boundary vs sandbox-security-preprod-blockers",
+      0.5993442976149848
+    ],
+    [
+      "qa-automation-boundary vs sandbox-v2-interact-less-northstar",
+      0.6261307785854759
+    ],
+    [
+      "qa-automation-boundary vs sdlc-skill-retro-from-sandbox-sprints",
+      0.5403970616408165
+    ],
+    [
+      "qa-automation-boundary vs specify-external-tooling-in-prompts",
+      0.526971280161755
+    ],
+    [
+      "qa-automation-boundary vs stage1-pins-all-tooling",
+      0.5727840736404093
+    ],
+    [
+      "qa-automation-boundary vs start-needs-skill-invocation",
+      0.5627929628357405
+    ],
+    [
+      "qa-automation-boundary vs verify-on-track-before-idle",
+      0.5093512248903702
+    ],
+    [
+      "sandbox-actual-sdlc-flow vs sandbox-product-acceptance-bar",
+      0.6182951403971485
+    ],
+    [
+      "sandbox-actual-sdlc-flow vs sandbox-security-preprod-blockers",
+      0.5587741822812742
+    ],
+    [
+      "sandbox-actual-sdlc-flow vs sandbox-v2-interact-less-northstar",
+      0.5819807412060863
+    ],
+    [
+      "sandbox-actual-sdlc-flow vs sdlc-skill-retro-from-sandbox-sprints",
+      0.5033578014965512
+    ],
+    [
+      "sandbox-actual-sdlc-flow vs specify-external-tooling-in-prompts",
+      0.52330227054786
+    ],
+    [
+      "sandbox-actual-sdlc-flow vs stage1-pins-all-tooling",
+      0.5949543798452506
+    ],
+    [
+      "sandbox-actual-sdlc-flow vs start-needs-skill-invocation",
+      0.4743093133804515
+    ],
+    [
+      "sandbox-actual-sdlc-flow vs verify-on-track-before-idle",
+      0.5256312944589229
+    ],
+    [
+      "sandbox-product-acceptance-bar vs sandbox-security-preprod-blockers",
+      0.565191318411575
+    ],
+    [
+      "sandbox-product-acceptance-bar vs sandbox-v2-interact-less-northstar",
+      0.511452984611589
+    ],
+    [
+      "sandbox-product-acceptance-bar vs sdlc-skill-retro-from-sandbox-sprints",
+      0.5526186904321695
+    ],
+    [
+      "sandbox-product-acceptance-bar vs specify-external-tooling-in-prompts",
+      0.4972166019420741
+    ],
+    [
+      "sandbox-product-acceptance-bar vs stage1-pins-all-tooling",
+      0.49618432589141753
+    ],
+    [
+      "sandbox-product-acceptance-bar vs start-needs-skill-invocation",
+      0.40666293595424613
+    ],
+    [
+      "sandbox-product-acceptance-bar vs verify-on-track-before-idle",
+      0.5169844206055293
+    ],
+    [
+      "sandbox-security-preprod-blockers vs sandbox-v2-interact-less-northstar",
+      0.5634941104857101
+    ],
+    [
+      "sandbox-security-preprod-blockers vs sdlc-skill-retro-from-sandbox-sprints",
+      0.4243353636619502
+    ],
+    [
+      "sandbox-security-preprod-blockers vs specify-external-tooling-in-prompts",
+      0.6007520713014562
+    ],
+    [
+      "sandbox-security-preprod-blockers vs stage1-pins-all-tooling",
+      0.5578988703275568
+    ],
+    [
+      "sandbox-security-preprod-blockers vs start-needs-skill-invocation",
+      0.5067436756575366
+    ],
+    [
+      "sandbox-security-preprod-blockers vs verify-on-track-before-idle",
+      0.5720449033449593
+    ],
+    [
+      "sandbox-v2-interact-less-northstar vs sdlc-skill-retro-from-sandbox-sprints",
+      0.5735302462116316
+    ],
+    [
+      "sandbox-v2-interact-less-northstar vs specify-external-tooling-in-prompts",
+      0.6004591141421072
+    ],
+    [
+      "sandbox-v2-interact-less-northstar vs stage1-pins-all-tooling",
+      0.5864962700498618
+    ],
+    [
+      "sandbox-v2-interact-less-northstar vs start-needs-skill-invocation",
+      0.6468906689096836
+    ],
+    [
+      "sandbox-v2-interact-less-northstar vs verify-on-track-before-idle",
+      0.5875379175672708
+    ],
+    [
+      "sdlc-skill-retro-from-sandbox-sprints vs specify-external-tooling-in-prompts",
+      0.4620474068806833
+    ],
+    [
+      "sdlc-skill-retro-from-sandbox-sprints vs stage1-pins-all-tooling",
+      0.49550366326853545
+    ],
+    [
+      "sdlc-skill-retro-from-sandbox-sprints vs start-needs-skill-invocation",
+      0.6330541498101593
+    ],
+    [
+      "sdlc-skill-retro-from-sandbox-sprints vs verify-on-track-before-idle",
+      0.49994575172883665
+    ],
+    [
+      "specify-external-tooling-in-prompts vs stage1-pins-all-tooling",
+      0.6810100752786988
+    ],
+    [
+      "specify-external-tooling-in-prompts vs start-needs-skill-invocation",
+      0.47878017582754656
+    ],
+    [
+      "specify-external-tooling-in-prompts vs verify-on-track-before-idle",
+      0.5808640633130685
+    ],
+    [
+      "stage1-pins-all-tooling vs start-needs-skill-invocation",
+      0.5185295924289763
+    ],
+    [
+      "stage1-pins-all-tooling vs verify-on-track-before-idle",
+      0.5256604298655716
+    ],
+    [
+      "start-needs-skill-invocation vs verify-on-track-before-idle",
+      0.5412027748746537
+    ]
+  ]
+}

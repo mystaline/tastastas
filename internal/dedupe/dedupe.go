@@ -2,23 +2,43 @@
 // extracted facts before they are stored. The threshold is derived
 // empirically by prototype/scoring.py against real transcript data.
 //
-// Calibration run 2026-07-20 (see prototype/calibration_output.jsonl and
-// prototype/fixtures/snippets_from_repo_testdata.jsonl): 8 snippets derived
-// from repo test fixtures (obsidian vault + docwalk acme-style testdata) —
-// NOT real user conversation data, since this session had no access to
-// actual user conversation history. Extraction via qwen3.5:2b-q4_K_M,
-// embedding via nomic-embed-text (768-dim), both against local Ollama.
+// Calibration run 2026-07-20, v2 (real data): 22 real facts from
+// ~/.claude/projects/-home-mystaline-dev-Workspace-Personal-sandbox/memory/
+// (a personal side project's session-memory files — no NDA concerns, real
+// decisions/corrections from actual Claude Code sessions, not synthetic
+// fixtures). Each fact has two independently-authored terse phrasings: the
+// MEMORY.md index one-liner and the file's YAML frontmatter description —
+// both written for different audiences (human skim vs semantic search), so
+// comparing them is a genuine "same fact, reworded" test, not a paraphrase
+// I invented. Embedding via nomic-embed-text (768-dim) against local Ollama.
+// See prototype/fixtures/sandbox_calibration_records.json and
+// prototype/sandbox_calibration_output.json for the raw data.
 //
-// True near-duplicate pairs (same underlying fact, differently worded
-// snippet — e.g. "PostgreSQL... full-text search" restated twice, or
-// "coupon redemption" restated twice) scored 0.82-0.84 cosine.
-// Genuinely-distinct-but-same-topic facts (coupon expiry vs coupon
-// validity vs coupon checkout location — all about coupons, but different
-// facts) scored 0.62-0.76 cosine. The two distributions separate but with
-// a narrow gap and a small sample (13 facts, 78 pairs, 4 known-dup pairs
-// identified by hand) — re-calibrate against a larger, more diverse
-// real-conversation corpus once available. Treat 0.80 as a reasonable v1
-// starting point, not a settled constant.
+// This superseded the v1 calibration (8 synthetic repo-fixture snippets,
+// mixed narrative-vs-bullet register, threshold 0.80) for two reasons: (1)
+// it's real data instead of synthetic, and (2) v1 compared mismatched
+// registers (a verbose narrative fact vs a terse one-line paraphrase),
+// which is NOT what extract_and_remember actually compares in production —
+// it always compares two similarly-terse LLM-extracted facts. Matching the
+// production register changed the result substantially.
+//
+// SAME-REGISTER true-positive (same fact, 2 independent terse phrasings,
+// n=22): min=0.641 median=0.877 max=0.939.
+// SAME-REGISTER true-negative (distinct facts, both terse, n=231):
+// min=0.340 median=0.532 p95=0.647 max=0.710.
+// The two distributions are cleanly separated (true-neg max 0.710 barely
+// touches true-pos min 0.641) — much better separation than v1's noisy
+// mixed-register run. Sweeping thresholds against this data: t=0.71 gives
+// the minimum total error (2/253 pairs misclassified, 0.8%): 2 missed
+// merges (9% of true dups), 0 wrong merges. Chose 0.71 over the raw
+// error-minimizing value because wrong merges (silently conflating two
+// distinct facts) are worse than missed merges (a near-dup just stays a
+// separate node) — 0.71 has zero wrong-merges in this sample while missing
+// only 2/22 true dups.
+//
+// Still a v2 starting point, not settled: n=22 facts from one project by
+// one author. Re-calibrate against a larger, more diverse real corpus
+// (multiple users/projects/domains) once available.
 package dedupe
 
 import (
@@ -28,7 +48,7 @@ import (
 // DefaultThreshold is the empirically-derived cosine similarity cutoff
 // above which two facts are treated as duplicates (merge, not insert).
 // See package doc comment above for the calibration run this came from.
-const DefaultThreshold = 0.80
+const DefaultThreshold = 0.71
 
 // CosineSimilarity computes cosine similarity between two vectors.
 // Returns 0 if either vector is empty or dimensions don't match.
