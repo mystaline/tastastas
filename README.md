@@ -27,10 +27,36 @@ go build -o tastastas ./cmd/tastastas
 ```
 
 `--embed-dim` must match your embedder (768 = `nomic-embed-text`, 384 =
-many `sentence-transformers`). Wrong-dim vectors are rejected at insert.
+`bge-small-en-v1.5` / many `sentence-transformers`). Wrong-dim vectors are
+rejected at insert.
 
 Everything works with zero external dependencies except
-`extract_and_remember`, which needs a local [Ollama](https://ollama.com).
+`extract_and_remember` and doc/code chunk search, which need an embedder
+(see [Flags](#flags) below — pick `sidecar` for zero-setup, or `ollama` if
+you already run it).
+
+## Flags
+
+| Flag | Default | Does |
+|---|---|---|
+| `--serve` | *(unset)* | Run as HTTP server on this address (e.g. `:8080`). Unset = stdio MCP mode. |
+| `--db` | `memory.db` | Path to the SQLite database file. |
+| `--embed-dim` | `384` | Vector dimension. Must match whatever embedder you use — 384 for the baked sidecar (`bge-small-en-v1.5`) or many `sentence-transformers`, 768 for `nomic-embed-text`. Wrong-dim vectors are rejected at insert. |
+| `--embed-backend` | `ollama` | Which embedder to use: `sidecar` (baked ONNX binary, zero external deps, always 384-dim — run `scripts/build-sidecar.sh` once first), `ollama` (HTTP call to a local Ollama), or `none` (lexical-only, no embedding at all — `extract_and_remember` and semantic recall degrade gracefully). |
+| `--ollama-url` | `http://localhost:11434` | Ollama base URL. Only used when `--embed-backend=ollama`. |
+| `--ollama-model` | `nomic-embed-text` | Ollama embedding model name. Only used when `--embed-backend=ollama`. Must match `--embed-dim` (768 for `nomic-embed-text`). |
+
+```bash
+# Zero external deps — bakes bge-small-en-v1.5 into the binary once
+./scripts/build-sidecar.sh
+./tastastas --db memory.db --embed-dim 384 --embed-backend sidecar --serve :8080
+
+# Or point at an existing Ollama instance instead
+./tastastas --db memory.db --embed-dim 768 --embed-backend ollama --serve :8080
+
+# Or skip embedding entirely — lexical (FTS5) + graph only
+./tastastas --db memory.db --embed-backend none --serve :8080
+```
 
 ## First run (5 minutes, from fresh clone)
 
