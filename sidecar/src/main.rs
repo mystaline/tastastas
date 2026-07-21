@@ -4,13 +4,18 @@
 //   out: {"embeddings": [[...], [...]]}
 // Model + tokenizer are baked into the binary via include_bytes! so the
 // released binary has zero external file dependencies at runtime.
-use ort::session::{Session, builder::GraphOptimizationLevel};
+use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 use std::io::{self, BufRead, Write};
-use tokenizers::Tokenizer;
+use tokenizers::{Tokenizer, TruncationParams};
 
 const MODEL_BYTES: &[u8] = include_bytes!("../assets/model.onnx");
 const TOKENIZER_BYTES: &[u8] = include_bytes!("../assets/tokenizer.json");
+
+// bge-small-en-v1.5 is BERT-based: absolute position embeddings top out at
+// 512 tokens. Longer input must be truncated before it ever reaches the
+// model or onnxruntime errors on the position-embedding Add/Gather.
+const MAX_SEQ_LEN: usize = 512;
 
 #[derive(serde::Deserialize)]
 struct Request {
@@ -63,7 +68,7 @@ fn embed_batch(
 
     let mut ids = vec![0i64; batch * max_len];
     let mut mask = vec![0i64; batch * max_len];
-    let type_ids = vec![0i64; batch * max_len];
+    let type_ids = vec![0i64; batch * max_len]; // bge-small has one segment: all zeros
 
     for (i, enc) in encodings.iter().enumerate() {
         for (j, &id) in enc.get_ids().iter().enumerate() {
@@ -105,7 +110,13 @@ fn embed_batch(
 }
 
 fn main() {
-    let tokenizer = Tokenizer::from_bytes(TOKENIZER_BYTES).expect("load tokenizer");
+    let mut tokenizer = Tokenizer::from_bytes(TOKENIZER_BYTES).expect("load tokenizer");
+    tokenizer
+        .with_truncation(Some(TruncationParams {
+            max_length: MAX_SEQ_LEN,
+            ..Default::default()
+        }))
+        .expect("set truncation");
 
     ort::init().commit();
     let mut session = Session::builder()
