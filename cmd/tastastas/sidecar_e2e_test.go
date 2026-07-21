@@ -19,7 +19,7 @@ import (
 // the sidecar's embeddings to rank a semantically-related (but lexically
 // dissimilar) query above an unrelated one.
 func TestSidecarEndToEndRecall(t *testing.T) {
-	embedder := newEmbedder("sidecar", "", "")
+	embedder := newEmbedder("sidecar", "", "", 0)
 	sc, ok := embedder.(*embed.SidecarEmbedder)
 	if !ok {
 		t.Skip("sidecar unavailable on this platform (embedder fell back to nil)")

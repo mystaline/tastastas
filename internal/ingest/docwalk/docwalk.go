@@ -40,6 +40,39 @@ type Config struct {
 	Mappings  []Mapping `yaml:"mappings"`
 }
 
+// defaultSkipDirs are directory names skipped unconditionally — noise that
+// bloats every real-world walk (VCS internals, dependency trees, build
+// output, caches). Not configurable: if a mapping ever needs the guts of
+// node_modules, that's the exception, not the rule.
+var defaultSkipDirs = map[string]bool{
+	".git": true, ".hg": true, ".svn": true,
+	"node_modules": true, "vendor": true,
+	"dist": true, "build": true, "target": true, ".next": true,
+	"__pycache__": true, ".venv": true, "venv": true,
+	".idea": true, ".vscode": true,
+}
+
+// maxFileSize skips files larger than this — binaries, datasets, lockfiles.
+// A doc/code file this big is not something you want chunked wholesale
+// anyway.
+const maxFileSize = 1 << 20 // 1 MiB
+
+// looksBinary does a cheap null-byte sniff on the first 512 bytes — same
+// heuristic git/file(1) use. Good enough to skip images/archives/binaries
+// without a MIME library dependency.
+func looksBinary(b []byte) bool {
+	n := len(b)
+	if n > 512 {
+		n = 512
+	}
+	for i := 0; i < n; i++ {
+		if b[i] == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // LoadConfig reads and parses a .memoryrc.yaml file at path.
 func LoadConfig(path string) (Config, error) {
 	b, err := os.ReadFile(path)
@@ -73,26 +106,52 @@ var edgeRule = map[string]struct {
 // configured; if cfg has zero mappings, every regular file becomes a
 // generic-doc node (the ungated default: point it at any folder, get
 // something searchable, no config required).
-func Ingest(root string, cfg Config) ([]store.Node, []store.Edge, error) {
+//
+// Also returns counts: filesWalked (seen by WalkDir), filesSkipped (dirs
+// skipped via SkipDir + oversized/binaries + unmatched-when-mappings-exist).
+func Ingest(root string, cfg Config) ([]store.Node, []store.Edge, int, int, error) {
 	var nodes []store.Node
 	featureIndex := map[string]map[string]string{} // feature -> nodeType -> nodeID
+	filesWalked := 0
+	filesSkipped := 0
 
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			return err
-		}
-		if d.IsDir() {
+			// A single bad entry (permission denied, dangling symlink hit
+			// mid-walk) must not abort ingest of everything else — real
+			// directories always have a few of these (broken symlinks in
+			// .trunk/, race with a concurrent build deleting files, etc).
 			return nil
+		}
+		filesWalked++
+
+		if d.IsDir() {
+			if defaultSkipDirs[d.Name()] {
+				filesSkipped++
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			filesSkipped++
+			return nil // stat failed (dangling symlink, race) — skip, don't abort
+		}
+		if info.Size() > maxFileSize {
+			filesSkipped++
+			return nil // skip oversized files — binaries, datasets, lockfiles
 		}
 		rel, err := filepath.Rel(root, path)
 		if err != nil {
-			return err
+			filesSkipped++
+			return nil
 		}
 		rel = filepath.ToSlash(rel)
 
 		nodeType, feature, matched := classify(rel, cfg.Mappings)
 		if !matched {
 			if len(cfg.Mappings) > 0 {
+				filesSkipped++
 				return nil // mappings configured but this file matched none — skip
 			}
 			nodeType = "generic-doc" // no config at all: everything is generic-doc
@@ -100,8 +159,14 @@ func Ingest(root string, cfg Config) ([]store.Node, []store.Edge, error) {
 
 		content, err := os.ReadFile(path)
 		if err != nil {
-			return fmt.Errorf("docwalk: read %s: %w", path, err)
+			filesSkipped++
+			return nil // unreadable (permission, dangling symlink, race) — skip, don't abort
 		}
+		if looksBinary(content) {
+			filesSkipped++
+			return nil // skip binaries even if size/glob matched
+		}
+
 		id := nodeID(cfg.ProjectID, rel)
 		hash := sha256.Sum256(content)
 
@@ -128,13 +193,12 @@ func Ingest(root string, cfg Config) ([]store.Node, []store.Edge, error) {
 		return nil
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("docwalk: walk %s: %w", root, err)
+		return nil, nil, 0, 0, fmt.Errorf("docwalk: walk %s: %w", root, err)
 	}
 
 	edges := crossLink(featureIndex)
-	return nodes, edges, nil
+	return nodes, edges, filesWalked, filesSkipped, nil
 }
-
 // classify finds the first mapping whose PathGlob matches rel, returns its
 // node type and (if GroupBy set) the captured "feature" slug.
 func classify(rel string, mappings []Mapping) (nodeType, feature string, matched bool) {

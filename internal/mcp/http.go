@@ -17,6 +17,8 @@ import (
 // ServeHTTP starts the HTTP server with MCP-over-HTTP + REST ingestion endpoints.
 // addr is the listen address (e.g. ":8080").
 func ServeHTTP(ctx context.Context, db store.Store, embedder embed.EmbedderBackend, addr string) error {
+	jobs := newJobStore()
+
 	// MCP-over-HTTP via Streamable HTTP handler
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
 		srv := mcp.NewServer(&mcp.Implementation{
@@ -34,7 +36,8 @@ func ServeHTTP(ctx context.Context, db store.Store, embedder embed.EmbedderBacke
 
 	// REST ingestion endpoints — POST /ingest/{adapter} dispatches to
 	// docwalk, gitrepo, or obsidian.
-	mux.HandleFunc("POST /ingest/{adapter}", handleIngest(db, embedder))
+	mux.HandleFunc("POST /ingest/{adapter}", handleIngest(db, embedder, jobs))
+	mux.HandleFunc("GET /ingest/jobs/{id}", handleIngestJobStatus(jobs))
 	mux.HandleFunc("POST /ingest/webhook", handleIngestWebhook(db))
 
 	// Health check
@@ -59,9 +62,14 @@ func ServeHTTP(ctx context.Context, db store.Store, embedder embed.EmbedderBacke
 
 // handleIngest handles POST /ingest/{adapter} (docwalk, gitrepo, obsidian)
 // with JSON body: { "root": "/path", "config_path": "...", "project_id": "..." }
-// config_path only applies to the docwalk adapter. Chunks + embeds ingested
-// nodes when embedder is non-nil (mirrors the MCP "ingest" tool behavior).
-func handleIngest(db store.Store, embedder embed.EmbedderBackend) http.HandlerFunc {
+// config_path only applies to the docwalk adapter.
+//
+// Runs asynchronously: returns {"job_id": "..."} immediately (HTTP 202) and
+// does the walk + chunk + embed in a background goroutine. Large directories
+// (whole workspaces, dozens of repos) can take minutes to embed — holding
+// the request open that long guarantees client/proxy timeouts. Poll
+// GET /ingest/jobs/{job_id} for completion.
+func handleIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		adapter := r.PathValue("adapter")
 		var req struct {
@@ -75,34 +83,55 @@ func handleIngest(db store.Store, embedder embed.EmbedderBackend) http.HandlerFu
 			return
 		}
 
-		nodes, edges, err := runIngestAdapter(adapter, req.Root, req.ConfigPath, req.ProjectID)
-		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"ingest: %s"}`, err), http.StatusBadRequest)
-			return
-		}
-
-		ctx := r.Context()
-		for i := range nodes {
-			if err := db.UpsertNode(ctx, nodes[i]); err != nil {
-				http.Error(w, fmt.Sprintf(`{"error":"upsert node: %s"}`, err), http.StatusInternalServerError)
-				return
+		job := jobs.create()
+		jobs.runAsync(job, func(ctx context.Context) (int, int, int, error) {
+			nodes, edges, filesWalked, filesSkipped, err := runIngestAdapter(adapter, req.Root, req.ConfigPath, req.ProjectID)
+			if err != nil {
+				return 0, 0, 0, fmt.Errorf("ingest: %w", err)
 			}
-		}
-		for i := range edges {
-			if err := db.UpsertEdge(ctx, edges[i]); err != nil {
-				http.Error(w, fmt.Sprintf(`{"error":"upsert edge: %s"}`, err), http.StatusInternalServerError)
-				return
-			}
-		}
+			// Walk phase done — push progress immediately so poll shows
+			// files_walked/files_skipped while embedding churns in background.
+			jobs.updateCounts(job.ID, filesWalked, filesSkipped)
 
-		chunkCount, err := chunkAndEmbedNodes(ctx, db, embedder, nodes)
-		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"chunk/embed: %s"}`, err), http.StatusInternalServerError)
-			return
-		}
+			for i := range nodes {
+				if err := db.UpsertNode(ctx, nodes[i]); err != nil {
+					return 0, 0, 0, fmt.Errorf("upsert node: %w", err)
+				}
+			}
+			for i := range edges {
+				if err := db.UpsertEdge(ctx, edges[i]); err != nil {
+					return 0, 0, 0, fmt.Errorf("upsert edge: %w", err)
+				}
+			}
+			chunkCount, err := chunkAndEmbedNodes(ctx, db, embedder, nodes, func(n int) {
+				jobs.updateChunksEmbedded(job.ID, n)
+			})
+			if err != nil {
+				return 0, 0, 0, fmt.Errorf("chunk/embed: %w", err)
+			}
+			return len(nodes), len(edges), chunkCount, nil
+		})
 
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"nodes_ingested":%d,"edges_created":%d,"chunks_created":%d}`, len(nodes), len(edges), chunkCount)
+		w.WriteHeader(http.StatusAccepted)
+		fmt.Fprintf(w, `{"job_id":%q,"status":"running"}`, job.ID)
+	}
+}
+
+// handleIngestJobStatus handles GET /ingest/jobs/{id} — poll an async
+// ingest job's status. Returns 404 if the job ID is unknown (server
+// restarted, or typo).
+func handleIngestJobStatus(jobs *jobStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		job, ok := jobs.get(id)
+		w.Header().Set("Content-Type", "application/json")
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprintf(w, `{"error":"job not found"}`)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(job)
 	}
 }
 

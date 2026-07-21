@@ -41,7 +41,7 @@ func TestDocwalkChunksAndEmbeds(t *testing.T) {
 		t.Fatalf("write fixture: %v", err)
 	}
 
-	nodes, _, err := docwalk.Ingest(root, docwalk.Config{ProjectID: "docwalk-chunk-test"})
+	nodes, _, _, _, err := docwalk.Ingest(root, docwalk.Config{ProjectID: "docwalk-chunk-test"})
 	if err != nil {
 		t.Fatalf("docwalk.Ingest: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestDocwalkChunksAndEmbeds(t *testing.T) {
 		}
 	}
 
-	chunkCount, err := chunkAndEmbedNodes(ctx, db, sc, nodes)
+	chunkCount, err := chunkAndEmbedNodes(ctx, db, sc, nodes, nil)
 	if err != nil {
 		t.Fatalf("chunkAndEmbedNodes: %v", err)
 	}

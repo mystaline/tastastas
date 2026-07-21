@@ -1,6 +1,8 @@
 package docwalk
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -26,7 +28,7 @@ func TestIngestWithConfig(t *testing.T) {
 		t.Fatalf("LoadConfig: %v", err)
 	}
 
-	nodes, edges, err := Ingest("testdata/acme-style", cfg)
+	nodes, edges, _, _, err := Ingest("testdata/acme-style", cfg)
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -87,7 +89,7 @@ func TestIngestWithConfig(t *testing.T) {
 
 func TestIngestWithoutConfig(t *testing.T) {
 	// No mapping supplied -> every file becomes generic-doc, no cross-linking.
-	nodes, edges, err := Ingest("testdata/acme-style", Config{ProjectID: "no-config"})
+	nodes, edges, _, _, err := Ingest("testdata/acme-style", Config{ProjectID: "no-config"})
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -111,6 +113,74 @@ func nodeIDs(nodes []store.Node) []string {
 		out = append(out, n.ID)
 	}
 	return out
+}
+
+// TestIngestSkipsNoiseDirs proves large-directory ingest optimization: VCS
+// internals, dependency trees, and build output are skipped entirely (not
+// walked into), so a repo with node_modules/vendor/.git doesn't get any
+// slower or noisier than one without.
+func TestIngestSkipsNoiseDirs(t *testing.T) {
+	root := t.TempDir()
+	mustWriteFile(t, root, "keep.md", "# Keep\n\nThis should be ingested.\n")
+	mustWriteFile(t, root, ".git/HEAD", "ref: refs/heads/main\n")
+	mustWriteFile(t, root, "node_modules/pkg/index.js", "module.exports = {}\n")
+	mustWriteFile(t, root, "vendor/lib/lib.go", "package lib\n")
+	mustWriteFile(t, root, "dist/bundle.js", "//! bundled\n")
+
+	nodes, _, _, _, err := Ingest(root, Config{ProjectID: "skip-test"})
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 node (keep.md only), got %d: %+v", len(nodes), nodeIDs(nodes))
+	}
+	if nodes[0].SourcePath != "keep.md" {
+		t.Fatalf("expected keep.md, got %s", nodes[0].SourcePath)
+	}
+}
+
+// TestIngestSkipsOversizedAndBinaryFiles proves the size cap and binary
+// sniff both work: a file over maxFileSize and a file with embedded null
+// bytes are both excluded even though nothing in path/glob rules would
+// catch them.
+func TestIngestSkipsOversizedAndBinaryFiles(t *testing.T) {
+	root := t.TempDir()
+	mustWriteFile(t, root, "normal.md", "# Normal\n\nFine.\n")
+
+	big := make([]byte, maxFileSize+1)
+	for i := range big {
+		big[i] = 'a'
+	}
+	if err := os.WriteFile(filepath.Join(root, "huge.md"), big, 0o644); err != nil {
+		t.Fatalf("write huge.md: %v", err)
+	}
+
+	binary := []byte("some text\x00with a null byte\x00in it")
+	if err := os.WriteFile(filepath.Join(root, "binaryish.md"), binary, 0o644); err != nil {
+		t.Fatalf("write binaryish.md: %v", err)
+	}
+
+	nodes, _, _, _, err := Ingest(root, Config{ProjectID: "size-test"})
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 node (normal.md only), got %d: %+v", len(nodes), nodeIDs(nodes))
+	}
+	if nodes[0].SourcePath != "normal.md" {
+		t.Fatalf("expected normal.md, got %s", nodes[0].SourcePath)
+	}
+}
+
+func mustWriteFile(t *testing.T, root, rel, content string) {
+	t.Helper()
+	full := filepath.Join(root, rel)
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(full), err)
+	}
+	if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", full, err)
+	}
 }
 
 // relatedPRD is a test-only helper: with only one prd sharing the

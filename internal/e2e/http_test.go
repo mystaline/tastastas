@@ -128,18 +128,45 @@ func TestE2EHTTPIngestChunksAndEmbeds(t *testing.T) {
 		t.Fatalf("POST /ingest/docwalk: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusAccepted {
 		b, _ := io.ReadAll(resp.Body)
 		t.Fatalf("POST /ingest/docwalk: status %d: %s", resp.StatusCode, b)
 	}
-
-	var out struct {
-		NodesIngested int `json:"nodes_ingested"`
-		EdgesCreated  int `json:"edges_created"`
-		ChunksCreated int `json:"chunks_created"`
+	var accepted struct {
+		JobID string `json:"job_id"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		t.Fatalf("decode /ingest/docwalk: %v", err)
+	if err := json.NewDecoder(resp.Body).Decode(&accepted); err != nil {
+		t.Fatalf("decode /ingest/docwalk accepted response: %v", err)
+	}
+
+	// Ingest runs async now (internal/mcp/jobs.go) — poll job status instead
+	// of expecting the counts inline. Real-world ingests over big directories
+	// can take minutes; the REST contract reflects that.
+	var out struct {
+		Status        string `json:"status"`
+		NodesIngested int    `json:"nodes_ingested"`
+		EdgesCreated  int    `json:"edges_created"`
+		ChunksCreated int    `json:"chunks_created"`
+		Error         string `json:"error"`
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		jresp, err := http.Get(base + "/ingest/jobs/" + accepted.JobID)
+		if err != nil {
+			t.Fatalf("GET /ingest/jobs/%s: %v", accepted.JobID, err)
+		}
+		if err := json.NewDecoder(jresp.Body).Decode(&out); err != nil {
+			jresp.Body.Close()
+			t.Fatalf("decode job status: %v", err)
+		}
+		jresp.Body.Close()
+		if out.Status == "done" || out.Status == "error" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if out.Status != "done" {
+		t.Fatalf("job did not complete in time: %+v", out)
 	}
 	if out.NodesIngested == 0 {
 		t.Fatalf("expected >=1 node ingested, got %+v", out)

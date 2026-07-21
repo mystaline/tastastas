@@ -43,7 +43,10 @@ var tsLanguage = sync.OnceValue(func() *sitter.Language {
 // degrade gracefully to lexical-only search. Shared by the MCP "ingest"
 // tool and the HTTP POST /ingest/{adapter} handler so both paths get
 // chunking+embedding instead of just one.
-func chunkAndEmbedNodes(ctx context.Context, db store.Store, embedder embed.EmbedderBackend, nodes []store.Node) (int, error) {
+//
+// If progress is non-nil, it's called with the number of chunks embedded
+// after each batch completes (for job progress visibility).
+func chunkAndEmbedNodes(ctx context.Context, db store.Store, embedder embed.EmbedderBackend, nodes []store.Node, progress func(int)) (int, error) {
 	if embedder == nil {
 		return 0, nil
 	}
@@ -59,6 +62,7 @@ func chunkAndEmbedNodes(ctx context.Context, db store.Store, embedder embed.Embe
 	}
 
 	const batchSize = 32
+	embedded := 0
 	for i := 0; i < len(allChunks); i += batchSize {
 		end := i + batchSize
 		if end > len(allChunks) {
@@ -75,6 +79,10 @@ func chunkAndEmbedNodes(ctx context.Context, db store.Store, embedder embed.Embe
 		}
 		for j := range batch {
 			allChunks[i+j].Embedding = vecs[j]
+		}
+		embedded = end
+		if progress != nil {
+			progress(embedded)
 		}
 	}
 
@@ -252,7 +260,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 		Name:        "ingest",
 		Description: "Ingest documents from a filesystem root using a named adapter (docwalk, gitrepo, obsidian).",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args IngestInput) (*mcp.CallToolResult, IngestOutput, error) {
-		nodes, edges, err := runIngestAdapter(args.Adapter, args.Root, args.ConfigPath, args.ProjectID)
+		nodes, edges, _, _, err := runIngestAdapter(args.Adapter, args.Root, args.ConfigPath, args.ProjectID)
 		if err != nil {
 			return errorResult(err), IngestOutput{}, nil
 		}
@@ -269,7 +277,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 		}
 
 		// Chunk and embed ingested nodes if embedder is available.
-		chunkCount, err := chunkAndEmbedNodes(ctx, db, embedder, nodes)
+		chunkCount, err := chunkAndEmbedNodes(ctx, db, embedder, nodes, nil)
 		if err != nil {
 			return errorResult(err), IngestOutput{}, nil
 		}
@@ -385,7 +393,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 
 // runIngestAdapter dispatches to the named ingest adapter and returns the
 // resulting nodes/edges (gitrepo returns no edges; obsidian/docwalk do).
-func runIngestAdapter(adapter, root, configPath, projectID string) ([]store.Node, []store.Edge, error) {
+func runIngestAdapter(adapter, root, configPath, projectID string) ([]store.Node, []store.Edge, int, int, error) {
 	switch adapter {
 	case "docwalk":
 		var cfg docwalk.Config
@@ -393,7 +401,7 @@ func runIngestAdapter(adapter, root, configPath, projectID string) ([]store.Node
 		if configPath != "" {
 			cfg, err = docwalk.LoadConfig(configPath)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, 0, 0, err
 			}
 		}
 		if projectID != "" {
@@ -403,14 +411,14 @@ func runIngestAdapter(adapter, root, configPath, projectID string) ([]store.Node
 
 	case "gitrepo":
 		nodes, err := gitrepo.Ingest(gitrepo.Config{Root: root, ProjectID: projectID})
-		return nodes, nil, err
+		return nodes, nil, 0, 0, err
 
 	case "obsidian":
 		nodes, edges, err := obsidian.Ingest(obsidian.Config{Root: root, ProjectID: projectID})
-		return nodes, edges, err
+		return nodes, edges, 0, 0, err
 
 	default:
-		return nil, nil, fmt.Errorf("adapter %q not implemented (must be one of: docwalk, gitrepo, obsidian)", adapter)
+		return nil, nil, 0, 0, fmt.Errorf("adapter %q not implemented (must be one of: docwalk, gitrepo, obsidian)", adapter)
 	}
 }
 

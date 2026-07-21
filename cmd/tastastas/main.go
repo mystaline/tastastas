@@ -26,11 +26,21 @@ import (
 //     Falls back to nil (lexical-only) if this platform has no baked binary.
 //   - "ollama" (default): HTTP call to a local Ollama instance.
 //   - "none": explicit lexical-only mode, no embedder at all.
-func newEmbedder(backend, ollamaURL, ollamaModel string) embed.EmbedderBackend {
+func newEmbedder(backend, ollamaURL, ollamaModel string, sidecarWorkers int) embed.EmbedderBackend {
 	switch backend {
 	case "none":
 		return nil
 	case "sidecar":
+		if sidecarWorkers != 1 {
+			// Use pool for 0 (NumCPU) or >1 workers
+			p, err := embed.NewSidecarPool(sidecarWorkers)
+			if err != nil {
+				log.Printf("embed: sidecar pool unavailable (%v), falling back to lexical-only", err)
+				return nil
+			}
+			return p
+		}
+		// Single worker (original behavior)
 		sc, err := embed.NewSidecar()
 		if err != nil {
 			log.Printf("embed: sidecar unavailable (%v), falling back to lexical-only", err)
@@ -49,6 +59,7 @@ func main() {
 	embedBackend := flag.String("embed-backend", "ollama", "embedder backend: ollama, sidecar, or none")
 	ollamaURL := flag.String("ollama-url", "http://localhost:11434", "Ollama base URL (used when --embed-backend=ollama)")
 	ollamaModel := flag.String("ollama-model", "nomic-embed-text", "Ollama embedding model (used when --embed-backend=ollama)")
+	sidecarWorkers := flag.Int("sidecar-workers", 0, "number of sidecar workers (0 = NumCPU, only for --embed-backend=sidecar)")
 	flag.Parse()
 
 	db, err := sqlitestore.Open(context.Background(), *dbPath, *embedDim)
@@ -56,7 +67,7 @@ func main() {
 		log.Fatalf("open store: %v", err)
 	}
 
-	embedder := newEmbedder(*embedBackend, *ollamaURL, *ollamaModel)
+	embedder := newEmbedder(*embedBackend, *ollamaURL, *ollamaModel, *sidecarWorkers)
 	closeEmbedder := func() {
 		if closer, ok := embedder.(interface{ Close() error }); ok {
 			_ = closer.Close()

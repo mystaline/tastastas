@@ -41,7 +41,7 @@ func TestMCPSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	nodes, edges, err := docwalk.Ingest("../ingest/docwalk/testdata/acme-style", cfg)
+	nodes, edges, _, _, err := docwalk.Ingest("../ingest/docwalk/testdata/acme-style", cfg)
 	if err != nil {
 		t.Fatalf("docwalk.Ingest: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestMCPIngestGitrepo(t *testing.T) {
 	os.MkdirAll(filepath.Join(root, "project-a"), 0o755)
 	os.WriteFile(filepath.Join(root, "project-a/MEMORY.md"), []byte("# Project A\nBilling service."), 0o644)
 
-	nodes, edges, err := runIngestAdapter("gitrepo", root, "", "test-proj")
+	nodes, edges, _, _, err := runIngestAdapter("gitrepo", root, "", "test-proj")
 	if err != nil {
 		t.Fatalf("runIngestAdapter(gitrepo): %v", err)
 	}
@@ -120,7 +120,7 @@ func TestMCPIngestObsidian(t *testing.T) {
 	}
 	defer db.Close()
 
-	nodes, edges, err := runIngestAdapter("obsidian", "../ingest/obsidian/testdata/vault", "", "vault-proj")
+	nodes, edges, _, _, err := runIngestAdapter("obsidian", "../ingest/obsidian/testdata/vault", "", "vault-proj")
 	if err != nil {
 		t.Fatalf("runIngestAdapter(obsidian): %v", err)
 	}
@@ -154,7 +154,7 @@ func TestMCPIngestObsidian(t *testing.T) {
 // TestRunIngestAdapterUnknown confirms an unsupported adapter name errors
 // instead of silently no-oping.
 func TestRunIngestAdapterUnknown(t *testing.T) {
-	_, _, err := runIngestAdapter("not-a-real-adapter", "/tmp", "", "")
+	_, _, _, _, err := runIngestAdapter("not-a-real-adapter", "/tmp", "", "")
 	if err == nil {
 		t.Fatal("expected error for unknown adapter")
 	}
