@@ -18,6 +18,7 @@ type RememberInput struct {
 	Content    string  `json:"content"`
 	Importance float64 `json:"importance,omitempty"`
 }
+
 type RememberOutput struct {
 	ID     string `json:"id"`
 	Status string `json:"status"`
@@ -28,6 +29,7 @@ type RecallInput struct {
 	Query     string `json:"query"`
 	Limit     int    `json:"limit,omitempty"`
 }
+
 type RecallItem struct {
 	ID        string  `json:"id"`
 	Title     string  `json:"title"`
@@ -36,9 +38,10 @@ type RecallItem struct {
 	Score     float64 `json:"score"`
 	MatchType string  `json:"match_type"`
 }
+
 type RecallOutput struct {
-	Results []RecallItem       `json:"results"`
-	Links   []ImplicitMCPLink  `json:"links,omitempty"`
+	Results []RecallItem      `json:"results"`
+	Links   []ImplicitMCPLink `json:"links,omitempty"`
 }
 
 type ImplicitMCPLink struct {
@@ -50,6 +53,7 @@ type ImplicitMCPLink struct {
 type ForgetInput struct {
 	ID string `json:"id"`
 }
+
 type ForgetOutput struct {
 	Status string `json:"status"`
 }
@@ -60,6 +64,7 @@ type LinkInput struct {
 	EdgeType   string  `json:"edge_type"`
 	Confidence float64 `json:"confidence,omitempty"`
 }
+
 type LinkOutput struct {
 	Status string `json:"status"`
 }
@@ -70,6 +75,7 @@ type IngestInput struct {
 	ConfigPath string `json:"config_path,omitempty"`
 	ProjectID  string `json:"project_id,omitempty"`
 }
+
 type IngestOutput struct {
 	NodesIngested int `json:"nodes_ingested"`
 	EdgesCreated  int `json:"edges_created"`
@@ -80,9 +86,11 @@ type ExtractAndRememberInput struct {
 	ProjectID    string `json:"project_id,omitempty"`
 	Conversation string `json:"conversation"`
 }
+
 type ExtractAndRememberOutput struct {
 	Facts []ExtractedFactResult `json:"facts"`
 }
+
 type ExtractedFactResult struct {
 	ID     string `json:"id"`
 	Status string `json:"status"` // "created" | "merged"
@@ -92,19 +100,90 @@ type CheckImpactInput struct {
 	ID       string `json:"id"`
 	MaxDepth int    `json:"max_depth,omitempty"`
 }
+
 type CheckImpactOutput struct {
 	StaleNodes []StaleNode `json:"stale_nodes"`
 }
+
 type StaleNode struct {
 	ID       string `json:"id"`
 	NodeType string `json:"node_type"`
+}
+
+type OnboardInput struct {
+	CWD       string `json:"cwd,omitempty"`
+	ProjectID string `json:"project_id,omitempty"`
+	Scope     string `json:"scope,omitempty"` // "cwd" | "subtree"
+}
+
+type OnboardOutput struct {
+	ProjectID           string   `json:"project_id"`
+	JobID               string   `json:"job_id,omitempty"`
+	Status              string   `json:"status,omitempty"`
+	AlreadyOnboarded    bool     `json:"already_onboarded,omitempty"`
+	DetectedAdapters    []string `json:"detected_adapters"`
+	CodeSymbols         int      `json:"code_symbols"`
+	CallGraphEdges      int      `json:"call_graph_edges"`
+	ImportEdges         int      `json:"import_edges"`
+	GenericDocs         int      `json:"generic_docs"`
+	ConventionsInferred int      `json:"conventions_inferred"`
+	AutoLinked          int      `json:"auto_linked"`
+	ProposalsQueued     int      `json:"proposals_queued"`
+	FilesWalked         int      `json:"files_walked"`
+	DurationMs          int64    `json:"duration_ms"`
+}
+
+type OnboardCheckInput struct {
+	ProjectID string `json:"project_id,omitempty"`
+}
+
+type OnboardCheckOutput struct {
+	HasNodes       bool `json:"has_nodes"`
+	HasChunks      bool `json:"has_chunks"`
+	HasEmbeddings  bool `json:"has_embeddings"`
+	HasEdges       bool `json:"has_edges"`
+	HasConventions bool `json:"has_conventions"`
+	StaleCount     int  `json:"stale_count"`
+	NodeCount      int  `json:"node_count"`
+	EdgeCount      int  `json:"edge_count"`
+	ChunkCount     int  `json:"chunk_count"`
+	VecCount       int  `json:"vec_count"`
+}
+
+type BuildGraphInput struct {
+	ProjectID string `json:"project_id,omitempty"`
+}
+
+type BuildGraphOutput struct {
+	JobID     string `json:"job_id"`
+	Status    string `json:"status"`
+	StartedAt string `json:"started_at"`
+}
+
+type JobStatusInput struct {
+	JobID string `json:"id"`
+}
+
+type JobStatusOutput struct {
+	ID        string `json:"id"`
+	Status    string `json:"status"`
+	Nodes     int    `json:"nodes_ingested,omitempty"`
+	Edges     int    `json:"edges_created,omitempty"`
+	Chunks    int    `json:"chunks_created,omitempty"`
+	Error     string `json:"error,omitempty"`
+	StartedAt string `json:"started_at"`
+	EndedAt   string `json:"ended_at,omitempty"`
 }
 
 // chunkForNode splits a node's content into chunks suitable for embedding.
 // For Go code nodes, uses tree-sitter to split by function/type declarations.
 // For Markdown-like nodes, uses heading-based chunking.
 // All other types get a single chunk.
-func chunkForNode(n store.Node, cfg chunker.Config, goLang, tsLang *sitter.Language) []store.Chunk {
+func chunkForNode(
+	n store.Node,
+	cfg chunker.Config,
+	goLang, tsLang *sitter.Language,
+) []store.Chunk {
 	switch n.NodeType {
 	case "prd", "api-spec", "erd", "test-case", "generic-doc", "obsidian-note":
 		chunks, _ := chunker.ChunkMarkdown(n.ID, n.Content, cfg)
@@ -126,7 +205,7 @@ func chunkForNode(n store.Node, cfg chunker.Config, goLang, tsLang *sitter.Langu
 		if goLang != nil {
 			chunks, err := chunker.ChunkGoCode(n.ID, n.Content, goLang, cfg)
 			if err == nil && len(chunks) > 0 {
-				return chunkSlice(n.ID, chunks)
+				return chunkSlice(chunks)
 			}
 		}
 		fallthrough
@@ -135,7 +214,7 @@ func chunkForNode(n store.Node, cfg chunker.Config, goLang, tsLang *sitter.Langu
 		if tsLang != nil {
 			chunks, err := chunker.ChunkTypeScript(n.ID, n.Content, tsLang, cfg)
 			if err == nil && len(chunks) > 0 {
-				return chunkSlice(n.ID, chunks)
+				return chunkSlice(chunks)
 			}
 		}
 		fallthrough
@@ -154,7 +233,7 @@ func chunkForNode(n store.Node, cfg chunker.Config, goLang, tsLang *sitter.Langu
 }
 
 // chunkSlice converts chunker.Chunk slice to store.Chunk slice.
-func chunkSlice(parentID string, chunks []chunker.Chunk) []store.Chunk {
+func chunkSlice(chunks []chunker.Chunk) []store.Chunk {
 	result := make([]store.Chunk, len(chunks))
 	for i, c := range chunks {
 		result[i] = store.Chunk{

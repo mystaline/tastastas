@@ -15,8 +15,15 @@ import (
 )
 
 // ServeHTTP starts the HTTP server with MCP-over-HTTP + REST ingestion endpoints.
-// addr is the listen address (e.g. ":8080").
-func ServeHTTP(ctx context.Context, db store.Store, embedder embed.EmbedderBackend, addr string) error {
+// addr is the listen address (e.g. ":8080"). If authToken is non-empty, all
+// mutating endpoints require it via the Authorization: Bearer {token} header.
+// Empty token = no auth (open access — use behind VPN/SSH tunnel).
+func ServeHTTP(
+	ctx context.Context,
+	db store.Store,
+	embedder embed.EmbedderBackend,
+	addr, authToken string,
+) error {
 	jobs := newJobStore()
 
 	// MCP-over-HTTP via Streamable HTTP handler
@@ -25,7 +32,7 @@ func ServeHTTP(ctx context.Context, db store.Store, embedder embed.EmbedderBacke
 			Name:    "tastastas",
 			Version: "0.1.0",
 		}, nil)
-		registerTools(srv, db, embedder)
+		registerTools(srv, db, embedder, nil)
 		return srv
 	}, nil)
 
@@ -51,13 +58,60 @@ func ServeHTTP(ctx context.Context, db store.Store, embedder embed.EmbedderBacke
 	log.Printf("  Ingest:         %s/ingest/{docwalk,gitrepo,obsidian}", addr)
 	log.Printf("  Webhook:        %s/ingest/webhook", addr)
 
-	server := &http.Server{Addr: addr, Handler: mux}
+	var handler http.Handler = mux
+	if authToken != "" {
+		handler = withBearerAuth(authToken)(mux)
+	}
+
+	server := &http.Server{Addr: addr, Handler: handler}
 	go func() {
 		<-ctx.Done()
 		server.Close()
 	}()
 
 	return server.ListenAndServe()
+}
+
+// withBearerAuth returns middleware that checks Authorization: Bearer {token}.
+// GET /health is exempt (readiness probe).
+func withBearerAuth(token string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && r.URL.Path == "/health" {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if !bearerMatches(r, token) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				fmt.Fprint(w, `{"error":"unauthorized"}`)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// bearerMatches checks the Authorization header against token in constant time.
+func bearerMatches(r *http.Request, token string) bool {
+	got := r.Header.Get("Authorization")
+	if !strings.HasPrefix(got, "Bearer ") {
+		return false
+	}
+	got = strings.TrimPrefix(got, "Bearer ")
+	if len(got) != len(token) {
+		return false
+	}
+	// ponytail: ct_eq constant-time, fine for bearer token.
+	// Use subtle.ConstantTimeCompare if token contains secrets.
+	ok := 0
+	for i := range got {
+		if got[i] == token[i] {
+			ok++
+		}
+	}
+	// Only return true if ALL bytes matched (no early exit = timing-safe)
+	return ok == len(token) && len(token) > 0
 }
 
 // handleIngest handles POST /ingest/{adapter} (docwalk, gitrepo, obsidian)
@@ -85,10 +139,16 @@ func handleIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobStore
 
 		job := jobs.create()
 		jobs.runAsync(job, func(ctx context.Context) (int, int, int, error) {
-			nodes, edges, filesWalked, filesSkipped, err := runIngestAdapter(adapter, req.Root, req.ConfigPath, req.ProjectID)
+			nodes, edges, filesWalked, filesSkipped, err := runIngestAdapter(
+				adapter,
+				req.Root,
+				req.ConfigPath,
+				req.ProjectID,
+			)
 			if err != nil {
 				return 0, 0, 0, fmt.Errorf("ingest: %w", err)
 			}
+
 			// Walk phase done — push progress immediately so poll shows
 			// files_walked/files_skipped while embedding churns in background.
 			jobs.updateCounts(job.ID, filesWalked, filesSkipped)
@@ -98,17 +158,26 @@ func handleIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobStore
 					return 0, 0, 0, fmt.Errorf("upsert node: %w", err)
 				}
 			}
+
 			for i := range edges {
 				if err := db.UpsertEdge(ctx, edges[i]); err != nil {
 					return 0, 0, 0, fmt.Errorf("upsert edge: %w", err)
 				}
 			}
-			chunkCount, err := chunkAndEmbedNodes(ctx, db, embedder, nodes, func(n int) {
-				jobs.updateChunksEmbedded(job.ID, n)
-			})
+
+			chunkCount, err := chunkAndEmbedNodes(
+				ctx,
+				db,
+				embedder,
+				nodes,
+				func(n int) {
+					jobs.updateChunksEmbedded(job.ID, n)
+				},
+			)
 			if err != nil {
 				return 0, 0, 0, fmt.Errorf("chunk/embed: %w", err)
 			}
+
 			return len(nodes), len(edges), chunkCount, nil
 		})
 
@@ -125,12 +194,14 @@ func handleIngestJobStatus(jobs *jobStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
 		job, ok := jobs.get(id)
+
 		w.Header().Set("Content-Type", "application/json")
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			fmt.Fprintf(w, `{"error":"job not found"}`)
 			return
 		}
+
 		_ = json.NewEncoder(w).Encode(job)
 	}
 }
@@ -141,11 +212,11 @@ func handleIngestJobStatus(jobs *jobStore) http.HandlerFunc {
 func handleIngestWebhook(db store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var items []struct {
-			Path       string `json:"path"`
-			Content    string `json:"content"`
-			ProjectID  string `json:"project_id"`
-			NodeType   string `json:"node_type"`
-			Title      string `json:"title"`
+			Path      string `json:"path"`
+			Content   string `json:"content"`
+			ProjectID string `json:"project_id"`
+			NodeType  string `json:"node_type"`
+			Title     string `json:"title"`
 		}
 
 		body, _ := io.ReadAll(r.Body)
@@ -193,10 +264,12 @@ func handleIngestWebhook(db store.Store) http.HandlerFunc {
 				SourcePath:    item.Path,
 				Importance:    0.5,
 			}
+
 			if err := db.UpsertNode(ctx, n); err != nil {
 				http.Error(w, fmt.Sprintf(`{"error":"upsert: %s"}`, err), http.StatusInternalServerError)
 				return
 			}
+
 			ingested++
 		}
 

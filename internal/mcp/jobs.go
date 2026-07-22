@@ -13,16 +13,17 @@ import (
 // /ingest/{adapter} returns a job_id immediately and the actual work runs in
 // a goroutine; GET /ingest/jobs/{id} polls status.
 type ingestJob struct {
-	ID           string    `json:"id"`
-	Status       string    `json:"status"` // "running" | "done" | "error"
-	Nodes        int       `json:"nodes_ingested,omitempty"`
-	Edges        int       `json:"edges_created,omitempty"`
-	Chunks       int       `json:"chunks_created,omitempty"`
-	FilesWalked  int       `json:"files_walked,omitempty"`
-	FilesSkipped int       `json:"files_skipped,omitempty"`
-	Error        string    `json:"error,omitempty"`
-	StartedAt    time.Time `json:"started_at"`
-	EndedAt      time.Time `json:"ended_at,omitempty"`
+	ID           string             `json:"id"`
+	Status       string             `json:"status"` // "running" | "done" | "error"
+	Nodes        int                `json:"nodes_ingested,omitempty"`
+	Edges        int                `json:"edges_created,omitempty"`
+	Chunks       int                `json:"chunks_created,omitempty"`
+	FilesWalked  int                `json:"files_walked,omitempty"`
+	FilesSkipped int                `json:"files_skipped,omitempty"`
+	Error        string             `json:"error,omitempty"`
+	StartedAt    time.Time          `json:"started_at"`
+	EndedAt      time.Time          `json:"ended_at,omitempty"`
+	cancel       context.CancelFunc // for job cancellation
 }
 
 // jobStore is an in-memory registry of ingest jobs. Deliberately not
@@ -42,8 +43,17 @@ func newJobStore() *jobStore {
 func (js *jobStore) create() *ingestJob {
 	js.mu.Lock()
 	defer js.mu.Unlock()
+
 	id := fmt.Sprintf("job-%d", time.Now().UnixNano())
-	j := &ingestJob{ID: id, Status: "running", StartedAt: time.Now()}
+	ctx, cancel := context.WithCancel(context.Background())
+	_ = ctx // used by cancel
+
+	j := &ingestJob{
+		ID:        id,
+		Status:    "running",
+		StartedAt: time.Now(),
+		cancel:    cancel,
+	}
 	js.jobs[id] = j
 	return j
 }
@@ -51,6 +61,7 @@ func (js *jobStore) create() *ingestJob {
 func (js *jobStore) get(id string) (ingestJob, bool) {
 	js.mu.RLock()
 	defer js.mu.RUnlock()
+
 	j, ok := js.jobs[id]
 	if !ok {
 		return ingestJob{}, false
@@ -59,28 +70,43 @@ func (js *jobStore) get(id string) (ingestJob, bool) {
 }
 
 // finish marks the job done/error and updates final counts.
-func (js *jobStore) finish(id string, nodes, edges, chunks int, err error) {
+func (js *jobStore) finish(
+	id string,
+	nodes, edges, chunks int,
+	err error,
+) {
 	js.mu.Lock()
 	defer js.mu.Unlock()
+
 	j, ok := js.jobs[id]
 	if !ok {
 		return
 	}
 	j.EndedAt = time.Now()
+
 	if err != nil {
 		j.Status = "error"
 		j.Error = err.Error()
-		return
+	} else {
+		j.Status = "done"
+		j.Nodes, j.Edges, j.Chunks = nodes, edges, chunks
 	}
-	j.Status = "done"
-	j.Nodes, j.Edges, j.Chunks = nodes, edges, chunks
+
+	// Cancel any ongoing work
+	if j.cancel != nil {
+		j.cancel()
+	}
 }
 
 // updateCounts lets the background goroutine push progress (files walked/skipped)
 // before the job completes. Caller must hold no other locks.
-func (js *jobStore) updateCounts(id string, filesWalked, filesSkipped int) {
+func (js *jobStore) updateCounts(
+	id string,
+	filesWalked, filesSkipped int,
+) {
 	js.mu.Lock()
 	defer js.mu.Unlock()
+
 	j, ok := js.jobs[id]
 	if !ok {
 		return
@@ -92,6 +118,7 @@ func (js *jobStore) updateCounts(id string, filesWalked, filesSkipped int) {
 func (js *jobStore) updateChunksEmbedded(id string, chunksEmbedded int) {
 	js.mu.Lock()
 	defer js.mu.Unlock()
+
 	j, ok := js.jobs[id]
 	if !ok {
 		return
@@ -102,9 +129,19 @@ func (js *jobStore) updateChunksEmbedded(id string, chunksEmbedded int) {
 // runAsync kicks off ingest+chunk+embed in a background goroutine using a
 // context detached from the originating HTTP request (so client disconnect
 // / request-scoped cancellation doesn't kill a long ingest mid-flight).
-func (js *jobStore) runAsync(job *ingestJob, work func(ctx context.Context) (nodes, edges, chunks int, err error)) {
+// The returned context can be cancelled by calling js.cancelJob(id).
+func (js *jobStore) runAsync(
+	job *ingestJob,
+	work func(ctx context.Context) (
+		nodes, edges, chunks int,
+		err error,
+	),
+) context.CancelFunc {
+	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		nodes, edges, chunks, err := work(context.Background())
+		nodes, edges, chunks, err := work(ctx)
 		js.finish(job.ID, nodes, edges, chunks, err)
 	}()
+
+	return cancel
 }
