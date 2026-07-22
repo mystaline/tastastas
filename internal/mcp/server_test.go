@@ -22,7 +22,7 @@ func TestMCPSmoke(t *testing.T) {
 	}
 	defer db.Close()
 
-	srv := NewServer(db, nil)
+	srv := NewServer(db, nil, nil)
 	if srv == nil {
 		t.Fatal("NewServer returned nil")
 	}

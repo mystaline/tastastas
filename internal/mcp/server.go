@@ -7,8 +7,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
+	"time"
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
 	golang "github.com/tree-sitter/tree-sitter-go/bindings/go"
@@ -23,34 +27,29 @@ import (
 	"github.com/mystaline-dev/tastastas/internal/ingest/docwalk"
 	"github.com/mystaline-dev/tastastas/internal/ingest/gitrepo"
 	"github.com/mystaline-dev/tastastas/internal/ingest/obsidian"
+	"github.com/mystaline-dev/tastastas/internal/llm"
+	"github.com/mystaline-dev/tastastas/internal/onboard"
 	"github.com/mystaline-dev/tastastas/internal/retrieve"
 	"github.com/mystaline-dev/tastastas/internal/store"
 )
 
-// goLanguage is lazily initialized — tree-sitter grammars require CGo
-// and their Language() returns unsafe.Pointer from C.
 var goLanguage = sync.OnceValue(func() *sitter.Language {
 	return sitter.NewLanguage(golang.Language())
 })
-
 var tsLanguage = sync.OnceValue(func() *sitter.Language {
 	return sitter.NewLanguage(ts.LanguageTypescript())
 })
 
-// chunkAndEmbedNodes chunks the given nodes (markdown headings / tree-sitter
-// for Go+TS) and embeds each chunk in batches of 32, storing them via
-// db.UpsertChunks. No-op (returns 0, nil) if embedder is nil — callers
-// degrade gracefully to lexical-only search. Shared by the MCP "ingest"
-// tool and the HTTP POST /ingest/{adapter} handler so both paths get
-// chunking+embedding instead of just one.
-//
-// If progress is non-nil, it's called with the number of chunks embedded
-// after each batch completes (for job progress visibility).
-func chunkAndEmbedNodes(ctx context.Context, db store.Store, embedder embed.EmbedderBackend, nodes []store.Node, progress func(int)) (int, error) {
+func chunkAndEmbedNodes(
+	ctx context.Context,
+	db store.Store,
+	embedder embed.EmbedderBackend,
+	nodes []store.Node,
+	progress func(int),
+) (int, error) {
 	if embedder == nil {
 		return 0, nil
 	}
-
 	var allChunks []store.Chunk
 	goLang := goLanguage()
 	tsLang := tsLanguage()
@@ -60,7 +59,6 @@ func chunkAndEmbedNodes(ctx context.Context, db store.Store, embedder embed.Embe
 	if len(allChunks) == 0 {
 		return 0, nil
 	}
-
 	const batchSize = 32
 	embedded := 0
 	for i := 0; i < len(allChunks); i += batchSize {
@@ -85,238 +83,311 @@ func chunkAndEmbedNodes(ctx context.Context, db store.Store, embedder embed.Embe
 			progress(embedded)
 		}
 	}
-
 	if err := db.UpsertChunks(ctx, allChunks); err != nil {
 		return 0, err
 	}
 	return len(allChunks), nil
 }
 
-// NewServer creates an MCP server with all tastastas tools registered.
-// The store and embedder are injected by the caller (cmd/tastastas/main.go)
-// — no lazy init, no import cycle, clean dependency injection. Pass a nil
-// embedder to run in lexical-only mode (no embedding-dependent features).
-func NewServer(db store.Store, embedder embed.EmbedderBackend) *mcp.Server {
-	srv := mcp.NewServer(&mcp.Implementation{
-		Name:    "tastastas",
-		Version: "0.1.0",
-	}, nil)
-	registerTools(srv, db, embedder)
+// safeGo runs fn in a goroutine with panic recovery. Logs panic + stack trace.
+func safeGo(fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("PANIC: %v\n%s", r, debug.Stack())
+			}
+		}()
+		fn()
+	}()
+}
+
+func NewServer(db store.Store, embedder embed.EmbedderBackend, llmClient llm.Client) *mcp.Server {
+	srv := mcp.NewServer(
+		&mcp.Implementation{
+			Name:    "tastastas",
+			Version: "0.1.0",
+		},
+		nil,
+	)
+
+	registerTools(srv, db, embedder, llmClient)
 	return srv
 }
 
-// registerTools adds all 7 MCP tools to the server.
-func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBackend) {
+func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBackend, llmClient llm.Client) {
 	retriever := retrieve.New(db, retrieve.DefaultConfig())
 	extractor := extract.New(extract.Config{})
+	jobs := newJobStore()
+
 	// Tool 1: remember
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "remember",
-		Description: "Store or update a fact/entity in memory. Computes content hash automatically. If an embedder is configured, embeds content for vector search; if not, stores without embedding (degrades gracefully).",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args RememberInput) (*mcp.CallToolResult, RememberOutput, error) {
-		projectID := args.ProjectID
-		if projectID == "" {
-			projectID = "default"
-		}
-		nodeType := args.NodeType
-		if nodeType == "" {
-			nodeType = "generic-doc"
-		}
-		id := args.ID
-		if id == "" {
-			id = fmt.Sprintf("%s/fact/%s", projectID, genULID())
-		}
-		importance := args.Importance
-		if importance == 0 {
-			importance = 0.5
-		}
-
-		n := store.Node{
-			ID:            id,
-			NodeType:      nodeType,
-			Title:         args.Title,
-			Content:       args.Content,
-			ProjectID:     projectID,
-			Importance:    importance,
-			SourceAdapter: "mcp",
-		}
-		if err := db.UpsertNode(ctx, n); err != nil {
-			return errorResult(err), RememberOutput{}, nil
-		}
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf(`{"id":"%s","status":"stored"}`, id)}},
-		}, RememberOutput{ID: id, Status: "stored"}, nil
-	})
-
-	// Tool 2: recall (Phase 5/6: real scoring with recency + graph pull-in,
-	// now with Phase B vector fusion when embedding is available).
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "recall",
-		Description: "Search memory by query. Flexes lexical (FTS5) or fused lexical+vector scoring depending on whether an embedder is configured. Returns scored results with graph-neighbor pull-in for context enrichment.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args RecallInput) (*mcp.CallToolResult, RecallOutput, error) {
-		projectID := args.ProjectID
-		if projectID == "" {
-			projectID = "default"
-		}
-		limit := args.Limit
-		if limit == 0 {
-			limit = 10
-		}
-
-		params := retrieve.RecallParams{
-			ProjectID: projectID,
-			Query:     args.Query,
-			Limit:     limit,
-		}
-
-		// If embedder is available, embed the query for vector fusion.
-		if embedder != nil {
-			vec, err := embedder.Embed(ctx, args.Query)
-			if err == nil {
-				params.Embedding = vec
+	mcp.AddTool(
+		srv,
+		&mcp.Tool{
+			Name:        "remember",
+			Description: "Store or update a fact/entity in memory. Computes content hash automatically. If an embedder is configured, embeds content for vector search; if not, stores without embedding (degrades gracefully).",
+		},
+		func(ctx context.Context, req *mcp.CallToolRequest, args RememberInput) (*mcp.CallToolResult, RememberOutput, error) {
+			projectID := args.ProjectID
+			if projectID == "" {
+				projectID = "default"
 			}
-			// If embedding fails, proceed lexical-only — graceful degradation.
-		}
+			nodeType := args.NodeType
+			if nodeType == "" {
+				nodeType = "generic-doc"
+			}
+			id := args.ID
+			if id == "" {
+				id = fmt.Sprintf("%s/fact/%s", projectID, genULID())
+			}
+			importance := args.Importance
+			if importance == 0 {
+				importance = 0.5
+			}
 
-		result, err := retriever.Recall(ctx, params)
-		if err != nil {
-			return errorResult(err), RecallOutput{}, nil
-		}
+			n := store.Node{
+				ID: id, NodeType: nodeType, Title: args.Title, Content: args.Content,
+				ProjectID: projectID, Importance: importance, SourceAdapter: "mcp",
+			}
 
-		items := make([]RecallItem, 0, len(result.Nodes))
-		for _, s := range result.Nodes {
-			items = append(items, RecallItem{
-				ID:        s.ID,
-				Title:     s.Title,
-				Content:   s.Content,
-				NodeType:  s.NodeType,
-				Score:     s.Score,
-				MatchType: s.MatchType,
-			})
-		}
+			if err := db.UpsertNode(ctx, n); err != nil {
+				return errorResult(err), RememberOutput{}, nil
+			}
 
-		links := make([]ImplicitMCPLink, 0, len(result.Links))
-		for _, l := range result.Links {
-			links = append(links, ImplicitMCPLink{
-				FromChunkID: l.FromChunkID,
-				ToChunkID:   l.ToChunkID,
-				Cosine:      l.Cosine,
-			})
-		}
-		_ = result.Chunks // TODO: expose in RecallOutput when needed
+			if _, err := chunkAndEmbedNodes(
+				ctx,
+				db,
+				embedder,
+				[]store.Node{n}, nil,
+			); err != nil {
+				return errorResult(err), RememberOutput{}, nil
+			}
 
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(RecallOutput{Results: items, Links: links})}},
-		}, RecallOutput{Results: items, Links: links}, nil
-	})
+			toolResult := &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{
+						Text: fmt.Sprintf(`{"id":"%s","status":"stored"}`, id),
+					},
+				},
+			}
+
+			output := RememberOutput{
+				ID:     id,
+				Status: "stored",
+			}
+
+			return toolResult, output, nil
+		},
+	)
+
+	// Tool 2: recall
+	mcp.AddTool(
+		srv,
+		&mcp.Tool{
+			Name:        "recall",
+			Description: "Search memory by query. Flexes lexical (FTS5) or fused lexical+vector scoring depending on whether an embedder is configured. Returns scored results with graph-neighbor pull-in for context enrichment.",
+		}, func(ctx context.Context, req *mcp.CallToolRequest, args RecallInput) (*mcp.CallToolResult, RecallOutput, error) {
+			projectID := args.ProjectID
+			if projectID == "" {
+				projectID = "default"
+			}
+			limit := args.Limit
+			if limit == 0 {
+				limit = 10
+			}
+			params := retrieve.RecallParams{
+				ProjectID: projectID,
+				Query:     args.Query,
+				Limit:     limit,
+			}
+			if embedder != nil {
+				if vec, err := embedder.Embed(ctx, args.Query); err == nil {
+					params.Embedding = vec
+				}
+			}
+
+			result, err := retriever.Recall(ctx, params)
+			if err != nil {
+				return errorResult(err), RecallOutput{}, nil
+			}
+
+			items := make([]RecallItem, 0, len(result.Nodes))
+			for _, s := range result.Nodes {
+				items = append(
+					items,
+					RecallItem{
+						ID:        s.ID,
+						Title:     s.Title,
+						Content:   s.Content,
+						NodeType:  s.NodeType,
+						Score:     s.Score,
+						MatchType: s.MatchType,
+					},
+				)
+			}
+
+			links := make([]ImplicitMCPLink, 0, len(result.Links))
+			for _, l := range result.Links {
+				links = append(
+					links,
+					ImplicitMCPLink{FromChunkID: l.FromChunkID, ToChunkID: l.ToChunkID, Cosine: l.Cosine},
+				)
+			}
+
+			toolResult := &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{
+						Text: marshalJSON(RecallOutput{
+							Results: items,
+							Links:   links,
+						},
+						),
+					},
+				},
+			}
+
+			output := RecallOutput{Results: items, Links: links}
+
+			return toolResult, output, nil
+		})
 
 	// Tool 3: forget
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "forget",
-		Description: "Delete a node from memory by ID.",
+		Name: "forget", Description: "Delete a node from memory by ID.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args ForgetInput) (*mcp.CallToolResult, ForgetOutput, error) {
 		err := db.DeleteNode(ctx, args.ID)
 		if errors.Is(err, store.ErrNotFound) {
 			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: `{"status":"not_found"}`}},
-			}, ForgetOutput{Status: "not_found"}, nil
+					Content: []mcp.Content{&mcp.TextContent{Text: `{"status":"not_found"}`}},
+				}, ForgetOutput{
+					Status: "not_found",
+				}, nil
 		}
 		if err != nil {
 			return errorResult(err), ForgetOutput{}, nil
 		}
 
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: `{"status":"deleted"}`}},
-		}, ForgetOutput{Status: "deleted"}, nil
+		toolResult := &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: `{"status":"deleted"}`},
+			},
+		}
+
+		output := ForgetOutput{
+			Status: "deleted",
+		}
+
+		return toolResult, output, nil
 	})
 
 	// Tool 4: link
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "link",
-		Description: "Create a typed, directed edge between two nodes.",
+		Name: "link", Description: "Create a typed, directed edge between two nodes.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args LinkInput) (*mcp.CallToolResult, LinkOutput, error) {
-		confidence := args.Confidence
-		if confidence == 0 {
-			confidence = 1.0
+		if args.Confidence == 0 {
+			args.Confidence = 1.0
 		}
 
-		e := store.Edge{
-			FromID:     args.FromID,
-			ToID:       args.ToID,
-			EdgeType:   args.EdgeType,
-			Confidence: confidence,
-		}
-		if err := db.UpsertEdge(ctx, e); err != nil {
+		if err := db.UpsertEdge(
+			ctx,
+			store.Edge{
+				FromID:     args.FromID,
+				ToID:       args.ToID,
+				EdgeType:   args.EdgeType,
+				Confidence: args.Confidence,
+			},
+		); err != nil {
 			return errorResult(err), LinkOutput{}, nil
 		}
 
-		return &mcp.CallToolResult{
+		toolResult := &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: `{"status":"linked"}`}},
-		}, LinkOutput{Status: "linked"}, nil
+		}
+
+		output := LinkOutput{
+			Status: "linked",
+		}
+
+		return toolResult, output, nil
 	})
 
 	// Tool 5: ingest
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ingest",
-		Description: "Ingest documents from a filesystem root using a named adapter (docwalk, gitrepo, obsidian).",
+		Name: "ingest", Description: "Ingest documents from a filesystem root using a named adapter (docwalk, gitrepo, obsidian).",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args IngestInput) (*mcp.CallToolResult, IngestOutput, error) {
 		nodes, edges, _, _, err := runIngestAdapter(args.Adapter, args.Root, args.ConfigPath, args.ProjectID)
 		if err != nil {
 			return errorResult(err), IngestOutput{}, nil
 		}
-
-		for i := range nodes {
-			if err := db.UpsertNode(ctx, nodes[i]); err != nil {
+		for _, n := range nodes {
+			if err := db.UpsertNode(ctx, n); err != nil {
 				return errorResult(err), IngestOutput{}, nil
 			}
 		}
-		for i := range edges {
-			if err := db.UpsertEdge(ctx, edges[i]); err != nil {
+		for _, e := range edges {
+			if err := db.UpsertEdge(ctx, e); err != nil {
 				return errorResult(err), IngestOutput{}, nil
 			}
 		}
 
-		// Chunk and embed ingested nodes if embedder is available.
 		chunkCount, err := chunkAndEmbedNodes(ctx, db, embedder, nodes, nil)
 		if err != nil {
 			return errorResult(err), IngestOutput{}, nil
 		}
 
-		out := IngestOutput{NodesIngested: len(nodes), EdgesCreated: len(edges), ChunksCreated: chunkCount}
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
-		}, out, nil
+		output := IngestOutput{
+			NodesIngested: len(nodes),
+			EdgesCreated:  len(edges),
+			ChunksCreated: chunkCount,
+		}
+
+		toolResult := &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{
+					Text: marshalJSON(output),
+				},
+			},
+		}
+
+		return toolResult, output, nil
 	})
 
 	// Tool 6: check_impact
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "check_impact",
-		Description: "After updating a node, check which downstream nodes are affected. Returns list of nodes flagged stale by content change.",
+		Name: "check_impact", Description: "After updating a node, check which downstream nodes are affected.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args CheckImpactInput) (*mcp.CallToolResult, CheckImpactOutput, error) {
-		maxDepth := args.MaxDepth
-		if maxDepth == 0 {
-			maxDepth = 2
+		if args.MaxDepth == 0 {
+			args.MaxDepth = 2
 		}
-		stale, err := db.MarkStaleDownstream(ctx, args.ID, maxDepth)
+
+		stale, err := db.MarkStaleDownstream(ctx, args.ID, args.MaxDepth)
 		if err != nil {
 			return errorResult(err), CheckImpactOutput{}, nil
 		}
-		items := make([]StaleNode, 0, len(stale))
-		for _, n := range stale {
-			items = append(items, StaleNode{ID: n.ID, NodeType: n.NodeType})
+
+		items := make([]StaleNode, len(stale))
+		for i, n := range stale {
+			items[i] = StaleNode{ID: n.ID, NodeType: n.NodeType}
 		}
-		out := CheckImpactOutput{StaleNodes: items}
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
-		}, out, nil
+
+		toolResult := &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{
+					Text: marshalJSON(CheckImpactOutput{
+						StaleNodes: items,
+					},
+					),
+				},
+			},
+		}
+
+		output := CheckImpactOutput{
+			StaleNodes: items,
+		}
+
+		return toolResult, output, nil
 	})
 
-	// Tool 7: extract_and_remember (Phase 4/6: extraction + dedupe pipeline).
-	// Distinct from `remember`: takes raw conversation text, runs it through
-	// the LLM extraction pipeline, dedupe-checks each fact against existing
-	// nodes of the same kind in the project (cosine similarity via
-	// SearchVector), merges above threshold instead of duplicate-inserting.
-	// `remember`'s direct-insert contract is untouched by this tool.
+	// Tool 7: extract_and_remember — async
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "extract_and_remember",
 		Description: "Extract atomic facts/entities from raw conversation text via LLM, dedupe-check each against existing memory, and store (merge on near-duplicate, insert otherwise).",
@@ -326,73 +397,233 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			projectID = "default"
 		}
 
-		facts, err := extractor.Extract(ctx, args.Conversation)
+		job := jobs.create()
+		safeGo(func() {
+			defer jobs.finish(job.ID, 0, 0, 0, func() error {
+				facts, err := extractor.Extract(context.Background(), args.Conversation)
+				if err != nil {
+					return fmt.Errorf("extract: %w", err)
+				}
+
+				var storedNodes []store.Node
+				for _, f := range facts {
+					vec, err := embedder.Embed(context.Background(), f.Content)
+					if err != nil {
+						return fmt.Errorf("embed: %w", err)
+					}
+
+					candidates, err := db.SearchVector(context.Background(), projectID, vec, 5)
+					if err != nil {
+						log.Printf("extract_and_remember: search: %v", err)
+						continue
+					}
+
+					id := fmt.Sprintf("%s/%s/%s", projectID, f.Kind, genULID())
+
+					for _, c := range candidates {
+						if c.NodeType == f.Kind && c.Score >= dedupe.DefaultThreshold {
+							id = c.ID
+							break
+						}
+					}
+
+					node := store.Node{
+						ID: id, ProjectID: projectID, NodeType: f.Kind,
+						Title: f.Title, Content: f.Content, Importance: f.Importance,
+						SourceAdapter: "extract_and_remember", Embedding: vec,
+					}
+
+					if err := db.UpsertNode(context.Background(), node); err != nil {
+						return fmt.Errorf("upsert %s: %w", id, err)
+					}
+					storedNodes = append(storedNodes, node)
+				}
+
+				chunkAndEmbedNodes(context.Background(), db, embedder, storedNodes, nil)
+				return nil
+			}())
+		})
+
+		output := ExtractAndRememberOutput{
+			Facts: []ExtractedFactResult{
+				{ID: job.ID, Status: "running"},
+			},
+		}
+
+		toolResult := &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{
+					Text: marshalJSON(output),
+				},
+			},
+		}
+
+		return toolResult, output, nil
+	})
+
+	// Tool 8: onboard — async
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "onboard",
+		Description: "Onboard into a codebase. Auto-detects adapters, runs all matching, infers conventions, runs Tier 2 linking. Async — returns job_id.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args OnboardInput) (*mcp.CallToolResult, OnboardOutput, error) {
+		projectID := args.ProjectID
+		if projectID == "" {
+			projectID = "default"
+		}
+
+		cwd := args.CWD
+		if cwd == "" {
+			var err error
+			cwd, err = os.Getwd()
+			if err != nil {
+				return errorResult(err), OnboardOutput{}, nil
+			}
+		}
+
+		job := jobs.create()
+		safeGo(func() {
+			defer jobs.finish(job.ID, 0, 0, 0, func() error {
+				result, err := onboard.Run(
+					context.Background(),
+					onboard.Config{
+						CWD:       cwd,
+						ProjectID: projectID,
+						Scope:     args.Scope,
+						Embedder:  embedder,
+						Store:     db,
+					},
+				)
+				if err != nil {
+					return err
+				}
+				if result.AlreadyOnboarded {
+					return nil
+				}
+
+				// Chunk + embed for RAG-level recall.
+				_, err = chunkAndEmbedNodes(
+					context.Background(),
+					db,
+					embedder,
+					result.AllNodes,
+					nil,
+				)
+				if err != nil {
+					log.Printf("onboard: chunk+embed: %v", err)
+				}
+
+				return nil
+			}())
+		})
+
+		output := OnboardOutput{ProjectID: projectID, JobID: job.ID, Status: "running"}
+
+		toolResult := &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{
+					Text: marshalJSON(output),
+				},
+			},
+		}
+
+		return toolResult, output, nil
+	})
+
+	// Tool 9: onboard_check
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "onboard_check", Description: "Check graph state for a project. Read-only.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args OnboardCheckInput) (*mcp.CallToolResult, OnboardCheckOutput, error) {
+		projectID := args.ProjectID
+		if projectID == "" {
+			projectID = "default"
+		}
+
+		stats, err := db.Stats(ctx, projectID)
 		if err != nil {
-			return errorResult(err), ExtractAndRememberOutput{}, nil
+			return errorResult(err), OnboardCheckOutput{}, nil
 		}
 
-		results := make([]ExtractedFactResult, 0, len(facts))
-		for _, f := range facts {
-			vec, err := embedder.Embed(ctx, f.Content)
-			if err != nil {
-				return errorResult(err), ExtractAndRememberOutput{}, nil
-			}
-
-			// Cosine-search existing nodes of the same kind in this project.
-			// store.SearchVector's Score is exactly cosine similarity
-			// (sqlite backend: Score = 1 - vec_distance_cosine, and cosine
-			// distance IS 1 - cosine similarity) — so comparing it directly
-			// against dedupe.DefaultThreshold is equivalent to running
-			// dedupe.CosineSimilarity ourselves, without a redundant round
-			// trip to re-fetch raw vectors the store doesn't expose back.
-			candidates, err := db.SearchVector(ctx, projectID, vec, 5)
-			if err != nil {
-				return errorResult(err), ExtractAndRememberOutput{}, nil
-			}
-
-			id := ""
-			status := "created"
-			bestID, bestScore := "", -1.0
-			for _, c := range candidates {
-				if c.NodeType != f.Kind {
-					continue
-				}
-				if c.Score > bestScore {
-					bestID, bestScore = c.ID, c.Score
-				}
-			}
-			if bestID != "" && bestScore >= dedupe.DefaultThreshold {
-				id = bestID
-				status = "merged"
-			} else {
-				id = fmt.Sprintf("%s/%s/%s", projectID, f.Kind, genULID())
-			}
-
-			n := store.Node{
-				ID:            id,
-				ProjectID:     projectID,
-				NodeType:      f.Kind,
-				Title:         f.Title,
-				Content:       f.Content,
-				Importance:    f.Importance,
-				SourceAdapter: "extract_and_remember",
-				Embedding:     vec,
-			}
-			if err := db.UpsertNode(ctx, n); err != nil {
-				return errorResult(err), ExtractAndRememberOutput{}, nil
-			}
-			results = append(results, ExtractedFactResult{ID: id, Status: status})
+		output := OnboardCheckOutput{
+			HasNodes:       stats.NodeCount > 0,
+			HasChunks:      stats.ChunkCount > 0,
+			HasEmbeddings:  stats.VecCount > 0,
+			HasEdges:       stats.EdgeCount > 0,
+			HasConventions: stats.ConventionCnt > 0,
+			StaleCount:     stats.StaleCount,
+			NodeCount:      stats.NodeCount,
+			EdgeCount:      stats.EdgeCount,
+			ChunkCount:     stats.ChunkCount,
+			VecCount:       stats.VecCount,
 		}
 
-		out := ExtractAndRememberOutput{Facts: results}
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
-		}, out, nil
+		toolResult := &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{
+					Text: marshalJSON(output),
+				},
+			},
+		}
+
+		return toolResult, output, nil
+	})
+
+	// Tool 10: build_knowledge_graph — async
+	if llmClient != nil {
+		mcp.AddTool(srv, &mcp.Tool{
+			Name: "build_knowledge_graph", Description: "Run full linking pipeline (Tier 1/2/3) on an already-ingested project. Background job, returns job_id.",
+		}, func(ctx context.Context, req *mcp.CallToolRequest, args BuildGraphInput) (*mcp.CallToolResult, BuildGraphOutput, error) {
+			projectID := args.ProjectID
+			if projectID == "" {
+				projectID = "default"
+			}
+
+			state := jobs.runBuildGraph(context.Background(), projectID, db, embedder, llmClient)
+
+			output := BuildGraphOutput{JobID: state.ID, Status: state.Status, StartedAt: state.StartedAt}
+			toolResult := &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{
+						Text: marshalJSON(output),
+					},
+				},
+			}
+			return toolResult, output, nil
+		})
+	}
+
+	// Tool 11: job_status — poll any async job
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "job_status", Description: "Poll status of an async job (onboard, extract_and_remember, build_knowledge_graph). Returns current state.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args JobStatusInput) (*mcp.CallToolResult, JobStatusOutput, error) {
+		j, ok := jobs.get(args.JobID)
+		if !ok {
+			return errorResult(fmt.Errorf("job %s not found", args.JobID)), JobStatusOutput{}, nil
+		}
+		output := JobStatusOutput{
+			ID:        j.ID,
+			Status:    j.Status,
+			Nodes:     j.Nodes,
+			Edges:     j.Edges,
+			Chunks:    j.Chunks,
+			Error:     j.Error,
+			StartedAt: j.StartedAt.Format(time.RFC3339),
+		}
+		if !j.EndedAt.IsZero() {
+			output.EndedAt = j.EndedAt.Format(time.RFC3339)
+		}
+
+		toolResult := &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{
+					Text: marshalJSON(output),
+				},
+			},
+		}
+
+		return toolResult, output, nil
 	})
 }
 
-// runIngestAdapter dispatches to the named ingest adapter and returns the
-// resulting nodes/edges (gitrepo returns no edges; obsidian/docwalk do).
 func runIngestAdapter(adapter, root, configPath, projectID string) ([]store.Node, []store.Edge, int, int, error) {
 	switch adapter {
 	case "docwalk":
@@ -408,33 +639,39 @@ func runIngestAdapter(adapter, root, configPath, projectID string) ([]store.Node
 			cfg.ProjectID = projectID
 		}
 		return docwalk.Ingest(root, cfg)
-
 	case "gitrepo":
-		nodes, err := gitrepo.Ingest(gitrepo.Config{Root: root, ProjectID: projectID})
+		nodes, err := gitrepo.Ingest(
+			gitrepo.Config{Root: root, ProjectID: projectID},
+		)
 		return nodes, nil, 0, 0, err
-
 	case "obsidian":
-		nodes, edges, err := obsidian.Ingest(obsidian.Config{Root: root, ProjectID: projectID})
+		nodes, edges, err := obsidian.Ingest(
+			obsidian.Config{Root: root, ProjectID: projectID},
+		)
 		return nodes, edges, 0, 0, err
-
 	default:
-		return nil, nil, 0, 0, fmt.Errorf("adapter %q not implemented (must be one of: docwalk, gitrepo, obsidian)", adapter)
+		return nil, nil, 0, 0, fmt.Errorf(
+			"adapter %q not implemented (must be one of: docwalk, gitrepo, obsidian)",
+			adapter,
+		)
 	}
 }
-
-// --- helpers (types in types.go) ---
 
 func errorResult(err error) *mcp.CallToolResult {
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{
-			&mcp.TextContent{Text: fmt.Sprintf(`{"error":"%s"}`, strings.ReplaceAll(err.Error(), `"`, `\"`))},
+			&mcp.TextContent{
+				Text: fmt.Sprintf(
+					`{"error":"%s"}`,
+					strings.ReplaceAll(err.Error(), `"`, `\"`),
+				),
+			},
 		},
 		IsError: true,
 	}
 }
 
 func marshalJSON(v any) string {
-	// Use encoding/json for deterministic output — no fmt.Sprintf on structs.
 	b, err := json.Marshal(v)
 	if err != nil {
 		return fmt.Sprintf(`{"error":"marshal: %s"}`, err)
