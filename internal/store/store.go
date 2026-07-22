@@ -101,5 +101,44 @@ type Store interface {
 	// edge types) as status=stale, up to maxDepth hops, and returns them.
 	MarkStaleDownstream(ctx context.Context, changedID string, maxDepth int) ([]Node, error)
 
+	// Stats returns aggregate counts for a project.
+	Stats(ctx context.Context, projectID string) (StoreStats, error)
+
+	// ListNodesByType returns nodes matching any of the given types, ordered by created_at desc.
+	ListNodesByType(ctx context.Context, projectID string, types []string, limit, offset int) ([]Node, error)
+
+	// ListEdgesByType returns edges matching the given edge type, scoped to a project.
+	ListEdgesByType(ctx context.Context, projectID string, edgeType string, limit, offset int) ([]Edge, error)
+
+	// DeleteEdge removes a single edge by its composite key.
+	DeleteEdge(ctx context.Context, fromID, toID, edgeType string) error
+
+	// ResolveUnresolved checks if a newly-upserted node's title matches any
+	// pending unresolved_references mentions for the same project. For each
+	// match, creates the stored relation edge and deletes the reference.
+	// Returns number of references resolved.
+	ResolveUnresolved(ctx context.Context, projectID, nodeID, nodeTitle string) (int, error)
+
 	Close() error
+}
+
+// EdgeProposal is a Tier-3 candidate link awaiting disambiguation.
+type EdgeProposal struct {
+	ID         string
+	FromID     string
+	ToID       string
+	EdgeType   string
+	Confidence float64
+	Reason     string
+	Status     string // pending | accepted | rejected
+}
+
+// StoreStats holds aggregate project-level counts for inspection tools.
+type StoreStats struct {
+	NodeCount     int `json:"node_count"`
+	EdgeCount     int `json:"edge_count"`
+	ChunkCount    int `json:"chunk_count"`
+	VecCount      int `json:"vec_count"`
+	StaleCount    int `json:"stale_count"`
+	ConventionCnt int `json:"convention_count"`
 }
