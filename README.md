@@ -42,7 +42,7 @@ you already run it).
 | `--serve` | *(unset)* | Run as HTTP server on this address (e.g. `:8080`). Unset = stdio MCP mode. |
 | `--db` | `memory.db` | Path to the SQLite database file. |
 | `--embed-dim` | `384` | Vector dimension. Must match whatever embedder you use — 384 for the baked sidecar (`bge-small-en-v1.5`) or many `sentence-transformers`, 768 for `nomic-embed-text`. Wrong-dim vectors are rejected at insert. |
-| `--embed-backend` | `ollama` | Which embedder to use: `sidecar` (baked ONNX binary, zero external deps, always 384-dim — run `scripts/build-sidecar.sh` once first), `ollama` (HTTP call to a local Ollama), or `none` (lexical-only, no embedding at all — `extract_and_remember` and semantic recall degrade gracefully). |
+| `--embed-backend` | `sidecar` | Which embedder to use: `sidecar` (baked ONNX binary, zero external deps, always 384-dim — run `scripts/build-sidecar.sh` once first), `ollama` (HTTP call to a local Ollama), or `none` (lexical-only, no embedding at all — `extract_and_remember` and semantic recall degrade gracefully). |
 | `--ollama-url` | `http://localhost:11434` | Ollama base URL. Only used when `--embed-backend=ollama`. |
 | `--ollama-model` | `nomic-embed-text` | Ollama embedding model name. Only used when `--embed-backend=ollama`. Must match `--embed-dim` (768 for `nomic-embed-text`). |
 
@@ -236,6 +236,25 @@ linux/amd64, linux/arm64, macOS/amd64, macOS/arm64, windows/amd64, and
 attaches them to a GitHub Release. No manual `scripts/build-sidecar.sh`
 step needed for released binaries — that script is for building from
 source locally.
+
+## References
+
+tastastas retrieval pipeline composes several techniques:
+
+| Method | Role | Source |
+|---|---|---|
+| **FTS5 BM25** | Lexical keyword search (always runs) | SQLite FTS5 |
+| **Cosine similarity** | Semantic vector distance | Standard linear algebra |
+| **RRF (Reciprocal Rank Fusion)** | Fuses lexical + vector + graph ranks — unit-free, stable across embedder changes | [Microsoft hybrid search ranking](https://learn.microsoft.com/en-us/azure/search/hybrid-search-ranking), [TREC 2004 Robust Track](https://trec.nist.gov/pubs/trec13/papers/ROBUST.OVERVIEW.pdf) |
+| **Recency decay** | `2^(-age / halfLife)` time-based score decay | Exponential decay model |
+| **Importance weighting** | Node-level significance multiplier | Application-defined (stored per node) |
+| **Graph neighbor pull-in** | BFS walk from top hits, score = `0.5 · recency · importance · (×1.2 if edge confidence > 0.8)` | Graph traversal + heuristic boost |
+| **Cross-source linking** | Pairwise cosine similarity between chunks from different adapters | Implicit semantic edge detection |
+
+Other agentic-memory tools typically use flat `α · BM25 + (1-α) · cosine`
+linear fusion. tastastas uses RRF (rank-based) instead — removes dependence
+on embedder score distributions — and adds time decay, importance gating,
+and graph adjacency as independent signals with their own scoring math.
 
 ## License
 

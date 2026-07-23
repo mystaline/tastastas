@@ -34,6 +34,8 @@ func NewSidecarPool(n int) (*SidecarPool, error) {
 
 // EmbedBatch distributes the batch across workers in round-robin fashion.
 // Each worker gets at most ceil(len(texts)/len(workers)) texts.
+// Respects context cancellation — if ctx is cancelled, all in-flight workers
+// are abandoned and the error is returned immediately.
 func (p *SidecarPool) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, nil
@@ -69,14 +71,18 @@ func (p *SidecarPool) EmbedBatch(ctx context.Context, texts []string) ([][]float
 		}(i, w, sub)
 	}
 
-	// Collect results in order
+	// Collect results in order, return first error
 	results := make([]result, len(p.workers))
 	for range p.workers {
-		r := <-resCh
-		if r.err != nil {
-			return nil, r.err
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case r := <-resCh:
+			if r.err != nil {
+				return nil, r.err
+			}
+			results[r.idx] = r
 		}
-		results[r.idx] = r
 	}
 
 	// Concatenate in original order

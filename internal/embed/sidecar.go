@@ -4,8 +4,9 @@
 // and selected at build time via go:embed + runtime.GOOS/GOARCH.
 //
 // Protocol: newline-delimited JSON over the sidecar's stdin/stdout.
-//   in:  {"texts": ["a", "b"]}
-//   out: {"embeddings": [[...]], "error": null}
+//
+//	in:  {"texts": ["a", "b"]}
+//	out: {"embeddings": [[...]], "error": null}
 //
 // One request in flight at a time (mutex-guarded) — the sidecar is a
 // single persistent subprocess, not a pool. Batches of up to 32 chunks
@@ -125,6 +126,7 @@ func (s *SidecarEmbedder) Embed(ctx context.Context, text string) ([]float32, er
 }
 
 // EmbedBatch embeds up to 32 texts in a single sidecar round-trip.
+// Respects context cancellation.
 func (s *SidecarEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, nil
@@ -133,8 +135,21 @@ func (s *SidecarEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]f
 		return nil, fmt.Errorf("embed: batch size %d exceeds max 32", len(texts))
 	}
 
+	// Lock with context awareness
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
 
 	body, err := json.Marshal(sidecarRequest{Texts: texts})
 	if err != nil {
@@ -142,24 +157,49 @@ func (s *SidecarEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]f
 	}
 	body = append(bytes.TrimRight(body, "\n"), '\n')
 
-	if _, err := s.in.Write(body); err != nil {
-		return nil, fmt.Errorf("embed: write to sidecar: %w", err)
+	// Write with context check
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.in.Write(body)
+		done <- err
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case err := <-done:
+		if err != nil {
+			return nil, fmt.Errorf("embed: write to sidecar: %w", err)
+		}
 	}
 
-	line, err := s.out.ReadBytes('\n')
-	if err != nil {
-		return nil, fmt.Errorf("embed: read from sidecar: %w", err)
+	// Read with context check
+	type readResult struct {
+		line []byte
+		err  error
 	}
-
-	var resp sidecarResponse
-	if err := json.Unmarshal(line, &resp); err != nil {
-		return nil, fmt.Errorf("embed: decode sidecar response: %w", err)
+	readCh := make(chan readResult, 1)
+	go func() {
+		line, err := s.out.ReadBytes('\n')
+		readCh <- readResult{line: line, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-readCh:
+		if r.err != nil {
+			return nil, fmt.Errorf("embed: read from sidecar: %w", r.err)
+		}
+		var resp sidecarResponse
+		if err := json.Unmarshal(r.line, &resp); err != nil {
+			return nil, fmt.Errorf("embed: decode sidecar response: %w", err)
+		}
+		if resp.Error != nil {
+			return nil, fmt.Errorf("embed: sidecar error: %s", *resp.Error)
+		}
+		if len(resp.Embeddings) != len(texts) {
+			return nil, fmt.Errorf("embed: expected %d embeddings, got %d", len(texts), len(resp.Embeddings))
+		}
+		return resp.Embeddings, nil
 	}
-	if resp.Error != nil {
-		return nil, fmt.Errorf("embed: sidecar error: %s", *resp.Error)
-	}
-	if len(resp.Embeddings) != len(texts) {
-		return nil, fmt.Errorf("embed: expected %d embeddings, got %d", len(texts), len(resp.Embeddings))
-	}
-	return resp.Embeddings, nil
 }

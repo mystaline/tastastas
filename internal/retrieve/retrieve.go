@@ -16,6 +16,8 @@ import (
 	"math"
 	"time"
 
+	"strings"
+
 	"github.com/mystaline-dev/tastastas/internal/store"
 )
 
@@ -48,6 +50,10 @@ type Config struct {
 	// MaxChunks caps the number of chunk results returned. Default: 5.
 	MaxChunks int
 
+	// RRFK is the constant k for Reciprocal Rank Fusion.
+	// Standard value: 60. Larger = more weight to lower ranks.
+	RRFK int
+
 	// CrossSourceThreshold is the minimum cosine similarity between two
 	// chunks from different source adapters to surface as an implicit
 	// semantic link. Default: 0.85.
@@ -57,14 +63,15 @@ type Config struct {
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		RecencyHalfLife: 7 * 24 * time.Hour,
-		NeighborDepth:   1,
-		NeighborTypes:   nil,
-		MaxResults:      20,
-		Alpha:           0.4,
-		IncludeChunks:   true,
-		MaxChunks:       5,
+		RecencyHalfLife:      7 * 24 * time.Hour,
+		NeighborDepth:        1,
+		NeighborTypes:        nil,
+		MaxResults:           20,
+		Alpha:                0.4,
+		IncludeChunks:        true,
+		MaxChunks:            5,
 		CrossSourceThreshold: 0.85,
+		RRFK:                 60,
 	}
 }
 
@@ -87,9 +94,9 @@ type ImplicitLink struct {
 
 // RecallResult groups nodes, chunks, and implicit links returned by Recall.
 type RecallResult struct {
-	Nodes  []ScoredNode      `json:"nodes"`
+	Nodes  []ScoredNode        `json:"nodes"`
 	Chunks []store.ScoredChunk `json:"chunks"`
-	Links  []ImplicitLink    `json:"links,omitempty"`
+	Links  []ImplicitLink      `json:"links,omitempty"`
 }
 
 // ScoredNode is a node with its computed retrieval score.
@@ -137,7 +144,9 @@ func (r *Retriever) Recall(ctx context.Context, params RecallParams) (*RecallRes
 	}
 
 	// 1. Lexical search — always runs (fast, no external deps)
-	lexHits, err := r.store.SearchLexical(ctx, params.ProjectID, params.Query, limit*3)
+	// FTS5 MATCH treats bare words as phrase. Convert multi-word queries to OR.
+	ftsq := toFTSQuery(params.Query)
+	lexHits, err := r.store.SearchLexical(ctx, params.ProjectID, ftsq, limit*3)
 	if err != nil {
 		return nil, err
 	}
@@ -170,45 +179,16 @@ func (r *Retriever) Recall(ctx context.Context, params RecallParams) (*RecallRes
 		candidateIDs[id] = true
 	}
 
-	// 4. Score each candidate: fuse lexical + vector, then × recency × importance
+	// 4. RRF fusion scoring
 	now := time.Now()
-	scored := make([]ScoredNode, 0, len(candidateIDs))
-	seen := map[string]bool{}
-
-	for id := range candidateIDs {
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-
-		node, err := r.store.GetNode(ctx, id)
-		if err != nil {
-			continue // node deleted between search and get
-		}
-
-		lexRel := lexScores[id] // 0 if not in lexical results
-		vecSim := vecScores[id] // 0 if not in vector results
-		if vecScores == nil {
-			vecSim = 0
-		}
-
-		// Fuse: if we have vector scores, use alpha-weighted fusion,
-		// otherwise pure lexical (vecSim stays 0, alpha effectively 1.0).
-		fused := fuseScore(lexRel, vecSim, r.cfg.Alpha, vecScores != nil)
-		matchType := matchTypeOf(lexRel, vecSim)
-
-		recency := r.recencyDecay(now.Sub(parseTime(node)))
-		score := fused * recency * node.Importance
-		if score > 0 {
-			scored = append(scored, ScoredNode{
-				Node:      node,
-				Score:     score,
-				MatchType: matchType,
-			})
-		}
-	}
+	candNodes := r.fetchCandidates(ctx, candidateIDs)
+	scored := r.rrfScore(candNodes, lexScores, vecScores, now)
 
 	// 5. Graph pull-in: for top hits, fetch N-hop neighbors
+	seen := map[string]bool{}
+	for _, s := range scored {
+		seen[s.ID] = true
+	}
 	if r.cfg.NeighborDepth > 0 && len(scored) > 0 {
 		pullFrom := scored
 		if len(pullFrom) > 5 {
@@ -224,17 +204,23 @@ func (r *Retriever) Recall(ctx context.Context, params RecallParams) (*RecallRes
 			if err != nil {
 				continue
 			}
+
 			for _, n := range neighbors {
 				if seen[n.ID] {
 					continue
 				}
+
 				seen[n.ID] = true
 				recency := r.recencyDecay(now.Sub(parseTime(n)))
 				ns := 0.5 * recency * n.Importance
 				if confidence[n.ID] > 0.8 {
 					ns *= 1.2
 				}
-				scored = append(scored, ScoredNode{Node: n, Score: ns, MatchType: "graph"})
+				scored = append(scored, ScoredNode{
+					Node:      n,
+					Score:     ns,
+					MatchType: "graph",
+				})
 			}
 		}
 	}
@@ -262,6 +248,116 @@ func (r *Retriever) Recall(ctx context.Context, params RecallParams) (*RecallRes
 	}
 
 	return &RecallResult{Nodes: scored, Chunks: chunkResults, Links: links}, nil
+}
+
+// toFTSQuery converts user input to FTS5 MATCH query:
+// multi-word → OR terms, single word → as-is, empty → match-all prefix.
+func toFTSQuery(q string) string {
+	fields := strings.Fields(q)
+	if len(fields) == 0 {
+		return "*"
+	}
+	if len(fields) == 1 {
+		return fields[0]
+	}
+	// Quote each term in case of special chars, join with OR
+	parts := make([]string, len(fields))
+	for i, f := range fields {
+		parts[i] = `"` + f + `"`
+	}
+	return strings.Join(parts, " OR ")
+}
+
+// fetchCandidates loads nodes by ID from the store.
+func (r *Retriever) fetchCandidates(ctx context.Context, ids map[string]bool) []store.Node {
+	out := make([]store.Node, 0, len(ids))
+	for id := range ids {
+		n, err := r.store.GetNode(ctx, id)
+		if err != nil {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+// rrfScore scores candidates using Reciprocal Rank Fusion.
+// RRF: for each candidate, score = Σ 1/(k + rank_in_set) across all search sets.
+// When only lexical set exists, score ∝ 1/(k+rank) ≈ rank-based relevance.
+func (r *Retriever) rrfScore(
+	nodes []store.Node,
+	lexScores, vecScores map[string]float64,
+	now time.Time,
+) []ScoredNode {
+	k := float64(r.cfg.RRFK)
+	if k == 0 {
+		k = 60
+	}
+
+	// ponytail: estimate rank from relevance score [0,1].
+	// Exact rank could use an ordered list from each search backend.
+	out := make([]ScoredNode, 0, len(nodes))
+	for _, node := range nodes {
+		rankSum := 0.0
+		sets := 0
+
+		if rel, ok := lexScores[node.ID]; ok && rel > 0 {
+			// Estimate rank from relevance score [0,1].
+			// We use inverse: higher relevance = earlier rank ≈ 1
+			// Map [0,1] relevance to rank 1..len
+			estRank := int((1.0-rel)*float64(len(lexScores)-1)) + 1
+			if estRank < 1 {
+				estRank = 1
+			}
+			rankSum += 1.0 / (k + float64(estRank))
+			sets++
+		}
+		if vec, ok := vecScores[node.ID]; ok && vec > 0 {
+			estRank := int((1.0-vec)*float64(len(vecScores)-1)) + 1
+			if estRank < 1 {
+				estRank = 1
+			}
+			rankSum += 1.0 / (k + float64(estRank))
+			sets++
+		}
+
+		if sets == 0 {
+			continue
+		}
+
+		fused := rankSum // RRF: sum, not average — appearing in more sets naturally boosts score
+		matchType := "lexical"
+		if _, ok := lexScores[node.ID]; ok {
+			if _, ok := vecScores[node.ID]; ok {
+				matchType = "hybrid"
+			}
+		} else if _, ok := vecScores[node.ID]; ok {
+			matchType = "semantic"
+		}
+
+		recency := r.recencyDecay(now.Sub(parseTime(node)))
+		score := fused * recency * node.Importance
+		if score > 0 {
+			out = append(out, ScoredNode{
+				Node:      node,
+				Score:     score,
+				MatchType: matchType,
+			})
+		}
+	}
+
+	// Sort by score descending
+	for i := 1; i < len(out); i++ {
+		key := out[i]
+		j := i - 1
+		for j >= 0 && out[j].Score < key.Score {
+			out[j+1] = out[j]
+			j--
+		}
+		out[j+1] = key
+	}
+
+	return out
 }
 
 // fuseScore combines lexical relevance and vector cosine similarity.
@@ -358,9 +454,9 @@ func findCrossSourceLinks(chunks []store.ScoredChunk, threshold float64) []Impli
 	}
 
 	type idxVec struct {
-		idx  int
-		vec  []float32
-		src  string
+		idx int
+		vec []float32
+		src string
 	}
 	items := make([]idxVec, 0, len(chunks))
 	for i, c := range chunks {
