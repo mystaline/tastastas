@@ -27,28 +27,7 @@ curl http://localhost:8080/health
 # → {"status":"ok","version":"0.1.0"}
 ```
 
-**MCP client config (Streamable HTTP):**
-
-Claude Code:
-```json
-{
-  "mcpServers": {
-    "tastastas": {
-      "type": "http",
-      "url": "http://localhost:8080/mcp"
-    }
-  }
-}
-```
-
-Kilo Code:
-```json
-"tastastas": {
-  "type": "remote",
-  "url": "http://localhost:8080/mcp",
-  "enabled": true
-}
-```
+MCP client config: see [MCP Configuration](#mcp-configuration) → HTTP.
 
 Graph visualization: `http://localhost:9292/graph/{project_id}`
 
@@ -73,7 +52,58 @@ Data persisted in Docker volume `tastastas-data`. Auth optional via `TASTASTAS_A
 
 > ℹ️ Sidecar ONNX model is baked into the binary by `build-sidecar.sh`. After build, no external deps needed — zero runtime installation, Ollama not required.
 
-**MCP client config (stdio):**
+MCP client config: stdio mode → see [MCP Configuration](#mcp-configuration) → Stdio. HTTP mode (`--serve`) → same as Option A, see → HTTP.
+
+### Option C: Single binary + external Ollama (personal, LLM extraction)
+
+**Prerequisites:** Go 1.26+, Ollama running + `ollama pull nomic-embed-text`
+
+> ⚠️ **Ollama + model must be running** before starting tastastas. Verify with `ollama list`. Change `--ollama-model` and `--embed-dim` for different models — check dimension via `curl -X POST http://localhost:11434/api/embeddings -d '{"model":"your-model","prompt":"test"}' | jq '.embedding | length'`.
+
+```bash
+go build -o tastastas ./cmd/tastastas
+
+# Stdio
+./tastastas --embed-backend ollama --ollama-url http://localhost:11434 --db ~/.local/share/tastastas/memory.db
+
+# HTTP
+./tastastas --embed-backend ollama --ollama-url http://localhost:11434 --serve :8080 --db ~/.local/share/tastastas/memory.db
+```
+
+`--ollama-url` defaults to `http://localhost:11434` — only needed if Ollama runs elsewhere (remote host, different port, Docker).
+
+MCP client config: stdio mode → see [MCP Configuration](#mcp-configuration) → Stdio + Ollama. HTTP mode (`--serve`) → same as Option A, see → HTTP.
+
+## MCP Configuration
+
+Config depends on how you started tastastas (Option A/B/C above). Pick the matching block.
+
+Only Claude Code and Kilo Code shown below — other agents just adjust to that agent's own MCP config format/file.
+
+**HTTP (Option A — Docker Compose):**
+
+Claude Code:
+```json
+{
+  "mcpServers": {
+    "tastastas": {
+      "type": "http",
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}
+```
+
+Kilo Code:
+```json
+"tastastas": {
+  "type": "remote",
+  "url": "http://localhost:8080/mcp",
+  "enabled": true
+}
+```
+
+**Stdio (Option B — sidecar):**
 
 Claude Code:
 ```json
@@ -104,23 +134,7 @@ Kilo Code:
 }
 ```
 
-### Option C: Single binary + external Ollama (personal, LLM extraction)
-
-**Prerequisites:** Go 1.26+, Ollama running + `ollama pull nomic-embed-text`
-
-> ⚠️ **Ollama + model must be running** before starting tastastas. Verify with `ollama list`. Change `--ollama-model` and `--embed-dim` for different models — check dimension via `curl -X POST http://localhost:11434/api/embeddings -d '{"model":"your-model","prompt":"test"}' | jq '.embedding | length'`.
-
-```bash
-go build -o tastastas ./cmd/tastastas
-
-# Stdio
-./tastastas --embed-backend ollama --db ~/.local/share/tastastas/memory.db
-
-# HTTP
-./tastastas --embed-backend ollama --serve :8080 --db ~/.local/share/tastastas/memory.db
-```
-
-**MCP client config (stdio):**
+**Stdio + Ollama (Option C):**
 
 Claude Code:
 ```json
@@ -133,8 +147,7 @@ Claude Code:
         "--db", "~/.local/share/tastastas/memory.db",
         "--embed-backend", "ollama",
         "--graph-addr", ":9292"
-      ],
-      "env": {}
+      ]
     }
   }
 }
@@ -152,6 +165,15 @@ Kilo Code:
   ],
   "enabled": true
 }
+```
+
+### Agent Integration
+
+Add this to your `.cursorrules`, `CLAUDE.md`, `AGENTS.md`, or other agent entrypoint:
+
+```markdown
+## Memory (tastastas)
+tastastas is an MCP server connected to this project. If you see tastastas in your available MCP tools, always call the `init` tool as the first step of every session to understand available tools and best practices.
 ```
 
 ## Flags
@@ -198,6 +220,8 @@ Source → [AutoDetectAdapters] → n → [EmbedNodes] → n → [InferConventio
 
 | Group | Tool | What it does | Embedder needed? | LLM needed? |
 |-------|------|-------------|-----------------|------------|
+| **Session start** | `init` | Capability overview — call first every session | No | No |
+| | | | | |
 | **Store / Delete** | `remember` | Store/update a fact | No | No |
 | | `forget` | Delete node by ID | No | No |
 | | | | | |
@@ -267,7 +291,7 @@ Accept: text/html (default)
 → 200  D3 force-directed graph HTML page
 ```
 
-### `POST /mcp` — MCP Streamable HTTP (all 13 tools)
+### `POST /mcp` — MCP Streamable HTTP (all 14 tools)
 
 See [Tools (MCP)](#tools-mcp) section below. Request/response follows the [MCP Streamable HTTP spec](https://spec.modelcontextprotocol.io/).
 

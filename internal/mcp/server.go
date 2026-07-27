@@ -185,7 +185,134 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 	extractor := extract.New(extract.Config{})
 	jobs := newJobStore(db)
 
-	// Tool 1: remember
+	// Tool 1: init
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "init", Description: "Initialize tastastas and get capability overview for your session.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct{}) (*mcp.CallToolResult, string, error) {
+		help := `Tastastas Memory Backend:
+- Typed graph + vector + lexical hybrid.
+- Tools: remember (store), recall (search), link (connect nodes), query_graph (trace), ingest (walk codebase).
+- Rules:
+  1. Always 'init' first.
+  2. Use 'recall' for initial search; if results are large, use 'recall_chunks' to fetch full paginated content (saves context).
+  3. Prefer 'link' (create edges) over 'remember' (store text or quick memorable notes) for complex relationships (ERD, PRD, API spec).
+  4. 'recall' returns ranked structural edges + inferred links; use 'query_graph' to inspect proposals.
+  5. Ingest is idempotent; run on every push.`
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: help}}}, help, nil
+	})
+
+	// Tool 2: onboard — async
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "onboard",
+		Description: "Onboard into a codebase. Auto-detects adapters, runs all matching, infers conventions, runs Tier 2 linking. Async — returns job_id.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args OnboardInput) (*mcp.CallToolResult, OnboardOutput, error) {
+		projectID := args.ProjectID
+		if projectID == "" {
+			projectID = "default"
+		}
+
+		cwd := args.CWD
+		if cwd == "" {
+			var err error
+			cwd, err = os.Getwd()
+			if err != nil {
+				return errorResult(err), OnboardOutput{}, nil
+			}
+		}
+
+		job := jobs.create()
+		safeGo(func() {
+			defer jobs.finish(job.ID, 0, 0, 0, func() error {
+				result, err := onboard.Run(
+					context.Background(),
+					onboard.Config{
+						CWD:       cwd,
+						ProjectID: projectID,
+						Scope:     args.Scope,
+						Embedder:  embedder,
+						Store:     db,
+					},
+				)
+				if err != nil {
+					return err
+				}
+				if result.AlreadyOnboarded {
+					return nil
+				}
+				// Report walk counts and transition phase to "embedding" — same as ingest path.
+				jobs.updateCounts(job.ID, result.FilesWalked, result.FilesSkipped)
+
+				// Chunk + embed for RAG-level recall.
+				chunkCount, err := chunkAndEmbedNodes(
+					context.Background(), db, embedder, result.AllNodes,
+					func(embedded, total int) { jobs.updateChunksEmbedded(job.ID, embedded, total) },
+					func() { jobs.updatePhase(job.ID, "persisting") },
+				)
+				if err != nil {
+					return fmt.Errorf("chunk/embed: %w", err)
+				}
+				_ = chunkCount
+				return nil
+			}())
+			// Report walk counts and transition phase to "embedding" — same as ingest path.
+		})
+		// Report walk counts and transition phase to "embedding" — same as ingest path.
+
+		output := OnboardOutput{ProjectID: projectID, JobID: job.ID, Status: "running"}
+
+		toolResult := &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{
+					Text: marshalJSON(output),
+				},
+			},
+		}
+
+		return toolResult, output, nil
+	})
+
+	// Tool 3: onboard_check
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "onboard_check", Description: "Check graph state for a project. Read-only.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args OnboardCheckInput) (*mcp.CallToolResult, OnboardCheckOutput, error) {
+		projectID := args.ProjectID
+		if projectID == "" {
+			projectID = "default"
+		}
+
+		stats, err := db.Stats(ctx, projectID)
+		if err != nil {
+			return errorResult(err), OnboardCheckOutput{}, nil
+		}
+
+		output := OnboardCheckOutput{
+			HasNodes:       stats.NodeCount > 0,
+			HasChunks:      stats.ChunkCount > 0,
+			HasEmbeddings:  stats.VecCount > 0,
+			HasEdges:       stats.EdgeCount > 0,
+			HasConventions: stats.ConventionCnt > 0,
+			StaleCount:     stats.StaleCount,
+			NodeCount:      stats.NodeCount,
+			EdgeCount:      stats.EdgeCount,
+			ChunkCount:     stats.ChunkCount,
+			VecCount:       stats.VecCount,
+		}
+		if etc, err := db.EdgeTypeCounts(ctx, projectID); err == nil && len(etc) > 0 {
+			output.EdgeTypeCounts = etc
+		}
+
+		toolResult := &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{
+					Text: marshalJSON(output),
+				},
+			},
+		}
+
+		return toolResult, output, nil
+	})
+
+	// Tool 4: remember
 	mcp.AddTool(
 		srv,
 		&mcp.Tool{
@@ -245,7 +372,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 		},
 	)
 
-	// Tool 2: recall
+	// Tool 5: recall
 	mcp.AddTool(
 		srv,
 		&mcp.Tool{
@@ -261,9 +388,9 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 				limit = 10
 			}
 			params := retrieve.RecallParams{
-				ProjectID:    projectID,
-				Query:        args.Query,
-				Limit:        limit,
+				ProjectID:     projectID,
+				Query:         args.Query,
+				Limit:         limit,
 				LinkThreshold: args.LinkThreshold,
 			}
 			if embedder != nil {
@@ -323,64 +450,72 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			return toolResult, output, nil
 
 		})
-		// Tool 3: recall_chunks
-		mcp.AddTool(srv, &mcp.Tool{
-			Name: "recall_chunks",
-			Description: "Fetch more chunks of a node returned by recall. Use when a recall result shows more_available=true. Pass the node id as parent_node_id with a chunk range (default 3 per page). chunk_end is exclusive (0-indexed): chunk_end=total_chunks fetches the remainder in one call.",
-		}, func(ctx context.Context, req *mcp.CallToolRequest, args RecallChunksInput) (*mcp.CallToolResult, RecallChunksOutput, error) {
-			if args.ParentNodeID == "" {
-				return errorResult(fmt.Errorf("parent_node_id is required")), RecallChunksOutput{}, nil
-			}
-			chunkStart := args.ChunkStart
-			if chunkStart < 0 {
-				chunkStart = 0
-			}
-			chunkEnd := args.ChunkEnd
-			if chunkEnd <= chunkStart {
-				chunkEnd = chunkStart + 3
-			}
-			parent, err := db.GetNode(ctx, args.ParentNodeID)
-			if err != nil {
-				return errorResult(fmt.Errorf("parent node not found: %w", err)), RecallChunksOutput{}, nil
-			}
-			total, err := db.CountChunksByParent(ctx, args.ParentNodeID)
-			if err != nil {
-				return errorResult(err), RecallChunksOutput{}, nil
-			}
-			if chunkEnd > total {
-				chunkEnd = total
-			}
-			limit := chunkEnd - chunkStart
-			if limit <= 0 {
-				out := RecallChunksOutput{ParentNodeID: args.ParentNodeID, ParentTitle: parent.Title, TotalChunks: total, ReturnedRange: "none", MoreAvailable: false, NextChunkStart: -1}
-				return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}}}, out, nil
-			}
-			chunks, err := db.GetChunksByParent(ctx, args.ParentNodeID, limit, chunkStart)
-			if err != nil {
-				return errorResult(err), RecallChunksOutput{}, nil
-			}
-			items := make([]ChunkOutputItem, 0, len(chunks))
-			for _, c := range chunks {
-				items = append(items, ChunkOutputItem{
-					ID: c.ID, ParentNodeID: c.ParentNodeID, ChunkIndex: c.ChunkIndex,
-					Type: c.Type, HeadingPath: c.HeadingPath, Content: c.Content,
-					Language: c.Language,
-				})
-			}
-			more := chunkEnd < total
-			next := chunkEnd
-			if !more {
-				next = -1
-			}
+
+	// Tool 6: recall_chunks
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "recall_chunks",
+		Description: "Fetch more chunks of a node returned by recall. Use when a recall result shows more_available=true. Pass the node id as parent_node_id with a chunk range (default 3 per page). chunk_end is exclusive (0-indexed): chunk_end=total_chunks fetches the remainder in one call.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args RecallChunksInput) (*mcp.CallToolResult, RecallChunksOutput, error) {
+		if args.ParentNodeID == "" {
+			return errorResult(fmt.Errorf("parent_node_id is required")), RecallChunksOutput{}, nil
+		}
+		chunkStart := args.ChunkStart
+		if chunkStart < 0 {
+			chunkStart = 0
+		}
+		chunkEnd := args.ChunkEnd
+		if chunkEnd <= chunkStart {
+			chunkEnd = chunkStart + 3
+		}
+		parent, err := db.GetNode(ctx, args.ParentNodeID)
+		if err != nil {
+			return errorResult(fmt.Errorf("parent node not found: %w", err)), RecallChunksOutput{}, nil
+		}
+		total, err := db.CountChunksByParent(ctx, args.ParentNodeID)
+		if err != nil {
+			return errorResult(err), RecallChunksOutput{}, nil
+		}
+		if chunkEnd > total {
+			chunkEnd = total
+		}
+		limit := chunkEnd - chunkStart
+		if limit <= 0 {
 			out := RecallChunksOutput{
-				ParentNodeID: args.ParentNodeID, ParentTitle: parent.Title,
-				TotalChunks: total, ReturnedRange: fmt.Sprintf("chunk %d-%d of %d", chunkStart, chunkEnd-1, total),
-				Chunks: items, MoreAvailable: more, NextChunkStart: next,
+				ParentNodeID:   args.ParentNodeID,
+				ParentTitle:    parent.Title,
+				TotalChunks:    total,
+				ReturnedRange:  "none",
+				MoreAvailable:  false,
+				NextChunkStart: -1,
 			}
 			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}}}, out, nil
-		})
+		}
+		chunks, err := db.GetChunksByParent(ctx, args.ParentNodeID, limit, chunkStart)
+		if err != nil {
+			return errorResult(err), RecallChunksOutput{}, nil
+		}
+		items := make([]ChunkOutputItem, 0, len(chunks))
+		for _, c := range chunks {
+			items = append(items, ChunkOutputItem{
+				ID: c.ID, ParentNodeID: c.ParentNodeID, ChunkIndex: c.ChunkIndex,
+				Type: c.Type, HeadingPath: c.HeadingPath, Content: c.Content,
+				Language: c.Language,
+			})
+		}
+		more := chunkEnd < total
+		next := chunkEnd
+		if !more {
+			next = -1
+		}
+		out := RecallChunksOutput{
+			ParentNodeID: args.ParentNodeID, ParentTitle: parent.Title,
+			TotalChunks: total, ReturnedRange: fmt.Sprintf("chunk %d-%d of %d", chunkStart, chunkEnd-1, total),
+			Chunks: items, MoreAvailable: more, NextChunkStart: next,
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}}}, out, nil
+	})
 
-		// Tool 5: forget
+	// Tool 7: forget
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "forget", Description: "Delete a node from memory by ID.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args ForgetInput) (*mcp.CallToolResult, ForgetOutput, error) {
@@ -409,7 +544,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 		return toolResult, output, nil
 	})
 
-	// Tool 4: link
+	// Tool 8: link
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "link", Description: "Create a typed, directed edge between two nodes.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args LinkInput) (*mcp.CallToolResult, LinkOutput, error) {
@@ -440,9 +575,9 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 		return toolResult, output, nil
 	})
 
-	// Tool 5: ingest — async, auto-detect adapters
+	// Tool 9: ingest — async, auto-detect adapters
 	mcp.AddTool(srv, &mcp.Tool{
-		Name: "ingest",
+		Name:        "ingest",
 		Description: "Ingest a project directory into memory. Auto-detects adapters (codeast, docwalk, gitrepo, obsidian, markdown-glob), walks files, chunks, embeds, and returns a job_id for polling via job_status.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args IngestInput) (*mcp.CallToolResult, IngestOutput, error) {
 		projectID := args.ProjectID
@@ -467,7 +602,12 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 
 		job := jobs.create()
 		safeGo(func() {
-			nodes, edges, _, filesWalked, filesSkipped, err := onboard.AutoDetectAdapters(context.Background(), db, cwd, projectID)
+			nodes, edges, _, filesWalked, filesSkipped, err := onboard.AutoDetectAdapters(
+				context.Background(),
+				db,
+				cwd,
+				projectID,
+			)
 			if err != nil {
 				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("detect adapters: %w", err))
 				return
@@ -528,7 +668,8 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(output)}},
 		}, output, nil
 	})
-	// Tool 6: check_impact
+
+	// Tool 10: check_impact
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "check_impact", Description: "After updating a node, check which downstream nodes are affected.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args CheckImpactInput) (*mcp.CallToolResult, CheckImpactOutput, error) {
@@ -564,7 +705,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 		return toolResult, output, nil
 	})
 
-	// Tool 7: extract_and_remember — async
+	// Tool 11: extract_and_remember — async
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "extract_and_remember",
 		Description: "Extract atomic facts/entities from raw conversation text via LLM, dedupe-check each against existing memory, and store (merge on near-duplicate, insert otherwise).",
@@ -638,118 +779,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 		return toolResult, output, nil
 	})
 
-	// Tool 8: onboard — async
-	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "onboard",
-		Description: "Onboard into a codebase. Auto-detects adapters, runs all matching, infers conventions, runs Tier 2 linking. Async — returns job_id.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args OnboardInput) (*mcp.CallToolResult, OnboardOutput, error) {
-		projectID := args.ProjectID
-		if projectID == "" {
-			projectID = "default"
-		}
-
-		cwd := args.CWD
-		if cwd == "" {
-			var err error
-			cwd, err = os.Getwd()
-			if err != nil {
-				return errorResult(err), OnboardOutput{}, nil
-			}
-		}
-
-		job := jobs.create()
-		safeGo(func() {
-			defer jobs.finish(job.ID, 0, 0, 0, func() error {
-				result, err := onboard.Run(
-					context.Background(),
-					onboard.Config{
-						CWD:       cwd,
-						ProjectID: projectID,
-						Scope:     args.Scope,
-						Embedder:  embedder,
-						Store:     db,
-					},
-				)
-				if err != nil {
-					return err
-				}
-				if result.AlreadyOnboarded {
-					return nil
-				}
-				// Report walk counts and transition phase to "embedding" — same as ingest path.
-				jobs.updateCounts(job.ID, result.FilesWalked, result.FilesSkipped)
-
-				// Chunk + embed for RAG-level recall.
-				chunkCount, err := chunkAndEmbedNodes(
-					context.Background(), db, embedder, result.AllNodes,
-					func(embedded, total int) { jobs.updateChunksEmbedded(job.ID, embedded, total) },
-					func() { jobs.updatePhase(job.ID, "persisting") },
-				)
-				if err != nil {
-					return fmt.Errorf("chunk/embed: %w", err)
-				}
-				_ = chunkCount
-				return nil
-			}())
-				// Report walk counts and transition phase to "embedding" — same as ingest path.
-		})
-				// Report walk counts and transition phase to "embedding" — same as ingest path.
-
-		output := OnboardOutput{ProjectID: projectID, JobID: job.ID, Status: "running"}
-
-		toolResult := &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{
-					Text: marshalJSON(output),
-				},
-			},
-		}
-
-		return toolResult, output, nil
-	})
-
-	// Tool 9: onboard_check
-	mcp.AddTool(srv, &mcp.Tool{
-		Name: "onboard_check", Description: "Check graph state for a project. Read-only.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args OnboardCheckInput) (*mcp.CallToolResult, OnboardCheckOutput, error) {
-		projectID := args.ProjectID
-		if projectID == "" {
-			projectID = "default"
-		}
-
-		stats, err := db.Stats(ctx, projectID)
-		if err != nil {
-			return errorResult(err), OnboardCheckOutput{}, nil
-		}
-
-		output := OnboardCheckOutput{
-			HasNodes:       stats.NodeCount > 0,
-			HasChunks:      stats.ChunkCount > 0,
-			HasEmbeddings:  stats.VecCount > 0,
-			HasEdges:       stats.EdgeCount > 0,
-			HasConventions: stats.ConventionCnt > 0,
-			StaleCount:     stats.StaleCount,
-			NodeCount:      stats.NodeCount,
-			EdgeCount:      stats.EdgeCount,
-			ChunkCount:     stats.ChunkCount,
-			VecCount:       stats.VecCount,
-		}
-		if etc, err := db.EdgeTypeCounts(ctx, projectID); err == nil && len(etc) > 0 {
-			output.EdgeTypeCounts = etc
-		}
-
-		toolResult := &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{
-					Text: marshalJSON(output),
-				},
-			},
-		}
-
-		return toolResult, output, nil
-	})
-
-	// Tool 10: query_graph - synchronous
+	// Tool 12: query_graph - synchronous
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "query_graph",
 		Description: "Query graph edges from/to a node. Returns typed relationships: who calls this function, what this doc references, etc. Use after recall to explore connections.",
@@ -824,7 +854,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 		}, output, nil
 	})
 
-	// Tool 11: project_graph - synchronous, macro-level visualization data
+	// Tool 13: project_graph - synchronous, macro-level visualization data
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "project_graph",
 		Description: "Return all edges and deduplicated nodes for a project, for macro-level graph visualization. By default excludes proposed edges and caps at 5000 edges.",
@@ -841,7 +871,17 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 
 		// Default: structural + auto-linked (exclude proposed).
 		if len(edgeTypes) == 0 {
-			edgeTypes = []string{"specifies", "implements", "tests", "calls", "defines", "imports", "convention-member", "auto-linked", "references"}
+			edgeTypes = []string{
+				"specifies",
+				"implements",
+				"tests",
+				"calls",
+				"defines",
+				"imports",
+				"convention-member",
+				"auto-linked",
+				"references",
+			}
 		}
 
 		results, total, err := db.ListEdgesByProject(ctx, projectID, edgeTypes, maxEdges, 0)
@@ -885,28 +925,28 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 		}, out, nil
 	})
 
-	// Tool 11: job_status — poll any async job
+	// Tool 14: job_status — poll any async job
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "job_status", Description: "Poll status of an async job (onboard, extract_and_remember). Returns current state.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args JobStatusInput) (*mcp.CallToolResult, JobStatusOutput, error) {
-			j, ok := jobs.get(args.JobID)
-			if !ok {
-				return errorResult(fmt.Errorf("job %s not found", args.JobID)), JobStatusOutput{}, nil
-			}
-			output := JobStatusOutput{
-				ID:              j.ID,
-				Status:          j.Status,
-				Phase:           j.Phase,
-				Nodes:           j.Nodes,
-				Edges:           j.Edges,
-				Chunks:          j.Chunks,
-				ChunksTotal:     j.ChunksTotal,
-				Conventions:     j.Conventions,
-				AutoLinked:      j.AutoLinked,
-				ProposalsQueued: j.ProposalsQueued,
-				Error:           j.Error,
-				StartedAt:       j.StartedAt.Format(time.RFC3339),
-			}
+		j, ok := jobs.get(args.JobID)
+		if !ok {
+			return errorResult(fmt.Errorf("job %s not found", args.JobID)), JobStatusOutput{}, nil
+		}
+		output := JobStatusOutput{
+			ID:              j.ID,
+			Status:          j.Status,
+			Phase:           j.Phase,
+			Nodes:           j.Nodes,
+			Edges:           j.Edges,
+			Chunks:          j.Chunks,
+			ChunksTotal:     j.ChunksTotal,
+			Conventions:     j.Conventions,
+			AutoLinked:      j.AutoLinked,
+			ProposalsQueued: j.ProposalsQueued,
+			Error:           j.Error,
+			StartedAt:       j.StartedAt.Format(time.RFC3339),
+		}
 		if !j.EndedAt.IsZero() {
 			output.EndedAt = j.EndedAt.Format(time.RFC3339)
 		}
