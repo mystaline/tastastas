@@ -26,12 +26,21 @@ import (
 // Inferred edges are embedding-derived (~0.80-0.89).
 // Proposed edges are excluded — they are the review queue, not knowledge.
 var (
-	StructuralEdgeTypes = []string{"specifies", "implements", "tests", "calls", "defines", "imports", "convention-member"}
-	InferredEdgeTypes   = []string{"auto-linked"}
+	StructuralEdgeTypes = []string{
+		"specifies",
+		"implements",
+		"tests",
+		"calls",
+		"defines",
+		"imports",
+		"convention-member",
+	}
+	InferredEdgeTypes = []string{"auto-linked"}
 
 	StructuralEdgeCap = 10
 	InferredEdgeCap   = 10
 )
+
 // Config holds retrieval tuning parameters.
 type Config struct {
 	// RecencyHalfLife is how long until a fact decays to 50% importance.
@@ -86,9 +95,9 @@ func DefaultConfig() Config {
 		MaxResults:           20,
 		Alpha:                0.4,
 		IncludeChunks:        true,
-		MaxChunks:      15,
+		MaxChunks:            15,
 		PreviewChunksPerNode: 3,
-		ExcerptLen:     200,
+		ExcerptLen:           200,
 		CrossSourceThreshold: 0.75,
 		RRFK:                 60,
 	}
@@ -116,7 +125,7 @@ type ImplicitLink struct {
 
 // RecallResult groups nodes, chunks, and implicit links returned by Recall.
 type RecallResult struct {
-	Nodes []ScoredNode        `json:"nodes"`
+	Nodes  []ScoredNode        `json:"nodes"`
 	Chunks []store.ScoredChunk `json:"-"`
 	Links  []ImplicitLink      `json:"links,omitempty"`
 }
@@ -134,12 +143,12 @@ type EdgeRef struct {
 type ScoredNode struct {
 	store.Node
 	Score          float64
-	MatchType      string   // "lexical" | "semantic" | "hybrid" | "graph"
-	Excerpt        string   `json:"excerpt"`          // truncated excerpt
-	PreviewChunks  []string `json:"preview_chunks"`   // first N chunk contents
-	TotalChunks    int      `json:"total_chunks"`
-	MoreAvailable  bool     `json:"more_available"`
-	NextChunkStart int      `json:"next_chunk_start"` // -1 if done
+	MatchType      string    // "lexical" | "semantic" | "hybrid" | "graph"
+	Excerpt        string    `json:"excerpt"`        // truncated excerpt
+	PreviewChunks  []string  `json:"preview_chunks"` // first N chunk contents
+	TotalChunks    int       `json:"total_chunks"`
+	MoreAvailable  bool      `json:"more_available"`
+	NextChunkStart int       `json:"next_chunk_start"` // -1 if done
 	Edges          []EdgeRef `json:"edges,omitempty"`
 	InferredEdges  []EdgeRef `json:"inferred_edges,omitempty"`
 }
@@ -188,51 +197,32 @@ func (r *Retriever) Recall(ctx context.Context, params RecallParams) (*RecallRes
 	}
 
 	// 1. Lexical search — always runs (fast, no external deps)
-	// FTS5 MATCH treats bare words as phrase. Convert multi-word queries to OR.
 	ftsq := toFTSQuery(params.Query)
 	lexHits, err := r.store.SearchLexical(ctx, params.ProjectID, ftsq, limit*3)
 	if err != nil {
 		return nil, err
 	}
 
-	// Build a map of node ID → lexical relevance for fusion later.
-	lexScores := make(map[string]float64, len(lexHits))
-	for _, h := range lexHits {
-		lexScores[h.ID] = rankToRelevance(h.Score)
-	}
-
 	// 2. Vector search (only if embedding provided)
-	var vecScores map[string]float64
+	var vecHits []store.ScoredNode
 	if len(params.Embedding) > 0 {
-		vecNodes, err := r.store.SearchVector(ctx, params.ProjectID, params.Embedding, limit*2)
+		vh, err := r.store.SearchVector(ctx, params.ProjectID, params.Embedding, limit*2)
 		if err == nil {
-			vecScores = make(map[string]float64, len(vecNodes))
-			for _, v := range vecNodes {
-				vecScores[v.ID] = v.Score // cosine similarity already in [0,1]
-			}
+			vecHits = vh
 		}
 		// On error, proceed lexical-only — graceful degradation.
 	}
 
-	// 3. Collect all candidate node IDs (union of lexical + vector hits)
-	candidateIDs := make(map[string]bool, len(lexScores)+len(vecScores))
-	for id := range lexScores {
-		candidateIDs[id] = true
-	}
-	for id := range vecScores {
-		candidateIDs[id] = true
-	}
-
-	// 4. RRF fusion scoring
+	// 3. RRF fusion scoring using real rank from ordered result lists
 	now := time.Now()
-	candNodes := r.fetchCandidates(ctx, candidateIDs)
-	scored := r.rrfScore(candNodes, lexScores, vecScores, now)
+	scored := r.rrfScore(lexHits, vecHits, nil, now, limit)
 
-	// 5. Graph pull-in: for top hits, fetch N-hop neighbors
+	// 4. Graph pull-in — walk edges from top-5 RRF results
 	seen := map[string]bool{}
 	for _, s := range scored {
 		seen[s.ID] = true
 	}
+	var graphNodes []ScoredNode
 	if r.cfg.NeighborDepth > 0 && len(scored) > 0 {
 		pullFrom := scored
 		if len(pullFrom) > 5 {
@@ -240,39 +230,29 @@ func (r *Retriever) Recall(ctx context.Context, params RecallParams) (*RecallRes
 		}
 		for _, s := range pullFrom {
 			neighbors, confidence, err := r.store.NeighborsWithConfidence(
-				ctx,
-				s.Node.ID,
-				r.cfg.NeighborTypes,
-				r.cfg.NeighborDepth,
+				ctx, s.Node.ID, r.cfg.NeighborTypes, r.cfg.NeighborDepth,
 			)
 			if err != nil {
 				continue
 			}
-
 			for _, n := range neighbors {
 				if seen[n.ID] {
 					continue
 				}
-
 				seen[n.ID] = true
-				recency := r.recencyDecay(now.Sub(parseTime(n)))
-				ns := 0.5 * recency * n.Importance
-				if confidence[n.ID] > 0.8 {
-					ns *= 1.2
-				}
-				scored = append(scored, ScoredNode{
+				graphNodes = append(graphNodes, ScoredNode{
 					Node:      n,
-					Score:     ns,
+					Score:     confidence[n.ID],
 					MatchType: "graph",
 				})
 			}
 		}
 	}
-
-	// 6. Sort by score descending, cap at limit
-	sortByScore(scored)
-	if len(scored) > limit {
-		scored = scored[:limit]
+	if len(graphNodes) > 0 {
+		// Merge graph nodes via RRF: treat them as appearing in a weak third
+		// "graph expansion" set at back ranks so their scores stay in the same
+		// magnitude as search results, never dominating them.
+		scored = r.rrfScore(lexHits, vecHits, graphNodes, now, limit)
 	}
 
 	// 7. Chunk search (optional, only if embedding provided + IncludeChunks)
@@ -291,9 +271,13 @@ func (r *Retriever) Recall(ctx context.Context, params RecallParams) (*RecallRes
 
 	// 9. Cross-source implicit links: compare chunks pairwise by cosine
 	// similarity when they come from different source adapters.
+	threshold := r.cfg.CrossSourceThreshold
+	if params.LinkThreshold > 0 {
+		threshold = params.LinkThreshold
+	}
 	var links []ImplicitLink
 	if len(chunkResults) > 1 {
-		links = findCrossSourceLinks(chunkResults, r.cfg.CrossSourceThreshold)
+		links = findCrossSourceLinks(chunkResults, threshold)
 	}
 
 	return &RecallResult{Nodes: scored, Chunks: chunkResults, Links: links}, nil
@@ -327,70 +311,133 @@ func escapeFTS(s string) string {
 }
 
 // fetchCandidates loads nodes by ID from the store.
-func (r *Retriever) fetchCandidates(ctx context.Context, ids map[string]bool) []store.Node {
-	out := make([]store.Node, 0, len(ids))
-	for id := range ids {
-		n, err := r.store.GetNode(ctx, id)
-		if err != nil {
-			continue
-		}
-		out = append(out, n)
-	}
-	return out
-}
-
 // rrfScore scores candidates using Reciprocal Rank Fusion.
-// RRF: for each candidate, score = Σ 1/(k + rank_in_set) across all search sets.
-// When only lexical set exists, score ∝ 1/(k+rank) ≈ rank-based relevance.
+// RRF: score = Σ 1/(k + rank_in_set) across all search sets.
+// lexHits and vecHits are ordered by the backend (best match first).
+// graphNodes are unordered — each gets rank = runnerUp + proximity within
+// the graph expansion set, so graph-neighbor scores never dominate search.
 func (r *Retriever) rrfScore(
-	nodes []store.Node,
-	lexScores, vecScores map[string]float64,
+	lexHits, vecHits []store.ScoredNode,
+	graphHits []ScoredNode,
 	now time.Time,
+	limit int,
 ) []ScoredNode {
 	k := float64(r.cfg.RRFK)
 	if k == 0 {
 		k = 60
 	}
 
-	// ponytail: estimate rank from relevance score [0,1].
-	// Exact rank could use an ordered list from each search backend.
-	out := make([]ScoredNode, 0, len(nodes))
-	for _, node := range nodes {
+	// Build rank for each search set: node ID → 1-based rank
+	lexRank := make(map[string]int, len(lexHits))
+	for i, h := range lexHits {
+		lexRank[h.ID] = i + 1
+	}
+	vecRank := make(map[string]int, len(vecHits))
+	for i, h := range vecHits {
+		vecRank[h.ID] = i + 1
+	}
+
+	// Union of all node IDs across all sets
+	allIDs := make(map[string]bool, len(lexRank)+len(vecRank)+len(graphHits))
+	for id := range lexRank {
+		allIDs[id] = true
+	}
+	for id := range vecRank {
+		allIDs[id] = true
+	}
+	for _, g := range graphHits {
+		allIDs[g.ID] = true
+	}
+
+	// Graph set: use the graph confidence as a pseudo-rank so nodes
+	// closer to the frontier rank higher than deeper expansions.
+	graphRank := make(map[string]int, len(graphHits))
+	for _, g := range graphHits {
+		// Confidence [0,1] → pseudo-rank 1..N within graph set
+		pr := int((1.0-g.Score)*float64(len(graphHits)-1)) + 1
+		if pr < 1 {
+			pr = 1
+		}
+		graphRank[g.ID] = pr
+	}
+
+	out := make([]ScoredNode, 0, len(allIDs))
+	for id := range allIDs {
 		rankSum := 0.0
 		sets := 0
 
-		if rel, ok := lexScores[node.ID]; ok && rel > 0 {
-			// Estimate rank from relevance score [0,1].
-			// We use inverse: higher relevance = earlier rank ≈ 1
-			// Map [0,1] relevance to rank 1..len
-			estRank := int((1.0-rel)*float64(len(lexScores)-1)) + 1
-			if estRank < 1 {
-				estRank = 1
-			}
-			rankSum += 1.0 / (k + float64(estRank))
+		if rank, ok := lexRank[id]; ok {
+			rankSum += 1.0 / (k + float64(rank))
 			sets++
 		}
-		if vec, ok := vecScores[node.ID]; ok && vec > 0 {
-			estRank := int((1.0-vec)*float64(len(vecScores)-1)) + 1
-			if estRank < 1 {
-				estRank = 1
-			}
-			rankSum += 1.0 / (k + float64(estRank))
+		if rank, ok := vecRank[id]; ok {
+			rankSum += 1.0 / (k + float64(rank))
 			sets++
 		}
-
+		if rank, ok := graphRank[id]; ok {
+			startOffset := len(lexHits) + len(vecHits) + 1
+			if startOffset < 5 {
+				startOffset = 5
+			}
+			rankSum += 1.0 / (k + float64(startOffset+rank))
+			sets++
+		}
 		if sets == 0 {
 			continue
 		}
 
-		fused := rankSum // RRF: sum, not average — appearing in more sets naturally boosts score
+		fused := rankSum
 		matchType := "lexical"
-		if _, ok := lexScores[node.ID]; ok {
-			if _, ok := vecScores[node.ID]; ok {
+		if _, ok := lexRank[id]; ok {
+			if _, ok := vecRank[id]; ok {
 				matchType = "hybrid"
 			}
-		} else if _, ok := vecScores[node.ID]; ok {
+		} else if _, ok := vecRank[id]; ok {
 			matchType = "semantic"
+		} else if _, ok := graphRank[id]; ok {
+			matchType = "graph"
+		}
+
+		// Fetch node data for the score calculation.
+		// If the node is in lexHits or vecHits, reuse that data; otherwise
+		// fetch from the store (graph-only nodes).
+		var node store.Node
+		found := false
+		for _, h := range lexHits {
+			if h.ID == id {
+				node = h.Node
+				if h.Node.Importance != 0 {
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			for _, h := range vecHits {
+				if h.ID == id {
+					node = h.Node
+					if h.Node.Importance != 0 {
+						found = true
+						break
+					}
+				}
+			}
+		}
+		if !found {
+			for _, g := range graphHits {
+				if g.ID == id {
+					node = g.Node
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			n, err := r.store.GetNode(context.Background(), id)
+			if err != nil {
+				continue
+			}
+			node = n
 		}
 
 		recency := r.recencyDecay(now.Sub(parseTime(node)))
@@ -414,39 +461,11 @@ func (r *Retriever) rrfScore(
 		}
 		out[j+1] = key
 	}
+	if len(out) > limit {
+		out = out[:limit]
+	}
 
 	return out
-}
-
-// fuseScore combines lexical relevance and vector cosine similarity.
-// When no vectors are available (vecAvailable=false), returns pure lexical.
-func fuseScore(lexRel, vecSim, alpha float64, vecAvailable bool) float64 {
-	if !vecAvailable || vecSim == 0 {
-		return lexRel
-	}
-	if lexRel == 0 {
-		return vecSim
-	}
-	return alpha*lexRel + (1-alpha)*vecSim
-}
-
-// matchTypeOf classifies how a result was found: lexical-only, semantic-only,
-// or hybrid (both signals contributed).
-func matchTypeOf(lexRel, vecSim float64) string {
-	switch {
-	case lexRel > 0 && vecSim > 0:
-		return "hybrid"
-	case vecSim > 0:
-		return "semantic"
-	default:
-		return "lexical"
-	}
-}
-
-// rankToRelevance normalizes FTS5 BM25 rank (negative, lower = better)
-// into a [0,1] relevance factor using a sigmoid-like decay.
-func rankToRelevance(rank float64) float64 {
-	return 1.0 / (1.0 + math.Exp(rank/2.0))
 }
 
 // parseTime extracts the UpdatedAt timestamp from a node, falling back
@@ -576,7 +595,6 @@ func (r *Retriever) enrichNode(ctx context.Context, s *ScoredNode) {
 	}
 }
 
-
 // findCrossSourceLinks compares chunk embeddings pairwise and returns
 // implicit links for chunks from different source adapters whose cosine
 // similarity exceeds the threshold.
@@ -595,7 +613,10 @@ func findCrossSourceLinks(chunks []store.ScoredChunk, threshold float64) []Impli
 		if len(c.Embedding) == 0 {
 			continue
 		}
-		src := sourceOf(c.ParentNodeID)
+		src := c.SourceAdapter
+		if src == "" {
+			src = "unknown"
+		}
 		items = append(items, idxVec{idx: i, vec: c.Embedding, src: src})
 	}
 
@@ -620,32 +641,6 @@ func findCrossSourceLinks(chunks []store.ScoredChunk, threshold float64) []Impli
 	return links
 }
 
-// splitN splits s by sep and returns at most n parts.
-func splitN(s, sep string, n int) []string {
-	parts := make([]string, 0, n)
-	rest := s
-	for i := 0; i < n-1; i++ {
-		idx := indexOf(rest, sep)
-		if idx < 0 {
-			parts = append(parts, rest)
-			return parts
-		}
-		parts = append(parts, rest[:idx])
-		rest = rest[idx+len(sep):]
-	}
-	parts = append(parts, rest)
-	return parts
-}
-
-func indexOf(s, sep string) int {
-	for i := 0; i <= len(s)-len(sep); i++ {
-		if s[i:i+len(sep)] == sep {
-			return i
-		}
-	}
-	return -1
-}
-
 // cosineSimilarity computes the cosine similarity between two float32 vectors.
 func cosineSimilarity(a, b []float32) float64 {
 	if len(a) != len(b) || len(a) == 0 {
@@ -661,4 +656,17 @@ func cosineSimilarity(a, b []float32) float64 {
 		return 0
 	}
 	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
+}
+
+// sortEdgesByConfidence sorts a slice of EdgeRef by confidence descending.
+func sortEdgesByConfidence(edges []EdgeRef) {
+	for i := 1; i < len(edges); i++ {
+		key := edges[i]
+		j := i - 1
+		for j >= 0 && edges[j].Confidence < key.Confidence {
+			edges[j+1] = edges[j]
+			j--
+		}
+		edges[j+1] = key
+	}
 }
