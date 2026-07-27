@@ -35,9 +35,9 @@ type Chunk struct {
 
 // Config holds chunking configuration.
 type Config struct {
-	MaxChunkSize  int // max chars per chunk (default: 1200)
-	OverlapSize   int // overlap between chunks (default: 150)
-	MinChunkSize  int // minimum chunk size to keep (default: 100)
+	MaxChunkSize int // max chars per chunk (default: 1200)
+	OverlapSize  int // overlap between chunks (default: 150)
+	MinChunkSize int // minimum chunk size to keep (default: 100)
 }
 
 // DefaultConfig returns sensible defaults.
@@ -125,7 +125,10 @@ func ChunkMarkdown(parentNodeID, content string, cfg Config) ([]Chunk, error) {
 	return splitOversizedChunks(chunks, cfg), nil
 }
 
-// splitOversizedChunks splits chunks that exceed MaxChunkSize with overlap.
+// splitOversizedChunks splits chunks that exceed MaxChunkSize.
+// For code chunks: already handled by AST descent in treesitter.go (extractOrDescend),
+// so only markdown/text chunks reach here. Splitting respects table rows and
+// fenced code block boundaries — never splits mid-row or mid-fence.
 func splitOversizedChunks(chunks []Chunk, cfg Config) []Chunk {
 	var result []Chunk
 	for _, chunk := range chunks {
@@ -134,8 +137,12 @@ func splitOversizedChunks(chunks []Chunk, cfg Config) []Chunk {
 			continue
 		}
 
-		// Split by paragraphs first, then by sentences, then hard split
-		parts := splitByParagraphs(chunk.Content, cfg.MaxChunkSize)
+		// Try structure-aware split first (table rows, code fence boundaries).
+		parts := splitByMarkdownStructure(chunk.Content, cfg.MaxChunkSize)
+		// Fall through to paragraph/sentence split if structure split found nothing.
+		if len(parts) <= 1 {
+			parts = splitByParagraphs(chunk.Content, cfg.MaxChunkSize)
+		}
 		for i, part := range parts {
 			if len(part) < cfg.MinChunkSize {
 				continue
@@ -149,6 +156,78 @@ func splitOversizedChunks(chunks []Chunk, cfg Config) []Chunk {
 	}
 	return result
 }
+
+// splitByMarkdownStructure splits text at table row boundaries and fenced code
+// block boundaries — never mid-row or mid-fence. Returns the original text as
+// a single item if no structural boundaries are found.
+func splitByMarkdownStructure(text string, maxSize int) []string {
+	lines := strings.Split(text, "\n")
+	var blocks []string
+	var current strings.Builder
+	inFence := false
+
+	flush := func() {
+		if current.Len() > 0 {
+			blocks = append(blocks, strings.TrimSuffix(current.String(), "\n"))
+			current.Reset()
+		}
+	}
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Track fenced code blocks (triple backtick or tildes)
+		if (strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~")) &&
+			strings.Count(trimmed, "`") >= 3 {
+			flush()
+			current.WriteString(line)
+			current.WriteString("\n")
+			inFence = !inFence
+			continue
+		}
+
+		// If current block would exceed maxSize, flush it
+		if current.Len() > 0 && current.Len()+len(line)+1 > maxSize {
+			// Only split at boundaries — never mid-table or mid-fence
+			if !inFence && !isTableLine(trimmed) {
+				flush()
+			}
+		}
+
+		current.WriteString(line)
+		current.WriteString("\n")
+
+		// Force flush at paragraph boundary if content is already large
+		if trimmed == "" && current.Len() >= maxSize/2 && !inFence {
+			flush()
+		}
+	}
+	flush()
+
+	// If structure-aware split found nothing usable, return single-item fallback
+	if len(blocks) <= 1 {
+		return []string{text}
+	}
+	return blocks
+}
+
+// isTableLine returns true if the line looks like a markdown table row.
+func isTableLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return false
+	}
+	// Table rows: | content | content |
+	// Separator rows: | --- | --- |
+	count := strings.Count(trimmed, "|")
+	if count >= 2 {
+		return true
+	}
+	return false
+}
+
+// splitByParagraphs splits text by double newlines, then by sentences if needed.
+// splitBySentences splits text by sentence boundaries.
 
 // splitByParagraphs splits text by double newlines, then by sentences if needed.
 func splitByParagraphs(text string, maxSize int) []string {
@@ -196,8 +275,6 @@ func splitByParagraphs(text string, maxSize int) []string {
 	}
 	return result
 }
-
-// splitBySentences splits text by sentence boundaries.
 func splitBySentences(text string, maxSize int) []string {
 	// Simple sentence split - handles . ! ? followed by space or end
 	re := regexp.MustCompile(`([.!?])\s+`)
