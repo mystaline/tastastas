@@ -21,6 +21,17 @@ import (
 	"github.com/mystaline-dev/tastastas/internal/store"
 )
 
+// Edge type tiers for enrichNode edge filtering.
+// Structural edges are config/parser-derived (confidence 1.0).
+// Inferred edges are embedding-derived (~0.80-0.89).
+// Proposed edges are excluded — they are the review queue, not knowledge.
+var (
+	StructuralEdgeTypes = []string{"specifies", "implements", "tests", "calls", "defines", "imports", "convention-member"}
+	InferredEdgeTypes   = []string{"auto-linked"}
+
+	StructuralEdgeCap = 10
+	InferredEdgeCap   = 10
+)
 // Config holds retrieval tuning parameters.
 type Config struct {
 	// RecencyHalfLife is how long until a fact decays to 50% importance.
@@ -47,8 +58,14 @@ type Config struct {
 	// ParentNodeID so the caller can reconstruct context.
 	IncludeChunks bool
 
-	// MaxChunks caps the number of chunk results returned. Default: 5.
+	// MaxChunks caps the number of chunk results returned by SearchChunks. Default: 15.
 	MaxChunks int
+
+	// PreviewChunksPerNode caps how many chunk previews are returned per node. Default: 3.
+	PreviewChunksPerNode int
+
+	// ExcerptLen caps the node content excerpt length. Default: 200 (chars).
+	ExcerptLen int
 
 	// RRFK is the constant k for Reciprocal Rank Fusion.
 	// Standard value: 60. Larger = more weight to lower ranks.
@@ -69,8 +86,10 @@ func DefaultConfig() Config {
 		MaxResults:           20,
 		Alpha:                0.4,
 		IncludeChunks:        true,
-		MaxChunks:            5,
-		CrossSourceThreshold: 0.85,
+		MaxChunks:      15,
+		PreviewChunksPerNode: 3,
+		ExcerptLen:     200,
+		CrossSourceThreshold: 0.75,
 		RRFK:                 60,
 	}
 }
@@ -81,6 +100,9 @@ type RecallParams struct {
 	Query     string
 	Embedding []float32 // optional; nil = lexical-only mode
 	Limit     int
+
+	// LinkThreshold overrides Config.CrossSourceThreshold when > 0.
+	LinkThreshold float64
 }
 
 // ImplicitLink represents a cross-source semantic link between two chunks
@@ -94,16 +116,32 @@ type ImplicitLink struct {
 
 // RecallResult groups nodes, chunks, and implicit links returned by Recall.
 type RecallResult struct {
-	Nodes  []ScoredNode        `json:"nodes"`
-	Chunks []store.ScoredChunk `json:"chunks"`
+	Nodes []ScoredNode        `json:"nodes"`
+	Chunks []store.ScoredChunk `json:"-"`
 	Links  []ImplicitLink      `json:"links,omitempty"`
+}
+
+// EdgeRef represents a single outgoing edge from a node, with the target's
+// metadata resolved for display. Used to surface relationships in recall.
+type EdgeRef struct {
+	ToID       string  `json:"to_id"`
+	ToTitle    string  `json:"to_title"`
+	EdgeType   string  `json:"edge_type"`
+	Confidence float64 `json:"confidence"`
 }
 
 // ScoredNode is a node with its computed retrieval score.
 type ScoredNode struct {
 	store.Node
-	Score     float64
-	MatchType string // "lexical" | "semantic" | "hybrid" | "graph"
+	Score          float64
+	MatchType      string   // "lexical" | "semantic" | "hybrid" | "graph"
+	Excerpt        string   `json:"excerpt"`          // truncated excerpt
+	PreviewChunks  []string `json:"preview_chunks"`   // first N chunk contents
+	TotalChunks    int      `json:"total_chunks"`
+	MoreAvailable  bool     `json:"more_available"`
+	NextChunkStart int      `json:"next_chunk_start"` // -1 if done
+	Edges          []EdgeRef `json:"edges,omitempty"`
+	InferredEdges  []EdgeRef `json:"inferred_edges,omitempty"`
 }
 
 // Retriever scores and retrieves facts from the store.
@@ -124,7 +162,13 @@ func New(st store.Store, cfg Config) *Retriever {
 		cfg.Alpha = 0.4
 	}
 	if cfg.MaxChunks == 0 {
-		cfg.MaxChunks = 5
+		cfg.MaxChunks = 15
+	}
+	if cfg.PreviewChunksPerNode == 0 {
+		cfg.PreviewChunksPerNode = 3
+	}
+	if cfg.ExcerptLen == 0 {
+		cfg.ExcerptLen = 200
 	}
 	if cfg.CrossSourceThreshold == 0 {
 		cfg.CrossSourceThreshold = 0.85
