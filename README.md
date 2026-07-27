@@ -1,260 +1,250 @@
 # tastastas
 
-**Agentic memory for AI agents.** Typed graph + vector + lexical hybrid
-store, single Go binary, SQLite, runs fully offline.
+**Agentic memory for AI agents.** Typed graph + vector + lexical hybrid store. Single Go binary, SQLite offline.
 
-> Store facts, recall them by relevance/recency/importance, and get
-> automatic "this might be stale now" alerts when connected docs change.
+Store facts, search by relevance × recency × importance, get "this might be stale" alerts when connected docs change.
 
-## Why not just RAG
+Data sources: doc repos (PRDs, ERDs, APIs, spec docs), codebases (Go symbols, call graphs), git history, conversation facts, and custom notes — all stored in one graph DB with zero external services.
 
-Flat chunk+cosine retrieval can't tell two mentions of the same fact apart,
-doesn't decay, and has no graph — it can't answer "what connects to X" or
-"what's stale because Y changed." tastastas keeps typed nodes/edges so
-recall = `relevance * recency * importance`, and changes propagate a
-"possibly stale" flag to connected docs automatically.
-
-## Install & run
+## Quick start
 
 ```bash
 go build -o tastastas ./cmd/tastastas
 
-# stdio — for MCP clients (Claude Desktop, Claude Code, any MCP agent)
-./tastastas --db memory.db --embed-dim 768
+# stdio mode — for MCP clients (Claude Desktop, Claude Code, etc.)
+./tastastas --db ~/.local/share/tastastas/memory.db --embed-dim 768
 
-# HTTP — shared team instance + webhook ingestion
-./tastastas --db memory.db --embed-dim 768 --serve :8080
+# HTTP mode — curl, webhooks, shared team instance
+./tastastas --db ~/.local/share/tastastas/memory.db --embed-dim 768 --serve :8080
 ```
 
-`--embed-dim` must match your embedder (768 = `nomic-embed-text`, 384 =
-`bge-small-en-v1.5` / many `sentence-transformers`). Wrong-dim vectors are
-rejected at insert.
+```bash
+# Ollama (default)
+./tastastas --db ~/.local/share/tastastas/memory.db --embed-dim 768 --embed-backend ollama --serve :8080
 
-Everything works with zero external dependencies except
-`extract_and_remember` and doc/code chunk search, which need an embedder
-(see [Flags](#flags) below — pick `sidecar` for zero-setup, or `ollama` if
-you already run it).
+# Sidecar — zero external deps, baked ONNX embedder
+./scripts/build-sidecar.sh
+./tastastas --db ~/.local/share/tastastas/memory.db --embed-dim 384 --embed-backend sidecar --serve :8080
+
+# Lexical + graph only — no embedding needed
+./tastastas --db ~/.local/share/tastastas/memory.db --embed-backend none --serve :8080
+```
+
+Embedding dim auto-detects when unset (384 sidecar, 768 ollama).
 
 ## Flags
 
-| Flag | Default | Does |
-|---|---|---|
-| `--serve` | *(unset)* | Run as HTTP server on this address (e.g. `:8080`). Unset = stdio MCP mode. |
-| `--db` | `memory.db` | Path to the SQLite database file. |
-| `--embed-dim` | `384` | Vector dimension. Must match whatever embedder you use — 384 for the baked sidecar (`bge-small-en-v1.5`) or many `sentence-transformers`, 768 for `nomic-embed-text`. Wrong-dim vectors are rejected at insert. |
-| `--embed-backend` | `sidecar` | Which embedder to use: `sidecar` (baked ONNX binary, zero external deps, always 384-dim — run `scripts/build-sidecar.sh` once first), `ollama` (HTTP call to a local Ollama), or `none` (lexical-only, no embedding at all — `extract_and_remember` and semantic recall degrade gracefully). |
-| `--ollama-url` | `http://localhost:11434` | Ollama base URL. Only used when `--embed-backend=ollama`. |
-| `--ollama-model` | `nomic-embed-text` | Ollama embedding model name. Only used when `--embed-backend=ollama`. Must match `--embed-dim` (768 for `nomic-embed-text`). |
+| Flag | Default | What it does |
+|------|---------|-------------|
+| `--serve` | *(unset)* | HTTP address (`:8080`). Unset = stdio MCP mode. |
+| `--db` | `~/.local/share/tastastas/memory.db` | SQLite DB path (honors `$TASTASTAS_DB`, `$XDG_DATA_HOME`) |
+| `--embed-dim` | `0` = auto-detect | Vector dimension: 384 for sidecar, 768 for ollama, 0 = pick from backend |
+| `--embed-backend` | `sidecar` | `sidecar` (baked ONNX, zero deps), `ollama`, or `none` |
+| `--ollama-url` | `http://localhost:11434` | Ollama URL (`embed-backend=ollama`) |
+| `--ollama-model` | `nomic-embed-text` | Ollama embedding model (`embed-backend=ollama`) |
+| `--sidecar-workers` | `0` = 4 | Sidecar worker count (`embed-backend=sidecar`) |
+| `--graph-addr` | *(unset)* | Graph visualization page on this address (`:9292`). Works alongside stdio MCP mode — no `--serve` needed. |
+| `--auth-token` | *(unset)* | Bearer token for HTTP server mode (empty = no auth) |
 
-```bash
-# Zero external deps — bakes bge-small-en-v1.5 into the binary once
-./scripts/build-sidecar.sh
-./tastastas --db memory.db --embed-dim 384 --embed-backend sidecar --serve :8080
+## How it works
 
-# Or point at an existing Ollama instance instead
-./tastastas --db memory.db --embed-dim 768 --embed-backend ollama --serve :8080
-
-# Or skip embedding entirely — lexical (FTS5) + graph only
-./tastastas --db memory.db --embed-backend none --serve :8080
+```
+Source → [AutoDetectAdapters] → n → [EmbedNodes] → n → [InferConventions]
+  → n + conv → [BuildHierarchy] → n + dir + contains → [Tier2ScoreAndLink]
+  → auto-linked + proposed edges
 ```
 
-## First run (5 minutes, from fresh clone)
+1. **Adapters** walk a directory — docwalk (`.memoryrc.yaml` mapping), codeast (Go AST), gitrepo, obsidian, markdown-glob. Each returns typed nodes + structural edges.
+2. **EmbedNodes** batch-embeds node content (ollama or sidecar ONNX).
+3. **InferConventions** detects naming patterns from code symbols (`Get*`/`handle*` prefixes).
+4. **BuildHierarchy** generates synthetic `directory` nodes connected by `contains` edges — every file becomes reachable from the repo root. Single-child pass-through folders collapse.
+5. **Tier2ScoreAndLink** pairs every two nodes: `0.4·cos + 0.2·typeCompat + 0.2·pathProximity + 0.2·identifierOverlap - templateCollisionPenalty`. Above 0.80 = `auto-linked`. Above 0.55 = `proposed` (review queue). Below = skipped.
+6. **Graph view** at `GET /graph/{project_id}` renders structural edges + auto-linked edges as a force-directed D3 visualization. Proposed edges hidden — use `query_graph` to inspect.
 
-### What you actually need
+### Architecture notes
 
-| Thing | Why | Mandatory? |
-|---|---|---|
-| Go 1.23+ | builds the binary | Yes |
-| [Ollama](https://ollama.com) | only for `extract_and_remember` tool; the other 6 tools (remember, recall, forget, link, ingest, check_impact) work without it | **No** — skip if you don't need LLM fact extraction |
-| 768-dim embedding model in Ollama (e.g. `nomic-embed-text`) | only for `extract_and_remember`'s dedupe step; `recall` uses FTS5 (lexical), not vectors | **No** — skip same as above |
+- **Typed edges** — `implements` (API Spec→PRD), `specifies` (ERD→PRD), `tests` (TestCases→PRD), `contains` (directory→file), `depends-on` (via link tool or manual), `auto-linked` (Tier 2 similarity > 0.80), `proposed` (review queue, 0.55–0.80).
+- **Template collision penalty** (`-0.20`) — same-filename docs in different directories don't auto-link anymore (previously files with same name in different features scored false 1.0 on identifier overlap, clearing the auto-link gate).
+- **4-tier linking** — Structural (confidence 1.0) → Tier 2 inferred (~0.80) → Proposed (review queue) → Explicit (manually linked).
+- **External content FTS5** — SQLite's built-in full-text search, no Elasticsearch.
+- **vec0 extension** — embedded vector search, no vector DB separate.
+- **Store interface** — abstracted. Swap sqlite→libsql (Turso) without changing callers.
+- **Recency decay** — `2^(-age / halfLife)` applied at recall time.
+- **RRF fusion** — uses Reciprocal Rank Fusion to merge FTS5 + vector + graph scores without distribution assumptions.
 
-### Steps with explanations
+## Tools (MCP)
 
-**1. Build the binary** (mandatory)
+| Group | Tool | What it does | Embedder needed? | LLM needed? |
+|-------|------|-------------|-----------------|------------|
+| **Store / Delete** | `remember` | Store/update a fact | No | No |
+| | `forget` | Delete node by ID | No | No |
+| | | | | |
+| **Content retrieval** | `recall` | Search content by relevance × recency × importance | No* | No |
+| | `recall_chunks` | Paginated chunk retrieval by parent + index | No | No |
+| | | | | |
+| **Graph** | `link` | Connect two nodes with typed edge | No | No |
+| | `query_graph` | Query edges from/to a specific node | No | No |
+| | `project_graph` | Return all edges — whole project graph shape | No | No |
+| | | | | |
+| **Ingestion / Impact** | `ingest` | Walk doc/code tree → searchable memory | No* | No |
+| | `onboard` | Full pipeline: detect → ingest → embed → link | No* | No |
+| | `onboard_check` | Check graph state for a project (read-only stats) | No | No |
+| | `check_impact` | "What's stale because this changed?" | No | No |
+| | | | | |
+| **LLM extraction** | `extract_and_remember` | Pull facts from raw conversation text | **Yes** | **Yes** |
+| | | | | |
+| **Async** | `job_status` | Poll async job (onboard, ingest, extract) | No | No |
 
-```bash
-git clone <your-fork-or-this-repo>
-cd tastastas
-go build -o tastastas ./cmd/tastastas
-```
+`*` = degrades gracefully to FTS5-only (lexical). Vector/semantic features skip without embedder. ONNX sidecar is zero-dependency and baked into the binary — run `scripts/build-sidecar.sh` once, no Ollama needed.
 
-*This compiles everything into a single `tastastas` binary. Nothing else to install.*
+For MCP clients, add to config:
 
-**2. Start the server** (mandatory — the whole thing runs as a server)
-
-Pick one mode:
-
-```bash
-# HTTP mode (easiest for trying things — you can curl it from another terminal)
-./tastastas --db memory.db --embed-dim 768 --serve :8080
-# Keep this terminal open. The server logs here.
-
-# OR: stdio mode (for connecting your MCP client — Claude Desktop, Claude Code, etc.)
-./tastastas --db memory.db --embed-dim 768
-# No port. This talks MCP over stdin/stdout — point your client config at this binary.
-```
-
-*Why two modes? HTTP mode lets you hit it with curl to try things. Stdio mode is how an AI agent connects to it — no port, no network, just pipes. You don't need both; pick one for now.*
-
-**3. Check it's alive** (skippable — just confirmation)
-
-```bash
-curl -s localhost:8080/health
-# → {"status":"ok","version":"0.1.0"}
-```
-
-*If you see this, the server is running. (Stdio mode has no health endpoint — it's alive if your MCP client connected.)*
-
-**4. Give it some content** (mandatory if you want something to search)
-
-```bash
-curl -s -X POST localhost:8080/ingest/docwalk \
-  -d '{"root": "/path/to/your/docs", "project_id": "my-project"}'
-# → {"nodes_ingested":118,"edges_created":0}
-```
-
-*This walks a folder, reads every markdown file, and stores each one as a searchable node. `project_id` is just a namespace — think "which project does this content belong to." No config file needed; without one, everything becomes a generic doc (still fully searchable).*
-
-*If your docs are structured (PRD/API spec/ERD folders with a naming convention), add a `.memoryrc.yaml` config to get typed nodes + automatic cross-linking. See [Ingesting docs](#ingesting-docs) below.*
-
-**5. Search it** (the payoff)
-
-```bash
-# First, initialize an MCP session — this is how the MCP protocol works.
-# You get back a session ID you reuse for all follow-up calls.
-curl -s -i -X POST localhost:8080/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"demo","version":"1.0"}}}'
-# → look for "Mcp-Session-Id: <some-long-string>" in the response headers
-#   copy that string
-
-SESSION="<paste-it-here>"
-
-# Now ask a question
-curl -s -X POST localhost:8080/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -H "Mcp-Session-Id: $SESSION" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"recall","arguments":{"project_id":"my-project","query":"your search terms"}}}'
-# → returns scored results (title, content, node_type, score)
-```
-
-*Why the session dance? This is MCP (Model Context Protocol) — the standard way AI agents talk to tools. Every call after `initialize` reuses the same session ID. If you connect tastastas to an MCP client (next section), the client handles all of this for you — you just talk to your agent normally.*
-
-### Skip the HTTP dance entirely — connect an MCP client
-
-If you have Claude Desktop or Claude Code, add this to your MCP config:
-
+**Claude Code:**
 ```json
 {
   "mcpServers": {
     "tastastas": {
-      "command": "/full/path/to/tastastas",
-      "args": ["--db", "memory.db", "--embed-dim", "768"]
+      "type": "stdio",
+      "command": "/path/to/tastastas",
+      "args": [
+        "--db", "~/.local/share/tastastas/memory.db",
+        "--embed-dim", "768",
+        "--embed-backend", "ollama",
+        "--graph-addr", ":9292"
+      ],
+      "env": {}
     }
   }
 }
 ```
 
-Restart your client. Now just talk to your agent normally:
+**Kilo Code:**
+```json
+"tastastas": {
+  "type": "local",
+  "command": [
+    "/path/to/tastastas",
+    "--db", "~/.local/share/tastastas/memory.db",
+    "--embed-dim", "768",
+    "--embed-backend", "ollama",
+    "--graph-addr", ":9292"
+  ]
+}
+```
 
-> "remember I prefer dark mode"
+DB path is customizable — `~/.local/share/tastastas/memory.db` follows the [XDG Base Directory](https://specifications.freedesktop.org/basedir-spec/latest/) convention: consistent across working directories, survives project cleanup, easy to find.
 
-> "recall what you know about coupon redemption"
+Then just talk naturally: "ingest my docs from ~/Workspace/project" or "recall what you know about coupon redemption."
 
-> "ingest my project docs from ~/Workspace/my-project"
+Then just talk naturally: "ingest my docs from ~/Workspace/project" or "recall what you know about coupon redemption."
 
-No curl, no session IDs, no JSON-RPC — the client handles it.
+## API endpoints (`--serve` mode)
 
-## The 7 tools
-
-| Tool | Does | Needs Ollama? |
-|---|---|---|
-| `remember` | Store/update a fact directly | No |
-| `recall` | Search by relevance × recency × importance | No |
-| `forget` | Delete by ID | No |
-| `link` | Connect two nodes with a typed edge | No |
-| `ingest` | Pull in a doc tree (docwalk / gitrepo / obsidian) | No |
-| `check_impact` | "What's now stale because this changed?" | No |
-| `extract_and_remember` | Pull facts out of raw conversation text | **Yes** |
-
-Ask your MCP-connected agent things like "remember I prefer dark mode" or
-"recall what you know about coupon redemption" — it calls the tools for you.
-Or hit them directly:
-
-```bash
-curl -X POST localhost:8080/mcp -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"recall","arguments":{"project_id":"my-project","query":"coupon redemption"}}}'
+```
+POST /mcp                — MCP protocol (Streamable HTTP)
+GET  /graph/{project_id}  — D3 force-directed graph visualization
+POST /ingest              — Ingest from path (auto-detect adapters)
+GET  /health              — Health check
 ```
 
 ## Ingesting docs
 
-Three adapters — point one at a folder and it becomes searchable memory:
+Three adapters. Point one at a folder:
 
-- **`docwalk`** — structured doc trees (PRD/APISpec/ERD/...) via a
-  `.memoryrc.yaml` glob→type config. Auto cross-links same-feature docs.
+- **`docwalk`** — structured doc trees (PRD/APISpec/ERD) via `.memoryrc.yaml` glob→type mapping. Auto cross-links same-feature docs.
 - **`gitrepo`** — walks a tree for `MEMORY.md`-style files.
 - **`obsidian`** — vault frontmatter + `[[wikilinks]]` become typed nodes/edges.
 
 ```bash
-curl -X POST localhost:8080/ingest/docwalk \
-  -d '{"root": "/path/to/docs", "config_path": ".memoryrc.yaml", "project_id": "my-project"}'
+# From curl — httpie or HTTP mode
+curl -X POST localhost:8080/ingest \
+  -d '{"cwd": "/path/to/docs", "project_id": "my-project"}'
+
+# From MCP client
+ingest project_id=my-project cwd=/path/to/docs
 ```
 
-`.memoryrc.yaml` example:
+`.memoryrc.yaml` example (optional, only needed for typed cross-linking):
 
 ```yaml
 project_id: my-project
 mappings:
-  - path_glob: "*/PRD/**/*.md"
+  - path_glob: "**/PRD/**/00-index.md"
     type: prd
-    group_by: "^[^/]+/PRD/(?P<feature>[^/]+)/"   # cross-links same-feature docs
-  - path_glob: "*/APISpec/*.md"
-    type: api-spec
-    group_by: "^[^/]+/APISpec/(?P<feature>[^.]+)\\.md$"
+    group_by: "PRD/(?P<feature>[^/]+)/"
 ```
 
-## HTTP routes (`--serve` mode)
+Without `.memoryrc.yaml` everything ingests as `generic-doc` — still searchable, just untyped.
+
+## Development
 
 ```
-POST /mcp                — MCP protocol (Streamable HTTP)
-POST /ingest/{adapter}    — {"root", "config_path", "project_id"}
-POST /ingest/webhook      — {"path", "content", "project_id", ...}
-GET  /health              — {"status": "ok", "version": "0.1.0"}
+go build ./...        — build all
+go test ./...         — run all tests
+go vet ./...          — static analysis
 ```
 
-## Status
+See `docs/architecture.md` for full architecture, `docs/demo-walkthrough.md` for end-to-end verification against the example-vault vault (800+ nodes, 36k edges).
 
-v0.1.0 — functional. See `DEVELOPMENT.md` for architecture, dev/verify
-commands, and roadmap. `tasks.md` tracks what's open past this release.
+## How it's different from plain RAG
 
-## Releases
+Flat chunk+cosine can't tell two mentions of the same fact apart, doesn't decay, and has no graph — can't answer "what connects to X" or "what's stale because Y changed." tastastas has typed nodes/edges, recency decay, importance gating, graph neighbor pull-in, and change propagation.
 
-Pushing a `v*` tag triggers `.github/workflows/release.yml`: builds the
-ONNX sidecar + tastastas binary (sidecar baked in via `go:embed`) for
-linux/amd64, linux/arm64, macOS/amd64, macOS/arm64, windows/amd64, and
-attaches them to a GitHub Release. No manual `scripts/build-sidecar.sh`
-step needed for released binaries — that script is for building from
-source locally.
+Uses RRF fusion (Reciprocal Rank Fusion) instead of linear `α·BM25 + (1-α)·cosine` — removes dependence on embedder score distributions. Same approach documented by:
 
-## References
+- [Azure AI Search hybrid retrieval ranking](https://learn.microsoft.com/en-us/azure/search/hybrid-search-ranking)
+- [Elasticsearch RRF hybrid search](https://www.elastic.co/guide/en/elasticsearch/reference/current/rrf.html)
 
-tastastas retrieval pipeline composes several techniques:
+Retrieval pipeline:
 
-| Method | Role | Source |
-|---|---|---|
-| **FTS5 BM25** | Lexical keyword search (always runs) | SQLite FTS5 |
-| **Cosine similarity** | Semantic vector distance | Standard linear algebra |
-| **RRF (Reciprocal Rank Fusion)** | Fuses lexical + vector + graph ranks — unit-free, stable across embedder changes | [Microsoft hybrid search ranking](https://learn.microsoft.com/en-us/azure/search/hybrid-search-ranking), [TREC 2004 Robust Track](https://trec.nist.gov/pubs/trec13/papers/ROBUST.OVERVIEW.pdf) |
-| **Recency decay** | `2^(-age / halfLife)` time-based score decay | Exponential decay model |
-| **Importance weighting** | Node-level significance multiplier | Application-defined (stored per node) |
-| **Graph neighbor pull-in** | BFS walk from top hits, score = `0.5 · recency · importance · (×1.2 if edge confidence > 0.8)` | Graph traversal + heuristic boost |
-| **Cross-source linking** | Pairwise cosine similarity between chunks from different adapters | Implicit semantic edge detection |
+| Method | Role | Reference |
+|--------|------|-----------|
+| FTS5 BM25 | Lexical keyword search (always runs) | [SQLite FTS5](https://www.sqlite.org/fts5.html) |
+| Cosine similarity | Semantic vector distance | Standard linear algebra |
+| RRF | Fuses lexical + vector + graph ranks | [Azure AI Search](https://learn.microsoft.com/en-us/azure/search/hybrid-search-ranking), [Elasticsearch](https://www.elastic.co/guide/en/elasticsearch/reference/current/rrf.html) |
+| Recency decay | `2^(-age / halfLife)` time decay | Standard exponential decay |
+| Importance weighting | Per-node significance multiplier | Application-defined (stored per node) |
+| Graph neighbor pull-in | BFS from top hits, confidence-boosted | Custom (graph traversal + heuristic boost) |
+| Cross-source linking | Pairwise cosine between chunks from different adapters | Custom (implicit semantic edge detection) |
 
-Other agentic-memory tools typically use flat `α · BM25 + (1-α) · cosine`
-linear fusion. tastastas uses RRF (rank-based) instead — removes dependence
-on embedder score distributions — and adds time decay, importance gating,
-and graph adjacency as independent signals with their own scoring math.
+## Why SQLite FTS5 (and not PostgreSQL FTS / Elasticsearch)
+
+tastastas uses SQLite FTS5 because it fits the use case:
+
+| Scenario | SQLite FTS5 fine? | If not, use |
+|----------|-------------------|-------------|
+| Single-team vault, <100k nodes, Go binary | ✅ Yes — zero-config, portable, same DB for everything | — |
+| Need fuzzy search, synonyms, language-specific stemming | ❌ No — FTS5 has Porter stemmer only | PostgreSQL FTS or Elasticsearch |
+| Multi-node HA, billions of docs | ❌ No — single file | Elasticsearch / Solr |
+| Offline / air-gapped / no Docker | ✅ Yes — one binary, no services | — |
+| Per-field BM25 weights, custom scoring | ❌ No — built-in BM25 only | PostgreSQL FTS (`ts_rank`) or Elasticsearch (function score) |
+| Full highlighting with fragments | ⚠️ Partial — `snippet()` only, no fragment builder | Elasticsearch highlight API |
+| Your data fits on one machine | ✅ Yes — simpler, faster to iterate | — |
+
+The `store.Store` interface is already abstracted. Swap SQLite for libsql (Turso) when you need distributed reads — same code path, no caller changes.
+
+PostgreSQL (`pgvector` + `tsvector`) is on the roadmap — the interface is ready, just needs the adapter implementation.
+
+## tastastas vs Graphify
+
+Not competing. [Graphify](https://github.com/Graphify-Labs/graphify) (96.5k ★, YC S26) is excellent at what it does. tastastas is just a simpler thing: a centralized memory server your AI talks to. Usage is dead simple — tell your agent "ingest this folder" and "recall what you know about X." Minimal config: one MCP entry, optional one `.memoryrc.yaml` if you want typed docs. No project setup, no per-repo install, no files to commit.
+
+| Angle | tastastas | Graphify |
+|-------|-----------|----------|
+| **What it is** | Agentic memory server (Go, SQLite, running daemon) | Codebase knowledge graph CLI (Python, static files) |
+| **Consumer** | AI agent querying a structured knowledge graph | AI agent reading a static graph.json + report |
+| **Storage** | Persistent SQLite DB — add/update/delete facts anytime | Static `graphify-out/` files, committed to git |
+| **Retrieval** | Hybrid: FTS5 + vector (vec0) + graph + recency + importance + RRF | Pure graph traversal — no embeddings, no vectors |
+| **Code analysis** | Go AST only (codeast adapter) | 40+ languages via tree-sitter AST |
+| **Non-code content** | Docs, PRDs, ERDs, specs, conventions, code, git history, conversation facts, custom notes | Docs, PDFs, images, video/audio, office files |
+| **Recency / Staleness** | Built-in: `2^(-age / halfLife)` decay + stale propagation on change | Snapshot at build time. `--update` / `watch` / git hooks for differential re-sync. No query-time decay or propagation |
+| **Live updates** | CRUD at any time — `remember`, `link`, `forget`, `ingest` all work while server is running | Rebuild the graph. Auto-rebuild on git commit via hook |
+| **Edge types** | 4 tiers: structural (1.0) → inferred (~0.80) → proposed (review) → explicit | `EXTRACTED` / `INFERRED` / `AMBIGUOUS` — each edge tagged with confidence tier |
+| **Embeddings** | Yes — vec0 extension, ONNX sidecar or Ollama | None — pure graph, no vector store |
+| **Output** | MCP tool responses + live D3 graph page at `GET /graph/{project}` | `graph.html`, `GRAPH_REPORT.md`, `graph.json` (git-committable) |
+| **MCP** | Native MCP server (stdio or HTTP) | `python -m graphify.serve graph.json` (separate process) |
+
+**tl;dr** — Graphify is better if you need a one-shot codebase map for your AI assistant, supports many languages, and want the output committed to git. tastastas is better if you need a persistent memory server with hybrid search that grows over time — ingest docs, code, conversations, and facts into one DB, query it with recall × recency × importance, and get change-propagation alerts.
 
 ## License
 
