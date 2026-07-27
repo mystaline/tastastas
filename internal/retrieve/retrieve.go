@@ -251,21 +251,30 @@ func (r *Retriever) Recall(ctx context.Context, params RecallParams) (*RecallRes
 }
 
 // toFTSQuery converts user input to FTS5 MATCH query:
-// multi-word → OR terms, single word → as-is, empty → match-all prefix.
+// Multi-word → OR terms in doublequotes. Single term → escaped with
+// doublequotes (FTS5 treats hyphens as column operators and quotes as
+// syntax — wrapping bare terms in doublequotes prevents both).
+// Empty → match-all prefix.
 func toFTSQuery(q string) string {
 	fields := strings.Fields(q)
 	if len(fields) == 0 {
 		return "*"
 	}
 	if len(fields) == 1 {
-		return fields[0]
+		return `"` + escapeFTS(q) + `"`
 	}
-	// Quote each term in case of special chars, join with OR
 	parts := make([]string, len(fields))
 	for i, f := range fields {
-		parts[i] = `"` + f + `"`
+		parts[i] = `"` + escapeFTS(f) + `"`
 	}
 	return strings.Join(parts, " OR ")
+}
+
+// escapeFTS quotes any bare double quotes inside a term so FTS5 doesn't
+// interpret them as syntax. Hyphens, parens, and other special chars are
+// handled by wrapping in doublequotes at the call site.
+func escapeFTS(s string) string {
+	return strings.ReplaceAll(s, `"`, `""`)
 }
 
 // fetchCandidates loads nodes by ID from the store.
