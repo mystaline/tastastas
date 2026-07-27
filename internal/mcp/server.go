@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -27,7 +28,6 @@ import (
 	"github.com/mystaline-dev/tastastas/internal/ingest/docwalk"
 	"github.com/mystaline-dev/tastastas/internal/ingest/gitrepo"
 	"github.com/mystaline-dev/tastastas/internal/ingest/obsidian"
-	"github.com/mystaline-dev/tastastas/internal/llm"
 	"github.com/mystaline-dev/tastastas/internal/onboard"
 	"github.com/mystaline-dev/tastastas/internal/retrieve"
 	"github.com/mystaline-dev/tastastas/internal/store"
@@ -40,33 +40,94 @@ var tsLanguage = sync.OnceValue(func() *sitter.Language {
 	return sitter.NewLanguage(ts.LanguageTypescript())
 })
 
+// chunkAndEmbedNodes splits nodes into chunks, embeds any missing vectors,
+// and bulk-persists everything. progress reports (embedded, total) after
+// each embed batch; onPersisting fires once, right before the bulk DB
+// insert starts — that insert has no progress callback of its own (one
+// transaction, N sequential single-row INSERTs), so without this signal a
+// multi-minute persist phase on a large project is indistinguishable from
+// a hang to anyone polling job status. Both callbacks may be nil.
 func chunkAndEmbedNodes(
 	ctx context.Context,
 	db store.Store,
 	embedder embed.EmbedderBackend,
 	nodes []store.Node,
-	progress func(int),
+	progress func(embedded, total int),
+	onPersisting func(),
 ) (int, error) {
 	if embedder == nil {
 		return 0, nil
 	}
+
+	// Collect chunks: unchanged nodes keep existing chunks (hash match);
+	// changed or new nodes get re-chunked. Delta-only — no full delete+re-insert.
 	var allChunks []store.Chunk
 	goLang := goLanguage()
 	tsLang := tsLanguage()
+	var chunkable []store.Node
 	for _, n := range nodes {
-		allChunks = append(allChunks, chunkForNode(n, chunker.DefaultConfig(), goLang, tsLang)...)
+		if n.ContentHash == "" {
+			chunkable = append(chunkable, n)
+			continue
+		}
+		existing, err := db.GetNode(ctx, n.ID)
+		if err == nil && existing.ContentHash == n.ContentHash {
+			// Same content — keep existing chunks and their embeddings.
+			chunks, cerr := db.GetChunksByParent(ctx, n.ID, 1000, 0)
+			if cerr == nil && len(chunks) > 0 {
+				allChunks = append(allChunks, chunks...)
+				continue
+			}
+		}
+		// Content changed (or first time) — delete stale chunks, re-chunk.
+		_ = db.DeleteChunksByParent(ctx, n.ID)
+		chunkable = append(chunkable, n)
+	}
+	if len(chunkable) > 0 {
+		type cr struct {
+			idx int
+			c   []store.Chunk
+		}
+		resCh := make(chan cr, len(chunkable))
+		for w := 0; w < 4; w++ {
+			go func(worker int) {
+				cfg := chunker.DefaultConfig()
+				for j := worker; j < len(chunkable); j += 4 {
+					resCh <- cr{idx: j, c: chunkForNode(chunkable[j], cfg, goLang, tsLang)}
+				}
+			}(w)
+		}
+		for range len(chunkable) {
+			r := <-resCh
+			if len(r.c) > 0 {
+				allChunks = append(allChunks, r.c...)
+			}
+		}
 	}
 	if len(allChunks) == 0 {
 		return 0, nil
 	}
-	const batchSize = 32
-	embedded := 0
-	for i := 0; i < len(allChunks); i += batchSize {
-		end := i + batchSize
-		if end > len(allChunks) {
-			end = len(allChunks)
+
+	// Only embed chunks without existing vectors — unchanged nodes keep
+	// their existing vectors, zero re-computation.
+	var needEmbed []store.Chunk
+	var needEmbedIdx []int
+	for i, c := range allChunks {
+		if len(c.Embedding) == 0 {
+			needEmbed = append(needEmbed, c)
+			needEmbedIdx = append(needEmbedIdx, i)
 		}
-		batch := allChunks[i:end]
+	}
+	if len(needEmbed) == 0 {
+		return len(allChunks), nil
+	}
+	const batchSize = 32 // ponytail: 64 for sidecar (ONNX CPU, padding-insensitive), 32 for ollama safer. Both work.
+	for i := 0; i < len(needEmbed); i += batchSize {
+		end := i + batchSize
+		if end > len(needEmbed) {
+			end = len(needEmbed)
+		}
+		batch := needEmbed[i:end]
 		texts := make([]string, len(batch))
 		for j, c := range batch {
 			texts[j] = c.Content
@@ -76,12 +137,14 @@ func chunkAndEmbedNodes(
 			return 0, fmt.Errorf("embed batch %d-%d: %w", i, end, err)
 		}
 		for j := range batch {
-			allChunks[i+j].Embedding = vecs[j]
+			allChunks[needEmbedIdx[i+j]].Embedding = vecs[j]
 		}
-		embedded = end
 		if progress != nil {
-			progress(embedded)
+			progress(end, len(needEmbed))
 		}
+	}
+	if onPersisting != nil {
+		onPersisting()
 	}
 	if err := db.UpsertChunks(ctx, allChunks); err != nil {
 		return 0, err
@@ -101,7 +164,7 @@ func safeGo(fn func()) {
 	}()
 }
 
-func NewServer(db store.Store, embedder embed.EmbedderBackend, llmClient llm.Client) *mcp.Server {
+func NewServer(db store.Store, embedder embed.EmbedderBackend) *mcp.Server {
 	srv := mcp.NewServer(
 		&mcp.Implementation{
 			Name:    "tastastas",
@@ -110,14 +173,14 @@ func NewServer(db store.Store, embedder embed.EmbedderBackend, llmClient llm.Cli
 		nil,
 	)
 
-	registerTools(srv, db, embedder, llmClient)
+	registerTools(srv, db, embedder)
 	return srv
 }
 
-func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBackend, llmClient llm.Client) {
+func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBackend) {
 	retriever := retrieve.New(db, retrieve.DefaultConfig())
 	extractor := extract.New(extract.Config{})
-	jobs := newJobStore()
+	jobs := newJobStore(db)
 
 	// Tool 1: remember
 	mcp.AddTool(
@@ -157,7 +220,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 				ctx,
 				db,
 				embedder,
-				[]store.Node{n}, nil,
+				[]store.Node{n}, nil, nil,
 			); err != nil {
 				return errorResult(err), RememberOutput{}, nil
 			}
@@ -184,7 +247,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 		srv,
 		&mcp.Tool{
 			Name:        "recall",
-			Description: "Search memory by query. Flexes lexical (FTS5) or fused lexical+vector scoring depending on whether an embedder is configured. Returns scored results with graph-neighbor pull-in for context enrichment.",
+			Description: "Search memory by query (FTS5 lexical + optional vector + RRF fusion + graph neighbors). Returns scored nodes with excerpt, first 3 chunk previews, and pagination metadata. Use recall_chunks to fetch more chunks when more_available is true.",
 		}, func(ctx context.Context, req *mcp.CallToolRequest, args RecallInput) (*mcp.CallToolResult, RecallOutput, error) {
 			projectID := args.ProjectID
 			if projectID == "" {
@@ -195,9 +258,10 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 				limit = 10
 			}
 			params := retrieve.RecallParams{
-				ProjectID: projectID,
-				Query:     args.Query,
-				Limit:     limit,
+				ProjectID:    projectID,
+				Query:        args.Query,
+				Limit:        limit,
+				LinkThreshold: args.LinkThreshold,
 			}
 			if embedder != nil {
 				if vec, err := embedder.Embed(ctx, args.Query); err == nil {
@@ -212,45 +276,108 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 
 			items := make([]RecallItem, 0, len(result.Nodes))
 			for _, s := range result.Nodes {
-				items = append(
-					items,
-					RecallItem{
-						ID:        s.ID,
-						Title:     s.Title,
-						Content:   s.Content,
-						NodeType:  s.NodeType,
-						Score:     s.Score,
-						MatchType: s.MatchType,
-					},
-				)
+				edges := make([]RecallEdge, 0, len(s.Edges))
+				for _, e := range s.Edges {
+					edges = append(edges, RecallEdge{
+						ToID: e.ToID, ToTitle: e.ToTitle,
+						EdgeType: e.EdgeType, Confidence: e.Confidence,
+					})
+				}
+				inferredEdges := make([]RecallEdge, 0, len(s.InferredEdges))
+				for _, e := range s.InferredEdges {
+					inferredEdges = append(inferredEdges, RecallEdge{
+						ToID: e.ToID, ToTitle: e.ToTitle,
+						EdgeType: e.EdgeType, Confidence: e.Confidence,
+					})
+				}
+				items = append(items, RecallItem{
+					ID: s.ID, Title: s.Title, Excerpt: s.Excerpt,
+					NodeType: s.NodeType, Score: s.Score, MatchType: s.MatchType,
+					PreviewChunks: s.PreviewChunks, TotalChunks: s.TotalChunks,
+					MoreAvailable: s.MoreAvailable, NextChunkStart: s.NextChunkStart,
+					Edges: edges, InferredEdges: inferredEdges,
+				})
 			}
 
 			links := make([]ImplicitMCPLink, 0, len(result.Links))
 			for _, l := range result.Links {
-				links = append(
-					links,
+				links = append(links,
 					ImplicitMCPLink{FromChunkID: l.FromChunkID, ToChunkID: l.ToChunkID, Cosine: l.Cosine},
 				)
 			}
+			recallOut := RecallOutput{Results: items, Links: links}
 
 			toolResult := &mcp.CallToolResult{
 				Content: []mcp.Content{
 					&mcp.TextContent{
-						Text: marshalJSON(RecallOutput{
-							Results: items,
-							Links:   links,
-						},
-						),
+						Text: marshalJSON(recallOut),
 					},
 				},
 			}
 
-			output := RecallOutput{Results: items, Links: links}
+			output := recallOut
 
 			return toolResult, output, nil
+
+		})
+		// Tool 3: recall_chunks
+		mcp.AddTool(srv, &mcp.Tool{
+			Name: "recall_chunks",
+			Description: "Fetch more chunks of a node returned by recall. Use when a recall result shows more_available=true. Pass the node id as parent_node_id with a chunk range (default 3 per page). chunk_end is exclusive (0-indexed): chunk_end=total_chunks fetches the remainder in one call.",
+		}, func(ctx context.Context, req *mcp.CallToolRequest, args RecallChunksInput) (*mcp.CallToolResult, RecallChunksOutput, error) {
+			if args.ParentNodeID == "" {
+				return errorResult(fmt.Errorf("parent_node_id is required")), RecallChunksOutput{}, nil
+			}
+			chunkStart := args.ChunkStart
+			if chunkStart < 0 {
+				chunkStart = 0
+			}
+			chunkEnd := args.ChunkEnd
+			if chunkEnd <= chunkStart {
+				chunkEnd = chunkStart + 3
+			}
+			parent, err := db.GetNode(ctx, args.ParentNodeID)
+			if err != nil {
+				return errorResult(fmt.Errorf("parent node not found: %w", err)), RecallChunksOutput{}, nil
+			}
+			total, err := db.CountChunksByParent(ctx, args.ParentNodeID)
+			if err != nil {
+				return errorResult(err), RecallChunksOutput{}, nil
+			}
+			if chunkEnd > total {
+				chunkEnd = total
+			}
+			limit := chunkEnd - chunkStart
+			if limit <= 0 {
+				out := RecallChunksOutput{ParentNodeID: args.ParentNodeID, ParentTitle: parent.Title, TotalChunks: total, ReturnedRange: "none", MoreAvailable: false, NextChunkStart: -1}
+				return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}}}, out, nil
+			}
+			chunks, err := db.GetChunksByParent(ctx, args.ParentNodeID, limit, chunkStart)
+			if err != nil {
+				return errorResult(err), RecallChunksOutput{}, nil
+			}
+			items := make([]ChunkOutputItem, 0, len(chunks))
+			for _, c := range chunks {
+				items = append(items, ChunkOutputItem{
+					ID: c.ID, ParentNodeID: c.ParentNodeID, ChunkIndex: c.ChunkIndex,
+					Type: c.Type, HeadingPath: c.HeadingPath, Content: c.Content,
+					Language: c.Language,
+				})
+			}
+			more := chunkEnd < total
+			next := chunkEnd
+			if !more {
+				next = -1
+			}
+			out := RecallChunksOutput{
+				ParentNodeID: args.ParentNodeID, ParentTitle: parent.Title,
+				TotalChunks: total, ReturnedRange: fmt.Sprintf("chunk %d-%d of %d", chunkStart, chunkEnd-1, total),
+				Chunks: items, MoreAvailable: more, NextChunkStart: next,
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}}}, out, nil
 		})
 
-	// Tool 3: forget
+		// Tool 5: forget
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "forget", Description: "Delete a node from memory by ID.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args ForgetInput) (*mcp.CallToolResult, ForgetOutput, error) {
@@ -310,47 +437,94 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 		return toolResult, output, nil
 	})
 
-	// Tool 5: ingest
+	// Tool 5: ingest — async, auto-detect adapters
 	mcp.AddTool(srv, &mcp.Tool{
-		Name: "ingest", Description: "Ingest documents from a filesystem root using a named adapter (docwalk, gitrepo, obsidian).",
+		Name: "ingest",
+		Description: "Ingest a project directory into memory. Auto-detects adapters (codeast, docwalk, gitrepo, obsidian, markdown-glob), walks files, chunks, embeds, and returns a job_id for polling via job_status.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args IngestInput) (*mcp.CallToolResult, IngestOutput, error) {
-		nodes, edges, _, _, err := runIngestAdapter(args.Adapter, args.Root, args.ConfigPath, args.ProjectID)
-		if err != nil {
-			return errorResult(err), IngestOutput{}, nil
-		}
-		for _, n := range nodes {
-			if err := db.UpsertNode(ctx, n); err != nil {
-				return errorResult(err), IngestOutput{}, nil
-			}
-		}
-		for _, e := range edges {
-			if err := db.UpsertEdge(ctx, e); err != nil {
+		projectID := args.ProjectID
+		cwd := args.CWD
+		if cwd == "" {
+			var err error
+			cwd, err = os.Getwd()
+			if err != nil {
 				return errorResult(err), IngestOutput{}, nil
 			}
 		}
 
-		chunkCount, err := chunkAndEmbedNodes(ctx, db, embedder, nodes, nil)
-		if err != nil {
-			return errorResult(err), IngestOutput{}, nil
+		if projectID == "" {
+			// Fallback to .memoryrc.yaml project_id if available
+			cfg, err := docwalk.LoadConfig(filepath.Join(cwd, ".memoryrc.yaml"))
+			if err == nil && cfg.ProjectID != "" {
+				projectID = cfg.ProjectID
+			} else {
+				projectID = "default"
+			}
 		}
 
-		output := IngestOutput{
-			NodesIngested: len(nodes),
-			EdgesCreated:  len(edges),
-			ChunksCreated: chunkCount,
-		}
+		job := jobs.create()
+		safeGo(func() {
+			nodes, edges, _, filesWalked, filesSkipped, err := onboard.AutoDetectAdapters(context.Background(), db, cwd, projectID)
+			if err != nil {
+				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("detect adapters: %w", err))
+				return
+			}
+			jobs.updateCounts(job.ID, filesWalked, filesSkipped)
+			for _, n := range nodes {
+				if err := db.UpsertNode(context.Background(), n); err != nil {
+					jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert node: %w", err))
+					return
+				}
+			}
+			for _, e := range edges {
+				if err := db.UpsertEdge(context.Background(), e); err != nil {
+					jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert edge: %w", err))
+					return
+				}
+			}
+			chunkCount, err := chunkAndEmbedNodes(
+				context.Background(), db, embedder, nodes,
+				func(embedded, total int) { jobs.updateChunksEmbedded(job.ID, embedded, total) },
+				func() { jobs.updatePhase(job.ID, "persisting") },
+			)
+			if err != nil {
+				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("chunk/embed: %w", err))
+				return
+			}
+			if err := onboard.EmbedNodes(context.Background(), db, nodes, embedder); err != nil {
+				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("embed nodes: %w", err))
+				return
+			}
+			convNodes := onboard.InferConventions(context.Background(), db, projectID, nodes)
+			for _, cn := range convNodes {
+				_ = db.UpsertNode(context.Background(), cn)
+			}
+			nodes = append(nodes, convNodes...)
 
-		toolResult := &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{
-					Text: marshalJSON(output),
-				},
-			},
-		}
+			hierNodes, hierEdges := onboard.BuildHierarchy(projectID, nodes)
+			for _, n := range hierNodes {
+				if err := db.UpsertNode(context.Background(), n); err != nil {
+					jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert hierarchy node: %w", err))
+					return
+				}
+			}
+			for _, e := range hierEdges {
+				if err := db.UpsertEdge(context.Background(), e); err != nil {
+					jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert hierarchy edge: %w", err))
+					return
+				}
+			}
+			nodes = append(nodes, hierNodes...)
 
-		return toolResult, output, nil
+			auto, proposals := onboard.Tier2ScoreAndLink(context.Background(), db, projectID, nodes)
+			jobs.finish(job.ID, len(nodes), len(edges), chunkCount, nil, len(convNodes), auto, proposals)
+		})
+
+		output := IngestOutput{JobID: job.ID, Status: "running"}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(output)}},
+		}, output, nil
 	})
-
 	// Tool 6: check_impact
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "check_impact", Description: "After updating a node, check which downstream nodes are affected.",
@@ -439,7 +613,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 					storedNodes = append(storedNodes, node)
 				}
 
-				chunkAndEmbedNodes(context.Background(), db, embedder, storedNodes, nil)
+				chunkAndEmbedNodes(context.Background(), db, embedder, storedNodes, nil, nil)
 				return nil
 			}())
 		})
@@ -499,22 +673,24 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 				if result.AlreadyOnboarded {
 					return nil
 				}
+				// Report walk counts and transition phase to "embedding" — same as ingest path.
+				jobs.updateCounts(job.ID, result.FilesWalked, result.FilesSkipped)
 
 				// Chunk + embed for RAG-level recall.
-				_, err = chunkAndEmbedNodes(
-					context.Background(),
-					db,
-					embedder,
-					result.AllNodes,
-					nil,
+				chunkCount, err := chunkAndEmbedNodes(
+					context.Background(), db, embedder, result.AllNodes,
+					func(embedded, total int) { jobs.updateChunksEmbedded(job.ID, embedded, total) },
+					func() { jobs.updatePhase(job.ID, "persisting") },
 				)
 				if err != nil {
-					log.Printf("onboard: chunk+embed: %v", err)
+					return fmt.Errorf("chunk/embed: %w", err)
 				}
-
+				_ = chunkCount
 				return nil
 			}())
+				// Report walk counts and transition phase to "embedding" — same as ingest path.
 		})
+				// Report walk counts and transition phase to "embedding" — same as ingest path.
 
 		output := OnboardOutput{ProjectID: projectID, JobID: job.ID, Status: "running"}
 
@@ -554,6 +730,9 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			EdgeCount:      stats.EdgeCount,
 			ChunkCount:     stats.ChunkCount,
 			VecCount:       stats.VecCount,
+		}
+		if etc, err := db.EdgeTypeCounts(ctx, projectID); err == nil && len(etc) > 0 {
+			output.EdgeTypeCounts = etc
 		}
 
 		toolResult := &mcp.CallToolResult{
@@ -705,21 +884,26 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 
 	// Tool 11: job_status — poll any async job
 	mcp.AddTool(srv, &mcp.Tool{
-		Name: "job_status", Description: "Poll status of an async job (onboard, extract_and_remember, build_knowledge_graph). Returns current state.",
+		Name: "job_status", Description: "Poll status of an async job (onboard, extract_and_remember). Returns current state.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args JobStatusInput) (*mcp.CallToolResult, JobStatusOutput, error) {
-		j, ok := jobs.get(args.JobID)
-		if !ok {
-			return errorResult(fmt.Errorf("job %s not found", args.JobID)), JobStatusOutput{}, nil
-		}
-		output := JobStatusOutput{
-			ID:        j.ID,
-			Status:    j.Status,
-			Nodes:     j.Nodes,
-			Edges:     j.Edges,
-			Chunks:    j.Chunks,
-			Error:     j.Error,
-			StartedAt: j.StartedAt.Format(time.RFC3339),
-		}
+			j, ok := jobs.get(args.JobID)
+			if !ok {
+				return errorResult(fmt.Errorf("job %s not found", args.JobID)), JobStatusOutput{}, nil
+			}
+			output := JobStatusOutput{
+				ID:              j.ID,
+				Status:          j.Status,
+				Phase:           j.Phase,
+				Nodes:           j.Nodes,
+				Edges:           j.Edges,
+				Chunks:          j.Chunks,
+				ChunksTotal:     j.ChunksTotal,
+				Conventions:     j.Conventions,
+				AutoLinked:      j.AutoLinked,
+				ProposalsQueued: j.ProposalsQueued,
+				Error:           j.Error,
+				StartedAt:       j.StartedAt.Format(time.RFC3339),
+			}
 		if !j.EndedAt.IsZero() {
 			output.EndedAt = j.EndedAt.Format(time.RFC3339)
 		}
@@ -734,6 +918,50 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 
 		return toolResult, output, nil
 	})
+}
+
+// resolveNodeMeta fetches a node's title and type. Errors return empty strings.
+func resolveNodeMeta(ctx context.Context, db store.Store, id string) (title, nodeType string) {
+	n, err := db.GetNode(ctx, id)
+	if err != nil {
+		title := store.DisplayName(id)
+		nt := "code:function"
+		if strings.Contains(id, "/code:type/") {
+			nt = "code:type"
+		} else if strings.Contains(id, "/code:package/") {
+			nt = "code:package"
+		}
+		return title, nt
+	}
+	title = n.Title
+	nt := n.NodeType
+	if nt == "" {
+		nt = "code:function"
+		if strings.Contains(id, "/code:type/") {
+			nt = "code:type"
+		} else if strings.Contains(id, "/code:package/") {
+			nt = "code:package"
+		}
+	}
+	return title, nt
+}
+
+// sortOutgoingFirst sorts edge results so outgoing edges come first,
+// then by confidence descending within each direction.
+func sortOutgoingFirst(results []EdgeResult) {
+	for i := 0; i < len(results); i++ {
+		for j := i + 1; j < len(results); j++ {
+			swap := false
+			if results[i].Direction != "outgoing" && results[j].Direction == "outgoing" {
+				swap = true
+			} else if results[i].Direction == results[j].Direction && results[j].Confidence > results[i].Confidence {
+				swap = true
+			}
+			if swap {
+				results[i], results[j] = results[j], results[i]
+			}
+		}
+	}
 }
 
 func runIngestAdapter(adapter, root, configPath, projectID string) ([]store.Node, []store.Edge, int, int, error) {

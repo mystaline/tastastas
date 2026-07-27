@@ -25,23 +25,66 @@ type RememberOutput struct {
 }
 
 type RecallInput struct {
-	ProjectID string `json:"project_id,omitempty"`
-	Query     string `json:"query"`
-	Limit     int    `json:"limit,omitempty"`
+	ProjectID    string  `json:"project_id,omitempty"`
+	Query        string  `json:"query"`
+	Limit        int     `json:"limit,omitempty"`
+	LinkThreshold float64 `json:"link_threshold,omitempty"` // override default 0.75
 }
 
 type RecallItem struct {
-	ID        string  `json:"id"`
-	Title     string  `json:"title"`
-	Content   string  `json:"content"`
-	NodeType  string  `json:"node_type"`
-	Score     float64 `json:"score"`
-	MatchType string  `json:"match_type"`
+	ID             string         `json:"id"`
+	Title          string         `json:"title"`
+	Excerpt        string         `json:"excerpt"`
+	NodeType       string         `json:"node_type"`
+	Score          float64        `json:"score"`
+	MatchType      string         `json:"match_type"`
+	PreviewChunks  []string       `json:"preview_chunks,omitempty"`  // first 3 chunk contents
+	TotalChunks    int            `json:"total_chunks"`              // e.g. 15
+	MoreAvailable  bool           `json:"more_available"`            // total_chunks > len(preview_chunks)
+	NextChunkStart int            `json:"next_chunk_start"`          // where to resume paging, or -1
+	Edges          []RecallEdge   `json:"edges,omitempty"`
+	InferredEdges  []RecallEdge `json:"inferred_edges,omitempty"`
+}
+
+type RecallEdge struct {
+	ToID       string  `json:"to_id"`
+	ToTitle    string  `json:"to_title"`
+	EdgeType   string  `json:"edge_type"`
+	Confidence float64 `json:"confidence"`
+}
+
+type ChunkOutputItem struct {
+	ID           string   `json:"id"`
+	ParentNodeID string   `json:"parent_node_id"`
+	ChunkIndex   int      `json:"chunk_index"`
+	Type         string   `json:"type"`
+	HeadingPath  []string `json:"heading_path,omitempty"`
+	Content      string   `json:"content"`
+	Language     string   `json:"language"`
+	PrevChunkID  string   `json:"prev_chunk_id,omitempty"`
+	NextChunkID  string   `json:"next_chunk_id,omitempty"`
 }
 
 type RecallOutput struct {
 	Results []RecallItem      `json:"results"`
 	Links   []ImplicitMCPLink `json:"links,omitempty"`
+}
+
+type RecallChunksInput struct {
+	ProjectID    string `json:"project_id,omitempty"`
+	ParentNodeID string `json:"parent_node_id"`
+	ChunkStart   int    `json:"chunk_start"` // 0-based, inclusive
+	ChunkEnd     int    `json:"chunk_end"`   // 0-based, exclusive; default chunk_start+3
+}
+
+type RecallChunksOutput struct {
+	ParentNodeID   string            `json:"parent_node_id"`
+	ParentTitle    string            `json:"parent_title"`
+	TotalChunks    int               `json:"total_chunks"`
+	ReturnedRange  string            `json:"returned_range"`   // e.g. "chunk 3-5 of 15"
+	Chunks         []ChunkOutputItem `json:"chunks"`
+	MoreAvailable  bool              `json:"more_available"`   // chunk_end < total_chunks
+	NextChunkStart int               `json:"next_chunk_start"` // chunk_end, or -1 if done
 }
 
 type ImplicitMCPLink struct {
@@ -70,16 +113,20 @@ type LinkOutput struct {
 }
 
 type IngestInput struct {
-	Adapter    string `json:"adapter"`
-	Root       string `json:"root"`
-	ConfigPath string `json:"config_path,omitempty"`
-	ProjectID  string `json:"project_id,omitempty"`
+	CWD       string `json:"cwd,omitempty"`       // project root to detect + ingest files from
+	ProjectID string `json:"project_id,omitempty"`
+	Scope     string `json:"scope,omitempty"`     // "cwd" | "subtree"
 }
 
 type IngestOutput struct {
-	NodesIngested int `json:"nodes_ingested"`
-	EdgesCreated  int `json:"edges_created"`
-	ChunksCreated int `json:"chunks_created"`
+	JobID             string `json:"job_id"`
+	Status            string `json:"status"` // "running" | "done" | "error"
+	NodesIngested    int    `json:"nodes_ingested"`
+	EdgesCreated     int    `json:"edges_created"`
+	ChunksCreated    int    `json:"chunks_created"`
+	ConventionsInferred int    `json:"conventions_inferred,omitempty"`
+	AutoLinked       int    `json:"auto_linked,omitempty"`
+	ProposalsQueued  int    `json:"proposals_queued,omitempty"`
 }
 
 type ExtractAndRememberInput struct {
@@ -138,16 +185,17 @@ type OnboardCheckInput struct {
 }
 
 type OnboardCheckOutput struct {
-	HasNodes       bool `json:"has_nodes"`
-	HasChunks      bool `json:"has_chunks"`
-	HasEmbeddings  bool `json:"has_embeddings"`
-	HasEdges       bool `json:"has_edges"`
-	HasConventions bool `json:"has_conventions"`
-	StaleCount     int  `json:"stale_count"`
-	NodeCount      int  `json:"node_count"`
-	EdgeCount      int  `json:"edge_count"`
-	ChunkCount     int  `json:"chunk_count"`
-	VecCount       int  `json:"vec_count"`
+	HasNodes       bool              `json:"has_nodes"`
+	HasChunks      bool              `json:"has_chunks"`
+	HasEmbeddings  bool              `json:"has_embeddings"`
+	HasEdges       bool              `json:"has_edges"`
+	HasConventions bool              `json:"has_conventions"`
+	StaleCount     int               `json:"stale_count"`
+	NodeCount      int               `json:"node_count"`
+	EdgeCount      int               `json:"edge_count"`
+	ChunkCount     int               `json:"chunk_count"`
+	VecCount       int               `json:"vec_count"`
+	EdgeTypeCounts map[string]int    `json:"edge_type_counts,omitempty"`
 }
 
 type QueryGraphInput struct {
@@ -206,14 +254,19 @@ type JobStatusInput struct {
 }
 
 type JobStatusOutput struct {
-	ID        string `json:"id"`
-	Status    string `json:"status"`
-	Nodes     int    `json:"nodes_ingested,omitempty"`
-	Edges     int    `json:"edges_created,omitempty"`
-	Chunks    int    `json:"chunks_created,omitempty"`
-	Error     string `json:"error,omitempty"`
-	StartedAt string `json:"started_at"`
-	EndedAt   string `json:"ended_at,omitempty"`
+	ID              string `json:"id"`
+	Status          string `json:"status"` // "running" | "done" | "error"
+	Phase           string `json:"phase,omitempty"` // "walking" | "embedding" | "persisting" | "" (done/error)
+	Nodes           int    `json:"nodes_ingested,omitempty"`
+	Edges           int    `json:"edges_created,omitempty"`
+	Chunks          int    `json:"chunks_created,omitempty"`
+	ChunksTotal     int    `json:"chunks_total,omitempty"` // total chunks queued for embedding, once known
+	Conventions     int    `json:"conventions_inferred,omitempty"`
+	AutoLinked      int    `json:"auto_linked,omitempty"`
+	ProposalsQueued int    `json:"proposals_queued,omitempty"`
+	Error           string `json:"error,omitempty"`
+	StartedAt       string `json:"started_at"`
+	EndedAt         string `json:"ended_at,omitempty"`
 }
 
 // chunkForNode splits a node's content into chunks suitable for embedding.

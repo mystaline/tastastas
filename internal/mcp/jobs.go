@@ -5,25 +5,31 @@ import (
 	"fmt"
 	"sync"
 	"time"
-)
 
+	"github.com/mystaline-dev/tastastas/internal/store"
+)
 // ingestJob tracks one async ingest run. Big-directory ingests (docwalk over
 // a whole workspace) can take minutes — long enough to blow past any client
 // or reverse-proxy HTTP timeout. Rather than hold the request open, POST
 // /ingest/{adapter} returns a job_id immediately and the actual work runs in
 // a goroutine; GET /ingest/jobs/{id} polls status.
 type ingestJob struct {
-	ID           string             `json:"id"`
-	Status       string             `json:"status"` // "running" | "done" | "error"
-	Nodes        int                `json:"nodes_ingested,omitempty"`
-	Edges        int                `json:"edges_created,omitempty"`
-	Chunks       int                `json:"chunks_created,omitempty"`
-	FilesWalked  int                `json:"files_walked,omitempty"`
-	FilesSkipped int                `json:"files_skipped,omitempty"`
-	Error        string             `json:"error,omitempty"`
-	StartedAt    time.Time          `json:"started_at"`
-	EndedAt      time.Time          `json:"ended_at,omitempty"`
-	cancel       context.CancelFunc // for job cancellation
+	ID              string             `json:"id"`
+	Status          string             `json:"status"` // "running" | "done" | "error"
+	Phase           string             `json:"phase,omitempty"` // "walking" | "embedding" | "persisting"
+	Nodes           int                `json:"nodes_ingested,omitempty"`
+	Edges           int                `json:"edges_created,omitempty"`
+	Chunks          int                `json:"chunks_created,omitempty"`
+	ChunksTotal     int                `json:"chunks_total,omitempty"`
+	Conventions     int                `json:"conventions_inferred,omitempty"`
+	AutoLinked      int                `json:"auto_linked,omitempty"`
+	ProposalsQueued int                `json:"proposals_queued,omitempty"`
+	FilesWalked     int                `json:"files_walked,omitempty"`
+	FilesSkipped    int                `json:"files_skipped,omitempty"`
+	Error           string             `json:"error,omitempty"`
+	StartedAt       time.Time          `json:"started_at"`
+	EndedAt         time.Time          `json:"ended_at,omitempty"`
+	cancel          context.CancelFunc // for job cancellation
 }
 
 // jobStore is an in-memory registry of ingest jobs. Deliberately not
@@ -32,12 +38,13 @@ type ingestJob struct {
 // the ingested nodes themselves are already durably in the DB by the time
 // status flips to "done".
 type jobStore struct {
+	store store.Store // for interrupted-run marker
 	mu   sync.RWMutex
 	jobs map[string]*ingestJob
 }
 
-func newJobStore() *jobStore {
-	return &jobStore{jobs: map[string]*ingestJob{}}
+func newJobStore(st store.Store) *jobStore {
+	return &jobStore{store: st, jobs: map[string]*ingestJob{}}
 }
 
 func (js *jobStore) create() *ingestJob {
@@ -51,10 +58,16 @@ func (js *jobStore) create() *ingestJob {
 	j := &ingestJob{
 		ID:        id,
 		Status:    "running",
+		Phase:     "walking",
 		StartedAt: time.Now(),
 		cancel:    cancel,
 	}
 	js.jobs[id] = j
+
+	// Record interrupted-run marker. Cleared by finish().
+	if js.store != nil {
+		_ = js.store.SetJobMarker(context.Background())
+	}
 	return j
 }
 
@@ -74,6 +87,7 @@ func (js *jobStore) finish(
 	id string,
 	nodes, edges, chunks int,
 	err error,
+	extra ...int,
 ) {
 	js.mu.Lock()
 	defer js.mu.Unlock()
@@ -84,22 +98,31 @@ func (js *jobStore) finish(
 	}
 	j.EndedAt = time.Now()
 
+	j.Phase = ""
 	if err != nil {
 		j.Status = "error"
 		j.Error = err.Error()
 	} else {
 		j.Status = "done"
 		j.Nodes, j.Edges, j.Chunks = nodes, edges, chunks
+		if len(extra) >= 3 {
+			j.Conventions, j.AutoLinked, j.ProposalsQueued = extra[0], extra[1], extra[2]
+		}
 	}
 
 	// Cancel any ongoing work
 	if j.cancel != nil {
 		j.cancel()
 	}
-}
 
+	// Clear interrupted-run marker — job finished cleanly.
+	if js.store != nil {
+		_ = js.store.ClearJobMarker(context.Background())
+	}
+}
 // updateCounts lets the background goroutine push progress (files walked/skipped)
-// before the job completes. Caller must hold no other locks.
+// before the job completes. Also flips phase to "embedding" — the walk is
+// done and chunk+embed is about to start. Caller must hold no other locks.
 func (js *jobStore) updateCounts(
 	id string,
 	filesWalked, filesSkipped int,
@@ -112,10 +135,12 @@ func (js *jobStore) updateCounts(
 		return
 	}
 	j.FilesWalked, j.FilesSkipped = filesWalked, filesSkipped
+	j.Phase = "embedding"
 }
 
 // updateChunksEmbedded lets the background goroutine push embedding progress.
-func (js *jobStore) updateChunksEmbedded(id string, chunksEmbedded int) {
+// chunksTotal is set once, on the first call, from the caller's known batch size.
+func (js *jobStore) updateChunksEmbedded(id string, chunksEmbedded, chunksTotal int) {
 	js.mu.Lock()
 	defer js.mu.Unlock()
 
@@ -124,6 +149,25 @@ func (js *jobStore) updateChunksEmbedded(id string, chunksEmbedded int) {
 		return
 	}
 	j.Chunks = chunksEmbedded
+	if chunksTotal > 0 {
+		j.ChunksTotal = chunksTotal
+	}
+}
+
+// updatePhase lets the background goroutine mark a phase transition that
+// isn't tied to a count update — e.g. "persisting" once all chunks are
+// embedded and the bulk DB insert (which reports no progress of its own)
+// is about to start. Without this, a multi-minute insert phase is
+// indistinguishable from a hang to anyone polling.
+func (js *jobStore) updatePhase(id, phase string) {
+	js.mu.Lock()
+	defer js.mu.Unlock()
+
+	j, ok := js.jobs[id]
+	if !ok {
+		return
+	}
+	j.Phase = phase
 }
 
 // runAsync kicks off ingest+chunk+embed in a background goroutine using a
