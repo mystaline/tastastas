@@ -189,11 +189,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "init",
 		Description: "Initialize tastastas and get capability overview for your session.",
-		InputSchema: map[string]interface{}{
-			"type": "object",
-			"properties": map[string]interface{}{},
-		},
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct{}) (*mcp.CallToolResult, string, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct{}) (*mcp.CallToolResult, InitOutput, error) {
 		help := `Tastastas Memory Backend:
 - Typed graph + vector + lexical hybrid.
 - Tools: remember (store), recall (search), link (connect nodes), query_graph (trace), ingest (walk codebase).
@@ -203,7 +199,8 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
   3. Prefer 'link' (create edges) over 'remember' (store text or quick memorable notes) for complex relationships (ERD, PRD, API spec).
   4. 'recall' returns ranked structural edges + inferred links; use 'query_graph' to inspect proposals.
   5. Ingest is idempotent; run on every push.`
-		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: help}}}, help, nil
+		output := InitOutput{Help: help}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: help}}}, output, nil
 	})
 
 	// Tool 2: onboard — async

@@ -10,6 +10,10 @@ import (
 
 // --- Input/Output types (Go types auto-generate MCP JSON schema) ---
 
+type InitOutput struct {
+	Help string `json:"help"`
+}
+
 type RememberInput struct {
 	ProjectID  string  `json:"project_id,omitempty"`
 	NodeType   string  `json:"node_type,omitempty"`
