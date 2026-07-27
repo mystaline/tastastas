@@ -6,31 +6,153 @@ Store facts, search by relevance × recency × importance, get "this might be st
 
 Data sources: doc repos (PRDs, ERDs, APIs, spec docs), codebases (Go symbols, call graphs), git history, conversation facts, and custom notes — all stored in one graph DB with zero external services.
 
-## Quick start
+## Quick Start
+
+Three deployment paths:
+
+### Option A: Docker Compose (on-prem / team server)
+
+**Prerequisites:** Docker + Docker Compose v2
+
+```bash
+docker compose up -d
+```
+
+> ⚠️ **First run**: `docker compose up` pulls Ollama image (~3.2GB) then downloads `nomic-embed-text` model (~270MB). Total ~3.5GB download. This happens once — subsequent starts are instant.
+
+Verify:
+
+```bash
+curl http://localhost:8080/health
+# → {"status":"ok","version":"0.1.0"}
+```
+
+**MCP client config (Streamable HTTP):**
+
+Claude Code:
+```json
+{
+  "mcpServers": {
+    "tastastas": {
+      "type": "http",
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}
+```
+
+Kilo Code:
+```json
+"tastastas": {
+  "type": "remote",
+  "url": "http://localhost:8080/mcp",
+  "enabled": true
+}
+```
+
+Graph visualization: `http://localhost:9292/graph/{project_id}`
+
+Data persisted in Docker volume `tastastas-data`. Auth optional via `TASTASTAS_AUTH_TOKEN` in `.env`.
+
+### Option B: Single binary + baked sidecar (zero deps, air-gapped)
+
+**Prerequisites:** Go 1.26+, Rust (cargo), curl, ~1GB disk, **clone repo** (no release binaries yet)
+
+```bash
+# Build sidecar (one-time: downloads model, builds, and embeds into binary)
+./scripts/build-sidecar.sh
+
+# Stdio mode (default)
+./tastastas
+
+# HTTP mode
+./tastastas --serve :8080
+```
+
+`--embed-backend sidecar` is default when binary present. Falls back to lexical-only gracefully.
+
+> ℹ️ Sidecar ONNX model is baked into the binary by `build-sidecar.sh`. After build, no external deps needed — zero runtime installation, Ollama not required.
+
+**MCP client config (stdio):**
+
+Claude Code:
+```json
+{
+  "mcpServers": {
+    "tastastas": {
+      "type": "stdio",
+      "command": "/path/to/tastastas",
+      "args": [
+        "--db", "~/.local/share/tastastas/memory.db",
+        "--graph-addr", ":9292"
+      ]
+    }
+  }
+}
+```
+
+Kilo Code:
+```json
+"tastastas": {
+  "type": "local",
+  "command": [
+    "/path/to/tastastas",
+    "--db", "~/.local/share/tastastas/memory.db",
+    "--graph-addr", ":9292"
+  ],
+  "enabled": true
+}
+```
+
+### Option C: Single binary + external Ollama (personal, LLM extraction)
+
+**Prerequisites:** Go 1.26+, Ollama running + `ollama pull nomic-embed-text`
+
+> ⚠️ **Ollama + model must be running** before starting tastastas. Verify with `ollama list`. Change `--ollama-model` and `--embed-dim` for different models — check dimension via `curl -X POST http://localhost:11434/api/embeddings -d '{"model":"your-model","prompt":"test"}' | jq '.embedding | length'`.
 
 ```bash
 go build -o tastastas ./cmd/tastastas
 
-# stdio mode — for MCP clients (Claude Desktop, Claude Code, etc.)
-./tastastas --db ~/.local/share/tastastas/memory.db --embed-dim 768
+# Stdio
+./tastastas --embed-backend ollama --db ~/.local/share/tastastas/memory.db
 
-# HTTP mode — curl, webhooks, shared team instance
-./tastastas --db ~/.local/share/tastastas/memory.db --embed-dim 768 --serve :8080
+# HTTP
+./tastastas --embed-backend ollama --serve :8080 --db ~/.local/share/tastastas/memory.db
 ```
 
-```bash
-# Ollama (default)
-./tastastas --db ~/.local/share/tastastas/memory.db --embed-dim 768 --embed-backend ollama --serve :8080
+**MCP client config (stdio):**
 
-# Sidecar — zero external deps, baked ONNX embedder
-./scripts/build-sidecar.sh
-./tastastas --db ~/.local/share/tastastas/memory.db --embed-dim 384 --embed-backend sidecar --serve :8080
-
-# Lexical + graph only — no embedding needed
-./tastastas --db ~/.local/share/tastastas/memory.db --embed-backend none --serve :8080
+Claude Code:
+```json
+{
+  "mcpServers": {
+    "tastastas": {
+      "type": "stdio",
+      "command": "/path/to/tastastas",
+      "args": [
+        "--db", "~/.local/share/tastastas/memory.db",
+        "--embed-backend", "ollama",
+        "--graph-addr", ":9292"
+      ],
+      "env": {}
+    }
+  }
+}
 ```
 
-Embedding dim auto-detects when unset (384 sidecar, 768 ollama).
+Kilo Code:
+```json
+"tastastas": {
+  "type": "local",
+  "command": [
+    "/path/to/tastastas",
+    "--db", "~/.local/share/tastastas/memory.db",
+    "--embed-backend", "ollama",
+    "--graph-addr", ":9292"
+  ],
+  "enabled": true
+}
+```
 
 ## Flags
 
@@ -97,47 +219,6 @@ Source → [AutoDetectAdapters] → n → [EmbedNodes] → n → [InferConventio
 
 `*` = degrades gracefully to FTS5-only (lexical). Vector/semantic features skip without embedder. ONNX sidecar is zero-dependency and baked into the binary — run `scripts/build-sidecar.sh` once, no Ollama needed.
 
-For MCP clients, add to config:
-
-**Claude Code:**
-```json
-{
-  "mcpServers": {
-    "tastastas": {
-      "type": "stdio",
-      "command": "/path/to/tastastas",
-      "args": [
-        "--db", "~/.local/share/tastastas/memory.db",
-        "--embed-dim", "768",
-        "--embed-backend", "ollama",
-        "--graph-addr", ":9292"
-      ],
-      "env": {}
-    }
-  }
-}
-```
-
-**Kilo Code:**
-```json
-"tastastas": {
-  "type": "local",
-  "command": [
-    "/path/to/tastastas",
-    "--db", "~/.local/share/tastastas/memory.db",
-    "--embed-dim", "768",
-    "--embed-backend", "ollama",
-    "--graph-addr", ":9292"
-  ]
-}
-```
-
-DB path is customizable — `~/.local/share/tastastas/memory.db` follows the [XDG Base Directory](https://specifications.freedesktop.org/basedir-spec/latest/) convention: consistent across working directories, survives project cleanup, easy to find.
-
-Then just talk naturally: "ingest my docs from ~/Workspace/project" or "recall what you know about coupon redemption."
-
-Then just talk naturally: "ingest my docs from ~/Workspace/project" or "recall what you know about coupon redemption."
-
 ## API endpoints (`--serve` mode)
 
 ```
@@ -175,6 +256,31 @@ mappings:
 ```
 
 Without `.memoryrc.yaml` everything ingests as `generic-doc` — still searchable, just untyped.
+
+## Technology Stack
+
+| Language | Role | What it does |
+|----------|------|-------------|
+| **Go** | Core application | MCP server, ingest pipeline, graph database, retrieval, chunking, SQLite store. All production code in `internal/`. |
+| **Rust** | Embedding sidecar | `tastastas-embed` — bge-small-en-v1.5 ONNX model baked into binary via `include_bytes!`. JSON-RPC over stdin/stdout. Communicates with Go process as subprocess. |
+| **Python** | Data science / calibration | `prototype/scoring.py` — extraction prompt calibration, dedup threshold derivation, embedding quality benchmarks. Not in production binary. |
+
+### Expansion Paths
+
+**Data engineers (Python):**
+- Fine-tune embedding models on domain-specific data → export ONNX → replace `sidecar/assets/model.onnx`
+- Calibrate RRF (Reciprocal Rank Fusion) weights via `prototype/scoring.py` benchmarks
+- Evaluate chunking strategies against recall quality metrics
+
+**Backend engineers (Go):**
+- Add new ingest adapters in `internal/ingest/` (Confluence, Notion, Google Docs)
+- Swap SQLite → PostgreSQL/turso via `store.Store` interface
+- Add authentication providers beyond bearer token
+
+**ML engineers (Rust):**
+- Swap bge-small-en-v1.5 with larger models (bge-large, multilingual)
+- Add GPU-accelerated ONNX Runtime execution
+- Implement cross-encoder reranking in sidecar
 
 ## Development
 

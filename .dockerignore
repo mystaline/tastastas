@@ -1,0 +1,11 @@
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+/bin/
+/tastastas
+sidecar/target/
+internal/embed/bin/linux_amd64/
+.git/
+prototype/
+docs/
