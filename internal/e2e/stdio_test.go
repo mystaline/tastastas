@@ -45,7 +45,7 @@ func connect(t *testing.T, bin, dbPath string) *mcp.ClientSession {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
 
-	cmd := exec.CommandContext(ctx, bin, "-db", dbPath, "-embed-dim", "8")
+	cmd := exec.CommandContext(ctx, bin, "-db", dbPath, "-embed-backend", "none")
 	transport := &mcp.CommandTransport{Command: cmd}
 
 	client := mcp.NewClient(&mcp.Implementation{Name: "e2e-test", Version: "0.0.0"}, nil)
