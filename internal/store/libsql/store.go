@@ -576,7 +576,7 @@ func (s *Store) SearchChunks(
 	}
 
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT c.id, c.parent_node_id, c.chunk_index, c.chunk_type, c.heading_path, c.content, c.language,
+		SELECT c.id, c.parent_node_id, c.chunk_index, c.chunk_type, c.heading_path, c.content, c.language, c.source_adapter, c.prev_chunk_id, c.next_chunk_id,
 		       vec_distance_cosine(v.embedding, vec_f32(?)) AS distance
 		FROM chunk_vectors v
 		JOIN chunks c ON c.id = v.chunk_id
@@ -596,7 +596,7 @@ func (s *Store) SearchChunks(
 		var sc store.ScoredChunk
 		var headingPath string
 		var distance float64
-		if err := rows.Scan(&sc.ID, &sc.ParentNodeID, &sc.ChunkIndex, &sc.Type, &headingPath, &sc.Content, &sc.Language, &distance); err != nil {
+		if err := rows.Scan(&sc.ID, &sc.ParentNodeID, &sc.ChunkIndex, &sc.Type, &headingPath, &sc.Content, &sc.Language, &sc.SourceAdapter, &sc.PrevChunkID, &sc.NextChunkID, &distance); err != nil {
 			return nil, fmt.Errorf("libsql: scan scored chunk: %w", err)
 		}
 		_ = json.Unmarshal([]byte(headingPath), &sc.HeadingPath)
@@ -778,6 +778,30 @@ func (s *Store) Stats(ctx context.Context, projectID string) (store.StoreStats, 
 	return st, nil
 }
 
+func (s *Store) EdgeTypeCounts(ctx context.Context, projectID string) (map[string]int, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT e.edge_type, COUNT(*) FROM edges e
+		JOIN nodes n ON n.id = e.from_id
+		WHERE n.project_id = ?
+		GROUP BY e.edge_type`,
+		projectID)
+	if err != nil {
+		return nil, fmt.Errorf("libsql: edge type counts: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]int{}
+	for rows.Next() {
+		var t string
+		var c int
+		if err := rows.Scan(&t, &c); err != nil {
+			return nil, fmt.Errorf("libsql: scan edge type count: %w", err)
+		}
+		out[t] = c
+	}
+	return out, rows.Err()
+}
+
 func buildEdgeTypeFilter(edgeTypes []string) (string, []any) {
 	if len(edgeTypes) == 0 {
 		return "", nil
@@ -866,6 +890,111 @@ func (s *Store) ListEdgesByType(
 		out = append(out, e)
 	}
 
+	return out, rows.Err()
+}
+
+func (s *Store) ListEdgesByProject(
+	ctx context.Context,
+	projectID string,
+	edgeTypes []string,
+	limit, offset int,
+) ([]store.EdgeResult, int, error) {
+	q := `SELECT e.from_id, fn.title, fn.node_type, e.to_id, tn.title, tn.node_type, e.edge_type, e.confidence,
+	       COUNT(*) OVER() AS total
+		FROM edges e
+		JOIN nodes fn ON fn.id = e.from_id
+		JOIN nodes tn ON tn.id = e.to_id
+		WHERE fn.project_id = ?`
+	args := []any{projectID}
+
+	if len(edgeTypes) > 0 {
+		placeholders := make([]string, len(edgeTypes))
+		for i, t := range edgeTypes {
+			placeholders[i] = "?"
+			args = append(args, t)
+		}
+		q += ` AND e.edge_type IN (` + strings.Join(placeholders, ",") + `)`
+	}
+	q += ` ORDER BY e.confidence DESC LIMIT ? OFFSET ?`
+	args = append(args, limit, offset)
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("libsql: list edges by project: %w", err)
+	}
+	defer rows.Close()
+
+	var out []store.EdgeResult
+	total := 0
+	for rows.Next() {
+		var er store.EdgeResult
+		var fromTitle, fromType, toTitle, toType string
+		var totalRow int
+		if err := rows.Scan(&er.FromID, &fromTitle, &fromType, &er.ToID, &toTitle, &toType, &er.EdgeType, &er.Confidence, &totalRow); err != nil {
+			return nil, 0, fmt.Errorf("libsql: scan edge result: %w", err)
+		}
+		total = totalRow
+		er.FromTitle = fromTitle
+		er.FromType = fromType
+		er.ToTitle = toTitle
+		er.ToType = toType
+		er.FromGroup = extractGroup(er.FromID, projectID)
+		er.ToGroup = extractGroup(er.ToID, projectID)
+		out = append(out, er)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return out, total, nil
+}
+
+func extractGroup(id, projectID string) string {
+	trimmed := strings.TrimPrefix(id, projectID+"/")
+	if i := strings.Index(trimmed, "/"); i >= 0 {
+		return trimmed[:i]
+	}
+	return ""
+}
+
+func (s *Store) GetEdgesFrom(ctx context.Context, nodeID string, edgeTypes []string) ([]store.Edge, error) {
+	typeFilter, args := buildEdgeTypeFilter(edgeTypes)
+	q := `SELECT from_id, to_id, edge_type, confidence FROM edges WHERE from_id = ?` + typeFilter
+	queryArgs := append([]any{nodeID}, args...)
+	rows, err := s.db.QueryContext(ctx, q, queryArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("libsql: get edges from: %w", err)
+	}
+	defer rows.Close()
+
+	var out []store.Edge
+	for rows.Next() {
+		var e store.Edge
+		if err := rows.Scan(&e.FromID, &e.ToID, &e.EdgeType, &e.Confidence); err != nil {
+			return nil, fmt.Errorf("libsql: scan edge: %w", err)
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetEdgesTo(ctx context.Context, nodeID string, edgeTypes []string) ([]store.Edge, error) {
+	typeFilter, args := buildEdgeTypeFilter(edgeTypes)
+	q := `SELECT from_id, to_id, edge_type, confidence FROM edges WHERE to_id = ?` + typeFilter
+	queryArgs := append([]any{nodeID}, args...)
+	rows, err := s.db.QueryContext(ctx, q, queryArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("libsql: get edges to: %w", err)
+	}
+	defer rows.Close()
+
+	var out []store.Edge
+	for rows.Next() {
+		var e store.Edge
+		if err := rows.Scan(&e.FromID, &e.ToID, &e.EdgeType, &e.Confidence); err != nil {
+			return nil, fmt.Errorf("libsql: scan edge: %w", err)
+		}
+		out = append(out, e)
+	}
 	return out, rows.Err()
 }
 

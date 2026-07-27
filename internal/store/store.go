@@ -55,6 +55,21 @@ type Edge struct {
 	Confidence float64
 }
 
+// EdgeResult bundles an edge with resolved metadata for both endpoints.
+// Used by project_graph for visualization payloads.
+type EdgeResult struct {
+	FromID     string  `json:"from_id"`
+	FromTitle  string  `json:"from_title"`
+	FromType   string  `json:"from_type"`
+	FromGroup  string  `json:"from_group"`
+	ToID       string  `json:"to_id"`
+	ToTitle    string  `json:"to_title"`
+	ToType     string  `json:"to_type"`
+	ToGroup    string  `json:"to_group"`
+	EdgeType   string  `json:"edge_type"`
+	Confidence float64 `json:"confidence"`
+}
+
 // ScoredNode is a Node with a retrieval score attached.
 type ScoredNode struct {
 	Node
@@ -129,11 +144,25 @@ type Store interface {
 	// Stats returns aggregate counts for a project.
 	Stats(ctx context.Context, projectID string) (StoreStats, error)
 
+	// EdgeTypeCounts returns edge count per edge type for a project.
+	EdgeTypeCounts(ctx context.Context, projectID string) (map[string]int, error)
+
 	// ListNodesByType returns nodes matching any of the given types, ordered by created_at desc.
 	ListNodesByType(ctx context.Context, projectID string, types []string, limit, offset int) ([]Node, error)
 
 	// ListEdgesByType returns edges matching the given edge type, scoped to a project.
 	ListEdgesByType(ctx context.Context, projectID string, edgeType string, limit, offset int) ([]Edge, error)
+
+	// ListEdgesByProject returns all edges for a project with resolved node
+	// metadata (title, type, group) for both endpoints. Paginated.
+	// edgeTypes filter: nil/empty = all types. Returns (edges, totalCount).
+	ListEdgesByProject(ctx context.Context, projectID string, edgeTypes []string, limit, offset int) ([]EdgeResult, int, error)
+
+	// GetEdgesFrom returns outgoing edges from nodeID, optionally filtered by edgeTypes.
+	GetEdgesFrom(ctx context.Context, nodeID string, edgeTypes []string) ([]Edge, error)
+
+	// GetEdgesTo returns incoming edges to nodeID, optionally filtered by edgeTypes.
+	GetEdgesTo(ctx context.Context, nodeID string, edgeTypes []string) ([]Edge, error)
 
 	// DeleteEdge removes a single edge by its composite key.
 	DeleteEdge(ctx context.Context, fromID, toID, edgeType string) error
@@ -143,6 +172,17 @@ type Store interface {
 	// match, creates the stored relation edge and deletes the reference.
 	// Returns number of references resolved.
 	ResolveUnresolved(ctx context.Context, projectID, nodeID, nodeTitle string) (int, error)
+
+
+	// SetJobMarker writes a marker indicating an async job is in progress.
+	// Used for interrupted-run detection on next startup.
+	SetJobMarker(ctx context.Context) error
+
+	// ClearJobMarker removes the in-progress marker.
+	ClearJobMarker(ctx context.Context) error
+
+	// HasJobMarker returns true if a previous run was interrupted.
+	HasJobMarker(ctx context.Context) (bool, error)
 
 	Close() error
 }
