@@ -101,6 +101,12 @@ type Store interface {
 	DeleteChunksByParent(ctx context.Context, parentNodeID string) error
 	SearchChunks(ctx context.Context, projectID string, embedding []float32, limit int) ([]ScoredChunk, error)
 
+	// GetChunksByParent returns chunks for a parent node, ordered by chunk_index.
+	GetChunksByParent(ctx context.Context, parentNodeID string, limit, offset int) ([]Chunk, error)
+
+	// CountChunksByParent returns total chunk count for a parent node.
+	CountChunksByParent(ctx context.Context, parentNodeID string) (int, error)
+
 	// Neighbors walks typed edges out to depth hops from id.
 	Neighbors(ctx context.Context, id string, edgeTypes []string, depth int) ([]Node, []Edge, error)
 

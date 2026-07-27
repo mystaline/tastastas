@@ -607,6 +607,38 @@ func (s *Store) SearchChunks(
 	return out, rows.Err()
 }
 
+func (s *Store) GetChunksByParent(ctx context.Context, parentNodeID string, limit, offset int) ([]store.Chunk, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, parent_node_id, chunk_index, chunk_type, heading_path, content, language, source_adapter
+		FROM chunks
+		WHERE parent_node_id = ?
+		ORDER BY chunk_index
+		LIMIT ? OFFSET ?
+	`, parentNodeID, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("libsql: get chunks by parent: %w", err)
+	}
+	defer rows.Close()
+
+	var out []store.Chunk
+	for rows.Next() {
+		var c store.Chunk
+		var headingPath string
+		if err := rows.Scan(&c.ID, &c.ParentNodeID, &c.ChunkIndex, &c.Type, &headingPath, &c.Content, &c.Language, &c.SourceAdapter, &c.PrevChunkID, &c.NextChunkID); err != nil {
+			return nil, fmt.Errorf("libsql: scan chunk: %w", err)
+		}
+		_ = json.Unmarshal([]byte(headingPath), &c.HeadingPath)
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) CountChunksByParent(ctx context.Context, parentNodeID string) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM chunks WHERE parent_node_id = ?`, parentNodeID).Scan(&count)
+	return count, err
+}
+
 func (s *Store) Neighbors(
 	ctx context.Context,
 	id string,
