@@ -2,7 +2,10 @@ package onboard
 
 import (
 	"math"
+	"path/filepath"
 	"testing"
+
+	"github.com/mystaline-dev/tastastas/internal/store"
 )
 
 func TestNamePrefix(t *testing.T) {
@@ -100,6 +103,75 @@ func TestSplitLastDot(t *testing.T) {
 	pkg, name = splitLastDot("no-dot")
 	if pkg != "no-dot" || name != "" {
 		t.Errorf(`splitLastDot("no-dot") = (%q, %q), want ("no-dot", "")`, pkg, name)
+	}
+}
+
+func docNode(typ, path string) store.Node {
+	return store.Node{ID: path, NodeType: typ, Title: filepath.Base(path), SourcePath: path}
+}
+
+func codeNode(typ, path string) store.Node {
+	return store.Node{ID: path, NodeType: typ, SourcePath: path}
+}
+
+func TestTemplateCollisionPenalty(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b store.Node
+		want float64
+	}{
+		{"docwalk numbered template, different features",
+			docNode("prd-detail", "PRJ/MDL/PRD/config-rbac/03-schema.md"),
+			docNode("prd-detail", "PRJ/MDL/PRD/module-y/03-schema.md"),
+			-0.20},
+		{"markdown-glob README, different dirs",
+			docNode("generic-doc", "docs/auth/README.md"),
+			docNode("generic-doc", "docs/billing/README.md"),
+			-0.20},
+		{"template collision, same doc type, diff features",
+			docNode("template", "feature-a/03-functional.md"),
+			docNode("template", "feature-b/03-functional.md"),
+			-0.20},
+		{"different filenames, same feature",
+			docNode("prd-detail", "PRJ/MDL/PRD/module-y/03-functional.md"),
+			docNode("prd-detail", "PRJ/MDL/PRD/module-y/03-schema.md"),
+			0},
+		{"same directory",
+			docNode("prd-detail", "PRJ/MDL/PRD/module-y/03-schema.md"),
+			docNode("prd-detail", "PRJ/MDL/PRD/module-y/03-schema.md"),
+			0},
+		{"code to code, same base name",
+			codeNode("code:function", "internal/store/sqlite/sqlite.go"),
+			codeNode("code:function", "internal/store/libsql/sqlite.go"),
+			0},
+		{"mixed code and doc",
+			codeNode("code:function", "internal/foo/bar.go"),
+			docNode("generic-doc", "docs/bar.md"),
+			0},
+		{"empty source path",
+			store.Node{NodeType: "prd", Title: "03-schema.md"},
+			docNode("prd", "some/path/03-schema.md"),
+			0},
+		{"obsidian collision across folders",
+			docNode("obsidian-note", "vault/project-a/architecture.md"),
+			docNode("obsidian-note", "vault/project-b/architecture.md"),
+			-0.20},
+		{"erd same dir, same filename",
+			docNode("erd", "feature/03-schema.md"),
+			docNode("erd", "feature/03-schema.md"),
+			0},
+		{"design-doc same name, different dirs",
+			docNode("design-doc", "auth/design.md"),
+			docNode("design-doc", "billing/design.md"),
+			-0.20},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := templateCollisionPenalty(tt.a, tt.b)
+			if got != tt.want {
+				t.Errorf("templateCollisionPenalty() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

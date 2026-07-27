@@ -543,12 +543,12 @@ func Tier2ScoreAndLink(ctx context.Context, db store.Store, projectID string, ne
 	// Score each pair (undirected, so only i<j)
 	for i := 0; i < len(newNodes); i++ {
 		a := newNodes[i]
-		if a.Embedding == nil {
+		if a.Embedding == nil || a.NodeType == "directory" {
 			continue
 		}
 		for j := i + 1; j < len(newNodes); j++ {
 			b := newNodes[j]
-			if b.Embedding == nil {
+			if b.Embedding == nil || b.NodeType == "directory" {
 				continue
 			}
 
@@ -714,6 +714,31 @@ func tokenize(s string) []string {
 		words = append(words, strings.ToLower(current))
 	}
 	return words
+}
+
+var docTypes = map[string]bool{
+	"prd": true, "prd-detail": true, "erd": true, "api-spec": true,
+	"test-case": true, "template": true, "foundation-doc": true,
+	"design-doc": true, "generic-doc": true, "architecture-decision": true,
+	"visual-design": true, "obsidian-note": true,
+}
+
+func templateCollisionPenalty(a, b store.Node) float64 {
+	if !docTypes[a.NodeType] || !docTypes[b.NodeType] {
+		return 0
+	}
+	if a.SourcePath == "" || b.SourcePath == "" {
+		return 0
+	}
+	pa := filepath.ToSlash(a.SourcePath)
+	pb := filepath.ToSlash(b.SourcePath)
+	if filepath.Base(pa) != filepath.Base(pb) {
+		return 0
+	}
+	if filepath.Dir(pa) == filepath.Dir(pb) {
+		return 0
+	}
+	return -0.20
 }
 
 func countCodeSymbols(nodes []store.Node) int {
