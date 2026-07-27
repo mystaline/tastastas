@@ -65,9 +65,13 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 
 	db := cfg.Store
 
-	// Graceful check: if project already has nodes, skip re-ingestion.
+	// Graceful check: if project already has nodes AND chunks, skip
+	// re-ingestion. Gating on NodeCount alone let a project that had nodes
+	// but never got chunked (crash mid-run, embedder down that one time)
+	// stay permanently unchunked — every future onboard call would hit
+	// this fast-path and never retry chunk+embed.
 	stats, err := db.Stats(ctx, cfg.ProjectID)
-	if err == nil && stats.NodeCount > 0 {
+	if err == nil && stats.NodeCount > 0 && stats.ChunkCount > 0 {
 		elapsed := time.Since(start).Milliseconds()
 		detected := []string{}
 		if stats.ConventionCnt > 0 {
@@ -83,148 +87,9 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 		}, nil
 	}
 
-	var allNodes []store.Node
-	var allEdges []store.Edge
-	detectedAdapters := []string{}
-	filesWalked := 0
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	var firstErr error
-
-	// Each adapter detects itself and runs concurrently.
-	type adapterResult struct {
-		name   string
-		nodes  []store.Node
-		edges  []store.Edge
-		walked int
-		err    error
-	}
-	ch := make(chan adapterResult, 5)
-
-	startAdapter := func(name string, fn func() ([]store.Node, []store.Edge, int, error)) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			nodes, edges, walked, err := fn()
-
-			ch <- adapterResult{
-				name:   name,
-				nodes:  nodes,
-				edges:  edges,
-				walked: walked,
-				err:    err,
-			}
-		}()
-	}
-
-	// codeast
-	if hasCodeast(cfg.CWD) {
-		langs := detectLanguages(cfg.CWD)
-		startAdapter("codeast", func() ([]store.Node, []store.Edge, int, error) {
-			ca := codeast.New(db, codeast.Config{
-				Root: cfg.CWD, ProjectID: cfg.ProjectID, Languages: langs,
-			})
-
-			nodes, edges, err := ca.Ingest(ctx)
-			if err != nil {
-				return nil, nil, 0, err
-			}
-
-			return nodes, edges, countFiles(cfg.CWD, langs), nil
-		})
-	}
-
-	//  ||
-	// 	hasFile(cfg.CWD, "AGENTS.md") ||
-	// 	hasFile(cfg.CWD, "CLAUDE.md") ||
-	// 	hasFile(cfg.CWD, "README.md")
-	// gitrepo
-	if hasFile(cfg.CWD, "MEMORY.md") {
-		startAdapter("gitrepo", func() ([]store.Node, []store.Edge, int, error) {
-			nodes, err := gitrepo.Ingest(
-				gitrepo.Config{
-					Root:      cfg.CWD,
-					ProjectID: cfg.ProjectID,
-				},
-			)
-			if err != nil {
-				return nil, nil, 0, err
-			}
-
-			return nodes, nil, countMEMORYFiles(cfg.CWD), nil
-		})
-	}
-
-	// docwalk
-	if exists(filepath.Join(cfg.CWD, ".memoryrc.yaml")) {
-		startAdapter("docwalk", func() ([]store.Node, []store.Edge, int, error) {
-			dwcfg, err := docwalk.LoadConfig(
-				filepath.Join(cfg.CWD, ".memoryrc.yaml"),
-			)
-			if err != nil {
-				return nil, nil, 0, fmt.Errorf("docwalk load config: %w", err)
-			}
-
-			dwcfg.ProjectID = cfg.ProjectID
-			nodes, edges, walked, _, err := docwalk.Ingest(
-				cfg.CWD,
-				dwcfg,
-			)
-
-			return nodes, edges, walked, err
-		})
-	}
-
-	// obsidian
-	if exists(filepath.Join(cfg.CWD, ".obsidian")) {
-		startAdapter("obsidian", func() ([]store.Node, []store.Edge, int, error) {
-			nodes, edges, err := obsidian.Ingest(
-				obsidian.Config{
-					Root:      cfg.CWD,
-					ProjectID: cfg.ProjectID,
-				},
-			)
-
-			return nodes, edges, countFiles(cfg.CWD, nil), err
-		})
-	}
-
-	// markdown-glob
-	if hasMD(cfg.CWD) {
-		startAdapter("markdown-glob", func() ([]store.Node, []store.Edge, int, error) {
-			nodes, err := markdownglob.Ingest(
-				markdownglob.Config{
-					Root:      cfg.CWD,
-					ProjectID: cfg.ProjectID,
-				},
-			)
-
-			return nodes, nil, countFiles(cfg.CWD, nil), err
-		})
-	}
-
-	// Collect results
-	go func() {
-		wg.Wait()
-		close(ch)
-	}()
-
-	for r := range ch {
-		mu.Lock()
-
-		detectedAdapters = append(detectedAdapters, r.name)
-		filesWalked += r.walked
-		if r.err != nil && firstErr == nil {
-			firstErr = r.err
-		}
-
-		allNodes = append(allNodes, r.nodes...)
-		allEdges = append(allEdges, r.edges...)
-
-		mu.Unlock()
-	}
-	if firstErr != nil {
-		return Result{}, firstErr
+	allNodes, allEdges, detectedAdapters, filesWalked, filesSkipped, err := AutoDetectAdapters(ctx, db, cfg.CWD, cfg.ProjectID)
+	if err != nil {
+		return Result{}, err
 	}
 
 	// Persist base nodes/edges
