@@ -187,7 +187,12 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 
 	// Tool 1: init
 	mcp.AddTool(srv, &mcp.Tool{
-		Name: "init", Description: "Initialize tastastas and get capability overview for your session.",
+		Name:        "init",
+		Description: "Initialize tastastas and get capability overview for your session.",
+		InputSchema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{},
+		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct{}) (*mcp.CallToolResult, string, error) {
 		help := `Tastastas Memory Backend:
 - Typed graph + vector + lexical hybrid.
