@@ -2,13 +2,13 @@ name: release
 
 # Builds the ONNX sidecar (Rust) + tastastas binary (Go) for every
 # supported platform, then attaches them to a GitHub Release. Triggered
-# manually or by pushing a `v*` tag — no remote is configured yet, so this
-# workflow doesn't run until one is pushed and a tag lands.
+# manually or by pushing a `v*` tag.
 #
 # Matrix mirrors what `ort` (onnxruntime bindings) ships prebuilt binaries
-# for via its download-binaries feature: linux x86_64/aarch64, macOS
-# x86_64/aarch64, windows x86_64. No linux/arm or windows/arm64 — ort has
-# no prebuilt runtime for those, would need self-built onnxruntime.
+# for via its download-binaries feature: linux x86_64/aarch64, macOS arm64,
+# windows x86_64. No Intel macOS — ort has no prebuilt binary for
+# x86_64-apple-darwin. No linux/arm or windows/arm64 — ort has no prebuilt
+# runtime for those, would need self-built onnxruntime.
 
 on:
   push:
@@ -16,10 +16,12 @@ on:
   workflow_dispatch: {}
 
 env:
-  GO_VERSION: "1.23"
+  GO_VERSION: "1.26"
 
 jobs:
   build:
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -32,10 +34,6 @@ jobs:
             goos: linux
             goarch: arm64
             target: aarch64-unknown-linux-gnu
-          - os: macos-15-intel
-            goos: darwin
-            goarch: amd64
-            target: x86_64-apple-darwin
           - os: macos-latest
             goos: darwin
             goarch: arm64
