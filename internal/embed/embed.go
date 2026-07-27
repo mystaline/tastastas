@@ -68,7 +68,7 @@ func (e *Embedder) Embed(ctx context.Context, text string) ([]float32, error) {
 	return vecs[0], nil
 }
 
-// EmbedBatch embeds up to 32 texts in a single Ollama call, amortizing HTTP
+	// EmbedBatch embeds up to 64 texts in a single Ollama /api/embed
 // overhead. Callers with more than 32 texts must chunk themselves.
 func (e *Embedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
 	if len(texts) == 0 {

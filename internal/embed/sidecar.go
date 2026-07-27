@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"time"
 )
 
 //go:embed bin
@@ -53,45 +54,56 @@ type sidecarResponse struct {
 	Error      *string     `json:"error"`
 }
 
-// NewSidecar extracts the platform-appropriate baked binary to a temp file
-// and starts it as a persistent subprocess. Returns an error if this
-// platform has no baked binary (caller should fall back to Ollama).
-func NewSidecar() (*SidecarEmbedder, error) {
+// extractSidecarBin extracts the platform-appropriate baked binary to an
+// OS temp dir and returns the path. The binary is extracted once and shared
+// across all pool workers — each calls startSidecar with the same binPath.
+func extractSidecarBin() (string, error) {
 	binName := fmt.Sprintf("bin/%s_%s/tastastas-embed", runtime.GOOS, runtime.GOARCH)
 	if runtime.GOOS == "windows" {
 		binName += ".exe"
 	}
-
 	data, err := sidecarBinFS.ReadFile(binName)
 	if err != nil {
-		return nil, fmt.Errorf("embed: no baked sidecar for %s/%s: %w", runtime.GOOS, runtime.GOARCH, err)
+		return "", fmt.Errorf("embed: no baked sidecar for %s/%s: %w", runtime.GOOS, runtime.GOARCH, err)
 	}
-
 	tmpDir, err := os.MkdirTemp("", "tastastas-embed-")
 	if err != nil {
-		return nil, fmt.Errorf("embed: create sidecar tempdir: %w", err)
+		return "", fmt.Errorf("embed: create sidecar tempdir: %w", err)
 	}
 	binPath := filepath.Join(tmpDir, filepath.Base(binName))
 	if err := os.WriteFile(binPath, data, 0o755); err != nil {
 		os.RemoveAll(tmpDir)
-		return nil, fmt.Errorf("embed: write sidecar binary: %w", err)
+		return "", fmt.Errorf("embed: write sidecar binary: %w", err)
 	}
+	return binPath, nil
+}
 
+// NewSidecar extracts the baked binary to a temp file and starts it as
+// a persistent subprocess. For pool usage, prefer extractSidecarBin + startSidecar
+// to avoid extracting the binary N times.
+func NewSidecar() (*SidecarEmbedder, error) {
+	binPath, err := extractSidecarBin()
+	if err != nil {
+		return nil, err
+	}
+	return startSidecar(binPath)
+}
+
+// startSidecar starts a sidecar subprocess from an existing binary path.
+// Used by SidecarPool to spawn N workers from one extracted binary.
+func startSidecar(binPath string) (*SidecarEmbedder, error) {
 	cmd := exec.Command(binPath)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		os.RemoveAll(tmpDir)
 		return nil, fmt.Errorf("embed: sidecar stdin pipe: %w", err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		os.RemoveAll(tmpDir)
 		return nil, fmt.Errorf("embed: sidecar stdout pipe: %w", err)
 	}
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
-		os.RemoveAll(tmpDir)
 		return nil, fmt.Errorf("embed: start sidecar: %w", err)
 	}
 
@@ -186,6 +198,8 @@ func (s *SidecarEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]f
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-time.After(30 * time.Second):
+		return nil, fmt.Errorf("embed: sidecar read timeout (30s) — worker may have died")
 	case r := <-readCh:
 		if r.err != nil {
 			return nil, fmt.Errorf("embed: read from sidecar: %w", r.err)

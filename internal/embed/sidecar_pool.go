@@ -3,7 +3,7 @@ package embed
 import (
 	"context"
 	"fmt"
-	"runtime"
+	"time"
 )
 
 // SidecarPool manages N SidecarEmbedder workers for parallel embedding.
@@ -13,15 +13,20 @@ type SidecarPool struct {
 }
 
 // NewSidecarPool creates a pool of N workers (defaults to runtime.NumCPU()).
+// Extracts the baked ONNX binary once and spawns N subprocesses from the
+// same path — avoids writing 150 MB × numCPU to temp.
 func NewSidecarPool(n int) (*SidecarPool, error) {
 	if n <= 0 {
-		n = runtime.NumCPU()
+		n = 4
+	}
+	binPath, err := extractSidecarBin()
+	if err != nil {
+		return nil, err
 	}
 	workers := make([]*SidecarEmbedder, n)
 	for i := 0; i < n; i++ {
-		w, err := NewSidecar()
+		w, err := startSidecar(binPath)
 		if err != nil {
-			// close any already-started workers
 			for j := 0; j < i; j++ {
 				_ = workers[j].Close()
 			}
@@ -44,7 +49,12 @@ func (p *SidecarPool) EmbedBatch(ctx context.Context, texts []string) ([][]float
 		return nil, fmt.Errorf("embed: total batch size %d exceeds pool capacity %d", len(texts), 32*len(p.workers))
 	}
 
-	// Distribute texts to workers
+	// Per-batch deadline prevents a single dead worker from hanging
+	// the pool — callers pass context.Background() so ctx.Done() alone
+	// never fires.
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+
 	type result struct {
 		idx int
 		vec [][]float32
@@ -52,7 +62,7 @@ func (p *SidecarPool) EmbedBatch(ctx context.Context, texts []string) ([][]float
 	}
 	resCh := make(chan result, len(p.workers))
 
-	// Split texts across workers
+	collected := 0
 	chunkSize := (len(texts) + len(p.workers) - 1) / len(p.workers)
 	start := 0
 	for i, w := range p.workers {
@@ -63,6 +73,7 @@ func (p *SidecarPool) EmbedBatch(ctx context.Context, texts []string) ([][]float
 		if start >= end {
 			break
 		}
+		collected++
 		sub := texts[start:end]
 		start = end
 		go func(idx int, worker *SidecarEmbedder, batch []string) {
@@ -71,18 +82,23 @@ func (p *SidecarPool) EmbedBatch(ctx context.Context, texts []string) ([][]float
 		}(i, w, sub)
 	}
 
-	// Collect results in order, return first error
-	results := make([]result, len(p.workers))
-	for range p.workers {
+	results := make([]result, collected)
+	var firstErr error
+	for i := 0; i < collected; i++ {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case r := <-resCh:
-			if r.err != nil {
-				return nil, r.err
+			if r.err != nil && firstErr == nil {
+				firstErr = r.err
 			}
-			results[r.idx] = r
+			if r.idx < collected {
+				results[r.idx] = r
+			}
 		}
+	}
+	if firstErr != nil {
+		return nil, firstErr
 	}
 
 	// Concatenate in original order
