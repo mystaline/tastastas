@@ -32,7 +32,7 @@ jobs:
             goos: linux
             goarch: arm64
             target: aarch64-unknown-linux-gnu
-          - os: macos-13
+          - os: macos-15-intel
             goos: darwin
             goarch: amd64
             target: x86_64-apple-darwin
@@ -90,23 +90,12 @@ jobs:
           [ "${{ matrix.goos }}" = "windows" ] && out="${out}.exe"
           go build -trimpath -ldflags="-s -w" -o "dist/$out" ./cmd/tastastas
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tastastas-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/*
-          if-no-files-found: error
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Create GitHub Release
+      # Upload straight to the release as each platform finishes — no
+      # waiting on other matrix legs. softprops/action-gh-release appends
+      # to an existing release (same tag) instead of overwriting it, so
+      # concurrent uploads from parallel jobs are safe.
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
