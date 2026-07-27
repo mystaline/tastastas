@@ -1,5 +1,5 @@
--- Edge proposals for Tier 3 disambiguation (0.55-0.80 band proposals).
--- Resolves to edge on confirm_links, cleaned on reject.
+-- 0003_tier1_tier3.up.sql — edge proposals and unresolved references.
+
 CREATE TABLE IF NOT EXISTS edge_proposals (
     id          TEXT PRIMARY KEY,
     from_id     TEXT NOT NULL,
@@ -11,8 +11,6 @@ CREATE TABLE IF NOT EXISTS edge_proposals (
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
--- Unresolved references for Tier 1 extraction (entity mentions from doc content
--- that haven't matched a known node yet).
 CREATE TABLE IF NOT EXISTS unresolved_references (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id      TEXT NOT NULL,

@@ -79,15 +79,54 @@ func defaultDBPath() string {
 	return filepath.Join(base, "tastastas", "memory.db")
 }
 
+func ensureDBDir(path string) {
+	dir := filepath.Dir(path)
+	_ = os.MkdirAll(dir, 0o755)
+}
+
 func isRemoteDSN(dsn string) bool {
 	return strings.HasPrefix(dsn, "libsql://") || strings.HasPrefix(dsn, "http://") || strings.HasPrefix(dsn, "https://")
 }
 
 func main() {
+	// Subcommand: update — run pending migrations then exit.
+	if len(os.Args) > 1 && os.Args[1] == "update" {
+		updateCmd := flag.NewFlagSet("update", flag.ExitOnError)
+		dbPath := updateCmd.String("db", defaultDBPath(), "path to SQLite database file")
+		embedDim := updateCmd.Int("embed-dim", 0, "embedding vector dimension")
+		embedBackend := updateCmd.String("embed-backend", "sidecar", "embedder backend")
+		updateCmd.Parse(os.Args[2:])
+
+		if *embedDim <= 0 {
+			switch *embedBackend {
+			case "ollama":
+				*embedDim = 768
+			default:
+				*embedDim = 384
+			}
+		}
+		if !isRemoteDSN(*dbPath) {
+			ensureDBDir(*dbPath)
+		}
+		if isRemoteDSN(*dbPath) {
+			_, err := libsqlstore.Open(context.Background(), *dbPath, *embedDim)
+			if err != nil {
+				log.Fatalf("update: open store: %v", err)
+			}
+			return
+		}
+		_, err := sqlitestore.Open(context.Background(), *dbPath, *embedDim)
+		if err != nil {
+			log.Fatalf("update: open store: %v", err)
+		}
+		log.Println("update complete")
+		return
+	}
+
 	serve := flag.String("serve", "", "run as HTTP server on given address (e.g. :8080)")
 	dbPath := flag.String("db", defaultDBPath(), "path to SQLite database file (default: $XDG_DATA_HOME/tastastas/memory.db — cwd-independent so all projects share one source of truth)")
-	embedDim := flag.Int("embed-dim", 384, "embedding vector dimension (must match your embedder; 384 for the baked sidecar / bge-small-en-v1.5)")
-	embedBackend := flag.String("embed-backend", "sidecar", "embedder backend: sidecar (baked ONNX, zero deps, 384-dim), ollama (HTTP, usually 768-dim with nomic-embed-text), or none (lexical only)")
+	embedDim := flag.Int("embed-dim", 0, "embedding vector dimension (0 = auto-detect: 384 for sidecar, 768 for ollama)")
+	embedBackend := flag.String("embed-backend", "sidecar", "embedder backend: sidecar (baked ONNX, zero deps, 384-dim), ollama (HTTP, 768-dim default with nomic-embed-text), or none (lexical only)")
 	ollamaURL := flag.String("ollama-url", "http://localhost:11434", "Ollama base URL (used when --embed-backend=ollama)")
 	ollamaModel := flag.String("ollama-model", "nomic-embed-text", "Ollama embedding model (used when --embed-backend=ollama)")
 	sidecarWorkers := flag.Int("sidecar-workers", 0, "number of sidecar workers (0 = NumCPU, only for --embed-backend=sidecar)")
@@ -95,6 +134,21 @@ func main() {
 	llmModel := flag.String("llm-model", "qwen3.5:2b-q4_K_M", "Ollama model for Tier 1/3 linking (build_knowledge_graph)")
 	authToken := flag.String("auth-token", "", "bearer token for HTTP server mode (empty = no auth)")
 	flag.Parse()
+
+	// Ensure DB directory exists (for local SQLite, not remote DSN).
+	if !isRemoteDSN(*dbPath) {
+		ensureDBDir(*dbPath)
+	}
+
+	// Auto-detect embed dim when not explicitly set (0 = default).
+	if *embedDim <= 0 {
+		switch *embedBackend {
+		case "ollama":
+			*embedDim = 768
+		default:
+			*embedDim = 384
+		}
+	}
 
 	var db store.Store
 	var err error

@@ -13,6 +13,8 @@ import (
 	"strings"
 
 	"github.com/mystaline-dev/tastastas/internal/store"
+	"github.com/mystaline/mig/pkg/database"
+	"github.com/mystaline/mig/pkg/migrator"
 )
 
 type Store struct {
@@ -25,9 +27,12 @@ func Open(ctx context.Context, path string, dim int) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: open %s: %w", path, err)
 	}
-	// Enable WAL mode for better concurrency
+	// Enable WAL mode + busy timeout for better concurrency
 	if _, err := db.ExecContext(ctx, `PRAGMA journal_mode = WAL;`); err != nil {
 		return nil, fmt.Errorf("sqlite: enable WAL: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA busy_timeout = 30000;`); err != nil {
+		return nil, fmt.Errorf("sqlite: set busy_timeout: %w", err)
 	}
 	s := &Store{db: db, dim: dim}
 	if err := s.initSchema(ctx); err != nil {
@@ -40,37 +45,59 @@ func Open(ctx context.Context, path string, dim int) (*Store, error) {
 var migrationsFS embed.FS
 
 func (s *Store) initSchema(ctx context.Context) error {
-	entries, err := migrationsFS.ReadDir("migrations")
-	if err != nil {
-		return fmt.Errorf("sqlite: read embedded migrations: %w", err)
+	// 1. Run versioned migrations via mig (reads from embedded FS).
+	m := migrator.NewMigratorFromFS(migrationsFS, "migrations")
+	m.SetDB(database.NewSQLiteDBFromDB(s.db))
+	m.Quiet = true
+	if err := m.Init(ctx); err != nil {
+		return fmt.Errorf("sqlite: init mig: %w", err)
 	}
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
-			continue
-		}
-		b, err := migrationsFS.ReadFile("migrations/" + e.Name())
-		if err != nil {
-			return fmt.Errorf("sqlite: read migration %s: %w", e.Name(), err)
-		}
-		if _, err := s.db.ExecContext(ctx, string(b)); err != nil {
-			return fmt.Errorf("sqlite: apply migration %s: %w", e.Name(), err)
-		}
+	if err := m.RunUp(ctx, 0); err != nil {
+		return fmt.Errorf("sqlite: run migrations: %w", err)
 	}
-	// vec0 tables are dimension-specific, created here rather than in the
-	// static migration files.
-	nodeVecStmt := fmt.Sprintf(
-		`CREATE VIRTUAL TABLE IF NOT EXISTS node_vectors USING vec0(node_id TEXT PRIMARY KEY, embedding float[%d])`,
-		s.dim,
-	)
-	if _, err := s.db.ExecContext(ctx, nodeVecStmt); err != nil {
-		return fmt.Errorf("sqlite: create node_vectors: %w", err)
+
+	// 2. [ONE-TIME] Existing DBs missing source_adapter column.
+	// Chunks CREATE TABLE in 0002 includes it; old DBs created before this
+	// migration system don't have it. SQLite's CREATE TABLE IF NOT EXISTS
+	// won't add missing columns, so we check and fix here.
+	var hasCol int
+	_ = s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pragma_table_info WHERE name = 'chunks' AND name = 'source_adapter'`).Scan(&hasCol)
+	if hasCol == 0 {
+		_, _ = s.db.ExecContext(ctx,
+			`ALTER TABLE chunks ADD COLUMN source_adapter TEXT NOT NULL DEFAULT ''`)
 	}
-	chunkVecStmt := fmt.Sprintf(
-		`CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vectors USING vec0(chunk_id TEXT PRIMARY KEY, embedding float[%d])`,
-		s.dim,
-	)
-	if _, err := s.db.ExecContext(ctx, chunkVecStmt); err != nil {
-		return fmt.Errorf("sqlite: create chunk_vectors: %w", err)
+
+	// 3. vec0 tables are dimension-specific. If an existing vec0 table has a
+	// different dimension (e.g. user switched embedder from ollama 768-dim to
+	// sidecar 384-dim), drop + re-create automatically. vec0 doesn't support
+	// ALTER TABLE to change float[N].
+	for _, tbl := range []string{"node_vectors", "chunk_vectors"} {
+		exists := 0
+		s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_list WHERE name = ?", tbl).Scan(&exists)
+		if exists != 0 {
+			// Check current dimension
+			var sqlStr string
+			s.db.QueryRowContext(ctx, "SELECT sql FROM sqlite_master WHERE name = ? AND type = 'table'", tbl).Scan(&sqlStr)
+			wantDim := fmt.Sprintf("float[%d]", s.dim)
+			if !strings.Contains(sqlStr, wantDim) {
+				if _, err := s.db.ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl); err != nil {
+					return fmt.Errorf("sqlite: drop stale %s: %w", tbl, err)
+				}
+			}
+		}
+		stmt := fmt.Sprintf(
+			`CREATE VIRTUAL TABLE IF NOT EXISTS %s USING vec0(%s TEXT PRIMARY KEY, embedding float[%d])`,
+			tbl,
+			map[string]string{
+				"node_vectors":  "node_id",
+				"chunk_vectors": "chunk_id",
+			}[tbl],
+			s.dim,
+		)
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("sqlite: create %s: %w", tbl, err)
+		}
 	}
 	return nil
 }
