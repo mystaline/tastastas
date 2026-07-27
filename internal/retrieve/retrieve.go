@@ -284,7 +284,12 @@ func (r *Retriever) Recall(ctx context.Context, params RecallParams) (*RecallRes
 		}
 	}
 
-	// 8. Cross-source implicit links: compare chunks pairwise by cosine
+	// 8. Enrich scored nodes with excerpt + chunk preview + pagination
+	for i := range scored {
+		r.enrichNode(ctx, &scored[i])
+	}
+
+	// 9. Cross-source implicit links: compare chunks pairwise by cosine
 	// similarity when they come from different source adapters.
 	var links []ImplicitLink
 	if len(chunkResults) > 1 {
@@ -474,17 +479,103 @@ func (r *Retriever) recencyDecay(age time.Duration) float64 {
 	return math.Pow(2, -age.Seconds()/halfLife)
 }
 
-func sortByScore(s []ScoredNode) {
-	for i := 1; i < len(s); i++ {
-		key := s[i]
-		j := i - 1
-		for j >= 0 && s[j].Score < key.Score {
-			s[j+1] = s[j]
-			j--
+// excerpt truncates content to n runes, appending "..." if truncated.
+func excerpt(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
+// enrichNode fills a scored node's pagination fields from chunk metadata
+// and populates edges from the graph store.
+func (r *Retriever) enrichNode(ctx context.Context, s *ScoredNode) {
+	s.Excerpt = excerpt(s.Node.Content, r.cfg.ExcerptLen)
+
+	// Populate edges from the node's outgoing edges (1 hop).
+	// Split into structural and inferred tiers, sort by confidence desc, cap per tier.
+	// Proposed edges are excluded entirely (review queue, not knowledge).
+	edges, err := r.store.GetEdgesFrom(ctx, s.Node.ID, nil)
+	if err == nil && len(edges) > 0 {
+		var structEdges, inferredEdges []EdgeRef
+		for _, e := range edges {
+			title := store.DisplayName(e.ToID)
+			if t, nerr := r.store.GetNode(ctx, e.ToID); nerr == nil {
+				title = t.Title
+			}
+			ref := EdgeRef{
+				ToID:       e.ToID,
+				ToTitle:    title,
+				EdgeType:   e.EdgeType,
+				Confidence: e.Confidence,
+			}
+			// Classify by tier
+			isStructural := false
+			for _, st := range StructuralEdgeTypes {
+				if e.EdgeType == st {
+					isStructural = true
+					break
+				}
+			}
+			isInferred := false
+			for _, it := range InferredEdgeTypes {
+				if e.EdgeType == it {
+					isInferred = true
+					break
+				}
+			}
+			switch {
+			case isStructural:
+				structEdges = append(structEdges, ref)
+			case isInferred:
+				inferredEdges = append(inferredEdges, ref)
+			}
+			// proposed and unknown types are dropped
 		}
-		s[j+1] = key
+		// Sort each tier by confidence desc
+		sortEdgesByConfidence(structEdges)
+		sortEdgesByConfidence(inferredEdges)
+		// Cap per tier
+		if len(structEdges) > StructuralEdgeCap {
+			structEdges = structEdges[:StructuralEdgeCap]
+		}
+		if len(inferredEdges) > InferredEdgeCap {
+			inferredEdges = inferredEdges[:InferredEdgeCap]
+		}
+		s.Edges = structEdges
+		s.InferredEdges = inferredEdges
+	}
+
+	total, err := r.store.CountChunksByParent(ctx, s.Node.ID)
+	if err != nil || total == 0 {
+		s.TotalChunks = 0
+		s.MoreAvailable = false
+		s.NextChunkStart = -1
+		return
+	}
+	s.TotalChunks = total
+
+	// Fetch first PreviewChunksPerNode chunks as preview
+	preview, err := r.store.GetChunksByParent(ctx, s.Node.ID, r.cfg.PreviewChunksPerNode, 0)
+	if err != nil {
+		s.MoreAvailable = total > 0
+		s.NextChunkStart = 0
+		return
+	}
+	s.PreviewChunks = make([]string, len(preview))
+	for i, c := range preview {
+		s.PreviewChunks[i] = c.Content
+	}
+
+	got := len(preview)
+	s.MoreAvailable = got < total
+	if s.MoreAvailable {
+		s.NextChunkStart = got
+	} else {
+		s.NextChunkStart = -1
 	}
 }
+
 
 // findCrossSourceLinks compares chunk embeddings pairwise and returns
 // implicit links for chunks from different source adapters whose cosine
@@ -492,18 +583,6 @@ func sortByScore(s []ScoredNode) {
 func findCrossSourceLinks(chunks []store.ScoredChunk, threshold float64) []ImplicitLink {
 	if len(chunks) < 2 {
 		return nil
-	}
-
-	// Group chunks by source adapter (derived from ParentNodeID prefix)
-	sourceOf := func(id string) string {
-		// Chunk IDs are parent_node_id/chunk_N; parent_node_id pattern:
-		// project/adapter/path...  e.g. "default/docwalk/README.md",
-		// "default/gitrepo/cmd/main.go", "default/obsidian/note.md"
-		parts := splitN(id, "/", 3)
-		if len(parts) >= 2 {
-			return parts[1] // adapter name
-		}
-		return "unknown"
 	}
 
 	type idxVec struct {
