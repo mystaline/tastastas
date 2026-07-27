@@ -150,14 +150,55 @@ type OnboardCheckOutput struct {
 	VecCount       int  `json:"vec_count"`
 }
 
-type BuildGraphInput struct {
-	ProjectID string `json:"project_id,omitempty"`
+type QueryGraphInput struct {
+	NodeID    string   `json:"node_id"`
+	EdgeTypes []string `json:"edge_types,omitempty"` // nil = all types
+	Direction string   `json:"direction,omitempty"`  // "outgoing" | "incoming" | "both"; default "both"
+	Limit     int      `json:"limit,omitempty"`      // default 20
 }
 
-type BuildGraphOutput struct {
-	JobID     string `json:"job_id"`
-	Status    string `json:"status"`
-	StartedAt string `json:"started_at"`
+type QueryGraphOutput struct {
+	NodeID string       `json:"node_id"`
+	Title  string       `json:"title"`
+	Edges  []EdgeResult `json:"edges"`
+}
+
+type EdgeResult struct {
+	Direction  string  `json:"direction"`   // "outgoing" | "incoming"
+	NodeID     string  `json:"node_id"`     // the other node (to_id or from_id)
+	NodeTitle  string  `json:"node_title"`
+	NodeType   string  `json:"node_type"`
+	EdgeType   string  `json:"edge_type"`
+	Confidence float64 `json:"confidence"`
+}
+
+type ProjectGraphInput struct {
+	ProjectID    string   `json:"project_id,omitempty"`
+	MaxEdges     int      `json:"max_edges,omitempty"`     // default 5000
+	EdgeTypes    []string `json:"edge_types,omitempty"`    // empty = all non-proposed types
+}
+
+type ProjectGraphOutput struct {
+	ProjectID  string       `json:"project_id"`
+	TotalEdges int          `json:"total_edges"`
+	Returned   int          `json:"returned"`
+	Nodes      []GraphNode  `json:"nodes"`
+	Edges      []GraphEdge  `json:"edges"`
+}
+
+type GraphNode struct {
+	ID     string `json:"id"`
+	Title  string `json:"title"`
+	Type   string `json:"type"`
+	Group  string `json:"group"`
+	Weight int    `json:"weight"`
+}
+
+type GraphEdge struct {
+	Source     string  `json:"source"`
+	Target     string  `json:"target"`
+	EdgeType   string  `json:"edge_type"`
+	Confidence float64 `json:"confidence"`
 }
 
 type JobStatusInput struct {

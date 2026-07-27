@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tastastas Graph</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#1a1a2e;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;overflow:hidden;height:100vh}
+svg{width:100%;height:100vh;cursor:grab}
+svg:active{cursor:grabbing}
+.tooltip{position:absolute;background:#16213e;border:1px solid #0f3460;border-radius:6px;padding:10px 14px;font-size:13px;pointer-events:none;opacity:0;transition:opacity .15s;max-width:400px;z-index:100;box-shadow:0 4px 20px rgba(0,0,0,.4)}
+.tooltip .name{font-weight:600;font-size:14px;color:#e0e0e0;margin-bottom:4px}
+.tooltip .meta{color:#a0a0b0;font-size:12px}
+.tooltip .meta span{color:#7ec8e3}
+.legend{position:absolute;top:16px;left:16px;background:#16213e;border:1px solid #0f3460;border-radius:8px;padding:14px 18px;font-size:12px;max-height:80vh;overflow-y:auto;z-index:50;min-width:180px}
+.legend h3{font-size:13px;color:#7ec8e3;margin-bottom:10px;font-weight:600}
+.legend-item{display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:11px;color:#c0c0d0}
+.legend-swatch{width:12px;height:12px;border-radius:50%;flex-shrink:0;border:1px solid rgba(255,255,255,.1)}
+.stats{position:absolute;bottom:16px;right:16px;background:#16213e;border:1px solid #0f3460;border-radius:8px;padding:10px 14px;font-size:11px;color:#808090;z-index:50}
+.stats span{color:#c0c0d0}
+.controls{position:absolute;top:16px;right:16px;display:flex;flex-direction:column;gap:6px;z-index:50}
+.controls label{display:flex;align-items:center;gap:6px;font-size:11px;color:#a0a0b0;cursor:pointer;background:#16213e;border:1px solid #0f3460;border-radius:6px;padding:6px 10px}
+.controls input[type=checkbox]{accent-color:#7ec8e3}
+.banner{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);background:#16213e;border:2px solid #e94560;border-radius:10px;padding:20px 30px;text-align:center;z-index:200;font-size:14px;max-width:500px;display:none}
+.banner h2{color:#e94560;margin-bottom:8px;font-size:18px}
+.banner p{color:#a0a0b0;font-size:13px}
+.edge-label{font-size:8px;fill:#606080;pointer-events:none;user-select:none}
+</style>
+</head>
+<body>
+<div class="tooltip" id="tooltip"></div>
+<div class="legend" id="legend"><h3>Loading...</h3></div>
+<div class="controls" id="controls">
+  <label><input type="checkbox" id="chkLabels" checked> Show labels</label>
+  <label><input type="checkbox" id="chkStructural" checked> Structural</label>
+  <label><input type="checkbox" id="chkInferred" checked> Inferred</label>
+</div>
+<div class="stats" id="stats">Loading...</div>
+<div class="banner" id="banner"><h2>Edge cap reached</h2><p id="bannerText"></p></div>
+<svg id="graph"></svg>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script>
+(async function(){
+  const DATA = __DATA__;
+
+  if (!DATA || !DATA.nodes || DATA.nodes.length === 0) {
+    document.getElementById('legend').innerHTML = '<h3>No data</h3><p style="color:#a0a0b0;font-size:12px">Project has no edges to display.</p>';
+    return;
+  }
+
+  const projectID = DATA.project_id;
+  const totalEdges = DATA.total_edges;
+  const returned = DATA.returned;
+  const nodes = DATA.nodes.map(n => ({...n}));
+  const edges = DATA.edges.map(e => ({...e}));
+
+  // --- color mapping ---
+  const groupHues = new Map();
+  let hueIdx = 0;
+  const hueStep = 360 / Math.max(new Set(nodes.map(n => n.group)).size, 1);
+  nodes.forEach(n => { if (!groupHues.has(n.group)) groupHues.set(n.group, (hueIdx++ * hueStep + 220) % 360); });
+
+  const typeLightness = {
+    'prd': 55, 'prd-detail': 50,
+    'erd': 45, 'api-spec': 50, 'test-case': 40,
+    'code:function': 35, 'code:type': 32, 'code:method': 38,
+    'generic-doc': 30, 'foundation-doc': 42, 'design-doc': 40, 'template': 35,
+    'convention': 25, 'architecture-decision': 38,
+    'visual-design': 40, 'obsidian-note': 45
+  };
+  const defaultLightness = 45;
+
+  function nodeColor(d) {
+    const hue = groupHues.get(d.group) || 220;
+    const lit = typeLightness[d.type] || defaultLightness;
+    return `hsl(${hue}, 60%, ${lit}%)`;
+  }
+  function nodeStroke(d) {
+    const hue = groupHues.get(d.group) || 220;
+    const lit = (typeLightness[d.type] || defaultLightness) + 15;
+    return `hsl(${hue}, 80%, ${lit}%)`;
+  }
+  function edgeColor(from, to) {
+    const h1 = groupHues.get(from.group) || 220;
+    const h2 = groupHues.get(to.group) || 220;
+    const avg = (h1 + h2) / 2;
+    return `hsla(${avg}, 50%, 45%, 0.4)`;
+  }
+
+  // --- layout ---
+  const width = window.innerWidth;
+  const height = window.innerHeight;
+  const svg = d3.select('#graph');
+  const g = svg.append('g');
+
+  // Zoom
+  svg.call(d3.zoom().scaleExtent([0.1, 8]).on('zoom', e => g.attr('transform', e.transform)));
+
+  // Force — weak repulsion + centering forces keep disconnected
+  // clusters (e.g. Acme vs ExampleProject with 0 cross edges)
+  // from flying to opposite corners. forceX/forceY pull all
+  // nodes toward center; charge keeps them from overlapping.
+  const sim = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(edges).id(d => d.id).distance(30))
+    .force('charge', d3.forceManyBody().strength(-30))
+    .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('x', d3.forceX(width / 2).strength(0.08))
+    .force('y', d3.forceY(height / 2).strength(0.08))
+    .force('collide', d3.forceCollide(d => Math.max(3, Math.log2(d.weight) * 2 + 1)));
+
+  // Edges from JSON have source/target as strings.
+  // D3 forceLink resolves them to node objects on initialize.
+  // After resolution, d.source IS the node object — use directly.
+
+  // Edges
+  const link = g.append('g').selectAll('line')
+    .data(edges).join('line')
+    .attr('stroke', d => edgeColor(d.source, d.target))
+    .attr('stroke-width', d => Math.max(0.5, d.confidence * 2.5))
+    .attr('opacity', 0.6);
+
+  // Edge labels
+  const edgeLabel = g.append('g').selectAll('text')
+    .data(edges).join('text')
+    .attr('class', 'edge-label')
+    .text(d => d.edge_type)
+    .attr('opacity', 0);
+
+  // Nodes
+  const node = g.append('g').selectAll('circle')
+    .data(nodes).join('circle')
+    .attr('r', d => Math.max(5, Math.log2(d.weight) * 3 + 2))
+    .attr('fill', nodeColor)
+    .attr('stroke', nodeStroke)
+    .attr('stroke-width', 1.5)
+    .attr('opacity', 1)
+    .call(d3.drag()
+      .on('start', (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+      .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y; })
+      .on('end', (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; })
+    );
+
+  // Tick
+  sim.on('tick', () => {
+    link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+        .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+    edgeLabel.attr('x', d => (d.source.x + d.target.x) / 2)
+             .attr('y', d => (d.source.y + d.target.y) / 2);
+    node.attr('cx', d => d.x).attr('cy', d => d.y);
+  });
+
+  // Tooltip
+  const tooltip = d3.select('#tooltip');
+  node.on('mouseenter', (e, d) => {
+    tooltip.style('opacity', 1)
+      .html(`<div class="name">${esc(d.title || d.id)}</div><div class="meta">Group: <span>${esc(d.group)}</span> · Type: <span>${esc(d.type)}</span> · Degree: <span>${d.weight}</span><br>ID: <span style="font-size:11px">${esc(d.id)}</span></div>`);
+  }).on('mousemove', e => tooltip.style('left', (e.pageX + 14) + 'px').style('top', (e.pageY - 10) + 'px'))
+    .on('mouseleave', () => tooltip.style('opacity', 0));
+
+  link.on('mouseenter', (e, d) => {
+    tooltip.style('opacity', 1)
+      .html(`<div class="name">${esc(d.edge_type)}</div><div class="meta">Confidence: <span>${d.confidence.toFixed(4)}</span></div>`);
+  }).on('mousemove', e => tooltip.style('left', (e.pageX + 14) + 'px').style('top', (e.pageY - 10) + 'px'))
+    .on('mouseleave', () => tooltip.style('opacity', 0));
+
+  // Click to focus
+  let focused = null;
+  function focus(d) {
+    focused = d ? d.id : null;
+    node.attr('opacity', n => {
+      if (!focused) return 1;
+      if (n.id === focused) return 1;
+      const edge = edges.find(e => (e.source.id === focused && e.target.id === n.id) || (e.target.id === focused && e.source.id === n.id));
+      if (edge) return 0.9;
+      const twoHop = edges.some(e => {
+        const other = e.source.id === focused ? e.target.id : (e.target.id === focused ? e.source.id : null);
+        if (!other) return false;
+        return e.source.id === n.id || e.target.id === n.id;
+      });
+      return twoHop ? 0.5 : 0.12;
+    });
+    node.attr('stroke-width', n => n.id === focused ? 3 : 1.5);
+    link.attr('opacity', e => {
+      if (!focused) return 0.6;
+      if (e.source.id === focused || e.target.id === focused) return 0.7;
+      const twoHop = edges.some(ee =>
+        (ee.source.id === focused && ee.target.id === e.target.id) || (ee.target.id === focused && ee.source.id === e.source.id)
+      );
+      return twoHop ? 0.3 : 0.04;
+    });
+  }
+
+  node.on('click', (e, d) => {
+    e.stopPropagation();
+    focus(d);
+  });
+  svg.on('click', () => focus(null));
+
+  // Edge labels toggle
+  document.getElementById('chkLabels').addEventListener('change', function() {
+    edgeLabel.attr('opacity', this.checked ? 0.5 : 0);
+  });
+
+  // Type filters
+  document.getElementById('chkStructural').addEventListener('change', applyFilters);
+  document.getElementById('chkInferred').addEventListener('change', applyFilters);
+  function applyFilters() {
+    const showStructural = document.getElementById('chkStructural').checked;
+    const showInferred = document.getElementById('chkInferred').checked;
+    const structural = new Set(['specifies','implements','tests','calls','defines','imports','convention-member']);
+    const inferred = new Set(['auto-linked','references']);
+    link.attr('display', d => {
+      if (showStructural && structural.has(d.edge_type)) return null;
+      if (showInferred && inferred.has(d.edge_type)) return null;
+      return 'none';
+    });
+    edgeLabel.attr('display', d => {
+      if (showStructural && structural.has(d.edge_type)) return null;
+      if (showInferred && inferred.has(d.edge_type)) return null;
+      return 'none';
+    });
+  }
+
+  // Legend
+  const groups = [...new Set(nodes.map(n => n.group))].sort();
+  const types = [...new Set(nodes.map(n => n.type))].sort();
+  let legendHTML = `<h3>${esc(projectID)}</h3>`;
+  groups.forEach(g => {
+    const hue = groupHues.get(g) || 220;
+    legendHTML += `<div class="legend-item"><div class="legend-swatch" style="background:hsl(${hue},60%,45%)"></div>${esc(g)}</div>`;
+  });
+  legendHTML += '<div style="margin-top:8px;padding-top:8px;border-top:1px solid #0f3460">';
+  types.forEach(t => {
+    const lit = typeLightness[t] || defaultLightness;
+    legendHTML += `<div class="legend-item"><div class="legend-swatch" style="background:hsl(220,60%,${lit}%)"></div>${esc(t)}</div>`;
+  });
+  legendHTML += '</div>';
+  document.getElementById('legend').innerHTML = legendHTML;
+
+  // Stats
+  document.getElementById('stats').innerHTML = `Nodes: <span>${nodes.length}</span> · Edges: <span>${edges.length}</span>${returned < totalEdges ? ' · Total: <span>'+totalEdges+'</span>' : ''}`;
+
+  // Edge cap banner
+  if (returned < totalEdges) {
+    document.getElementById('banner').style.display = 'block';
+    document.getElementById('bannerText').textContent = `Showing ${returned.toLocaleString()} of ${totalEdges.toLocaleString()} total edges. Set max_edges higher to see more.`;
+    setTimeout(() => { document.getElementById('banner').style.display = 'none'; }, 6000);
+  }
+
+  function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+})();
+</script>
+</body>
+</html>

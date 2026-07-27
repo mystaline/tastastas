@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -20,7 +21,6 @@ import (
 	_ "turso.tech/database/tursogo"
 
 	"github.com/mystaline-dev/tastastas/internal/embed"
-	"github.com/mystaline-dev/tastastas/internal/llm"
 	_ "github.com/mystaline-dev/tastastas/internal/onboard"
 	mcpserver "github.com/mystaline-dev/tastastas/internal/mcp"
 	libsqlstore "github.com/mystaline-dev/tastastas/internal/store/libsql"
@@ -124,14 +124,13 @@ func main() {
 	}
 
 	serve := flag.String("serve", "", "run as HTTP server on given address (e.g. :8080)")
+	graphAddr := flag.String("graph-addr", "", "serve graph visualization page on this address (e.g. :9292) — works in both stdio and HTTP mode")
 	dbPath := flag.String("db", defaultDBPath(), "path to SQLite database file (default: $XDG_DATA_HOME/tastastas/memory.db — cwd-independent so all projects share one source of truth)")
 	embedDim := flag.Int("embed-dim", 0, "embedding vector dimension (0 = auto-detect: 384 for sidecar, 768 for ollama)")
 	embedBackend := flag.String("embed-backend", "sidecar", "embedder backend: sidecar (baked ONNX, zero deps, 384-dim), ollama (HTTP, 768-dim default with nomic-embed-text), or none (lexical only)")
 	ollamaURL := flag.String("ollama-url", "http://localhost:11434", "Ollama base URL (used when --embed-backend=ollama)")
 	ollamaModel := flag.String("ollama-model", "nomic-embed-text", "Ollama embedding model (used when --embed-backend=ollama)")
-	sidecarWorkers := flag.Int("sidecar-workers", 0, "number of sidecar workers (0 = NumCPU, only for --embed-backend=sidecar)")
-	llmURL := flag.String("llm-url", "http://localhost:11434", "Ollama base URL for Tier 1/3 linking (build_knowledge_graph)")
-	llmModel := flag.String("llm-model", "qwen3.5:2b-q4_K_M", "Ollama model for Tier 1/3 linking (build_knowledge_graph)")
+	sidecarWorkers := flag.Int("sidecar-workers", 0, "number of sidecar workers (0 = 4, only for --embed-backend=sidecar)")
 	authToken := flag.String("auth-token", "", "bearer token for HTTP server mode (empty = no auth)")
 	flag.Parse()
 
@@ -161,18 +160,28 @@ func main() {
 		log.Fatalf("open store: %v", err)
 	}
 
+	// Check for interrupted-run marker from previous run.
+	if hasMarker, mErr := db.HasJobMarker(context.Background()); mErr == nil && hasMarker {
+		log.Println("WARNING: previous ingest/onboard was interrupted. Re-run to complete. Ingest is idempotent (upsert + content-hash skip), so re-running is safe.")
+	}
+
 	embedder := newEmbedder(*embedBackend, *ollamaURL, *ollamaModel, *sidecarWorkers)
 	closeEmbedder := func() {
 		if closer, ok := embedder.(interface{ Close() error }); ok {
 			_ = closer.Close()
 		}
 	}
-
-	llmEndpoint := *llmURL
-	if llmEndpoint == "" {
-		llmEndpoint = *ollamaURL
+	// Start graph HTTP server if requested (works alongside stdio MCP or HTTP mode).
+	if *graphAddr != "" {
+		go func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET /graph/{project}", mcpserver.HandleGraphView(db))
+			log.Printf("graph server listening on %s", *graphAddr)
+			if err := http.ListenAndServe(*graphAddr, mux); err != nil {
+				log.Printf("graph server: %v", err)
+			}
+		}()
 	}
-	llmClient := llm.NewOllama(llmEndpoint, *llmModel)
 
 	if *serve != "" {
 		// HTTP server mode
@@ -188,7 +197,7 @@ func main() {
 	}
 
 	// Stdio MCP server mode (default)
-	srv := mcpserver.NewServer(db, embedder, llmClient)
+	srv := mcpserver.NewServer(db, embedder)
 	if err := srv.Run(context.Background(), &mcpsdk.StdioTransport{}); err != nil {
 		db.Close() // close before os.Exit
 		closeEmbedder()

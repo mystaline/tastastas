@@ -567,29 +567,141 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 		return toolResult, output, nil
 	})
 
-	// Tool 10: build_knowledge_graph — async
-	if llmClient != nil {
-		mcp.AddTool(srv, &mcp.Tool{
-			Name: "build_knowledge_graph", Description: "Run full linking pipeline (Tier 1/2/3) on an already-ingested project. Background job, returns job_id.",
-		}, func(ctx context.Context, req *mcp.CallToolRequest, args BuildGraphInput) (*mcp.CallToolResult, BuildGraphOutput, error) {
-			projectID := args.ProjectID
-			if projectID == "" {
-				projectID = "default"
-			}
+	// Tool 10: query_graph - synchronous
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "query_graph",
+		Description: "Query graph edges from/to a node. Returns typed relationships: who calls this function, what this doc references, etc. Use after recall to explore connections.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args QueryGraphInput) (*mcp.CallToolResult, QueryGraphOutput, error) {
+		if args.NodeID == "" {
+			return errorResult(fmt.Errorf("node_id is required")), QueryGraphOutput{}, nil
+		}
 
-			state := jobs.runBuildGraph(context.Background(), projectID, db, embedder, llmClient)
+		outgoing, incoming := true, true
+		switch args.Direction {
+		case "outgoing":
+			incoming = false
+		case "incoming":
+			outgoing = false
+		}
 
-			output := BuildGraphOutput{JobID: state.ID, Status: state.Status, StartedAt: state.StartedAt}
-			toolResult := &mcp.CallToolResult{
-				Content: []mcp.Content{
-					&mcp.TextContent{
-						Text: marshalJSON(output),
-					},
-				},
+		limit := args.Limit
+		if limit <= 0 {
+			limit = 20
+		}
+
+		srcTitle := ""
+		if src, err := db.GetNode(ctx, args.NodeID); err == nil {
+			srcTitle = src.Title
+		}
+
+		var results []EdgeResult
+
+		if outgoing {
+			edges, err := db.GetEdgesFrom(ctx, args.NodeID, args.EdgeTypes)
+			if err == nil {
+				for _, e := range edges {
+					title, ntype := resolveNodeMeta(ctx, db, e.ToID)
+					results = append(results, EdgeResult{
+						Direction:  "outgoing",
+						NodeID:     e.ToID,
+						NodeTitle:  title,
+						NodeType:   ntype,
+						EdgeType:   e.EdgeType,
+						Confidence: e.Confidence,
+					})
+				}
 			}
-			return toolResult, output, nil
-		})
-	}
+		}
+
+		if incoming {
+			edges, err := db.GetEdgesTo(ctx, args.NodeID, args.EdgeTypes)
+			if err == nil {
+				for _, e := range edges {
+					title, ntype := resolveNodeMeta(ctx, db, e.FromID)
+					results = append(results, EdgeResult{
+						Direction:  "incoming",
+						NodeID:     e.FromID,
+						NodeTitle:  title,
+						NodeType:   ntype,
+						EdgeType:   e.EdgeType,
+						Confidence: e.Confidence,
+					})
+				}
+			}
+		}
+
+		sortOutgoingFirst(results)
+
+		if len(results) > limit {
+			results = results[:limit]
+		}
+
+		output := QueryGraphOutput{NodeID: args.NodeID, Title: srcTitle, Edges: results}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(output)}},
+		}, output, nil
+	})
+
+	// Tool 11: project_graph - synchronous, macro-level visualization data
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "project_graph",
+		Description: "Return all edges and deduplicated nodes for a project, for macro-level graph visualization. By default excludes proposed edges and caps at 5000 edges.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args ProjectGraphInput) (*mcp.CallToolResult, ProjectGraphOutput, error) {
+		projectID := args.ProjectID
+		if projectID == "" {
+			projectID = "default"
+		}
+		maxEdges := args.MaxEdges
+		if maxEdges <= 0 {
+			maxEdges = 5000
+		}
+		edgeTypes := args.EdgeTypes
+
+		// Default: structural + auto-linked (exclude proposed).
+		if len(edgeTypes) == 0 {
+			edgeTypes = []string{"specifies", "implements", "tests", "calls", "defines", "imports", "convention-member", "auto-linked", "references"}
+		}
+
+		results, total, err := db.ListEdgesByProject(ctx, projectID, edgeTypes, maxEdges, 0)
+		if err != nil {
+			return errorResult(err), ProjectGraphOutput{}, nil
+		}
+
+		// Deduplicate nodes from edge endpoints, count degree for weight.
+		nodeMap := map[string]*GraphNode{}
+		addNode := func(id, title, ntype, group string) {
+			if _, ok := nodeMap[id]; !ok {
+				nodeMap[id] = &GraphNode{ID: id, Title: title, Type: ntype, Group: group}
+			}
+			nodeMap[id].Weight++
+		}
+		edges := make([]GraphEdge, 0, len(results))
+		for _, r := range results {
+			addNode(r.FromID, r.FromTitle, r.FromType, r.FromGroup)
+			addNode(r.ToID, r.ToTitle, r.ToType, r.ToGroup)
+			edges = append(edges, GraphEdge{
+				Source: r.FromID, Target: r.ToID,
+				EdgeType: r.EdgeType, Confidence: r.Confidence,
+			})
+		}
+
+		nodes := make([]GraphNode, 0, len(nodeMap))
+		for _, n := range nodeMap {
+			nodes = append(nodes, *n)
+		}
+
+		out := ProjectGraphOutput{
+			ProjectID:  projectID,
+			TotalEdges: total,
+			Returned:   len(results),
+			Nodes:      nodes,
+			Edges:      edges,
+		}
+
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
+		}, out, nil
+	})
 
 	// Tool 11: job_status — poll any async job
 	mcp.AddTool(srv, &mcp.Tool{

@@ -7,15 +7,15 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/mystaline-dev/tastastas/internal/embed"
+	"github.com/mystaline-dev/tastastas/internal/onboard"
 	"github.com/mystaline-dev/tastastas/internal/store"
 )
 
-// ServeHTTP starts the HTTP server with MCP-over-HTTP + REST ingestion endpoints.
-// addr is the listen address (e.g. ":8080"). If authToken is non-empty, all
 // mutating endpoints require it via the Authorization: Bearer {token} header.
 // Empty token = no auth (open access — use behind VPN/SSH tunnel).
 func ServeHTTP(
@@ -24,7 +24,7 @@ func ServeHTTP(
 	embedder embed.EmbedderBackend,
 	addr, authToken string,
 ) error {
-	jobs := newJobStore()
+	jobs := newJobStore(db)
 
 	// MCP-over-HTTP via Streamable HTTP handler
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
@@ -32,7 +32,7 @@ func ServeHTTP(
 			Name:    "tastastas",
 			Version: "0.1.0",
 		}, nil)
-		registerTools(srv, db, embedder, nil)
+		registerTools(srv, db, embedder)
 		return srv
 	}, nil)
 
@@ -41,8 +41,11 @@ func ServeHTTP(
 	// MCP endpoint — all MCP protocol traffic
 	mux.Handle("/mcp", mcpHandler)
 
-	// REST ingestion endpoints — POST /ingest/{adapter} dispatches to
-	// docwalk, gitrepo, or obsidian.
+	// Graph visualization — GET /graph/{project}
+	mux.HandleFunc("GET /graph/{project}", HandleGraphView(db))
+
+	// REST ingestion — POST /ingest auto-detects adapters.
+	mux.HandleFunc("POST /ingest", handleIngest(db, embedder, jobs))
 	mux.HandleFunc("POST /ingest/{adapter}", handleIngest(db, embedder, jobs))
 	mux.HandleFunc("GET /ingest/jobs/{id}", handleIngestJobStatus(jobs))
 	mux.HandleFunc("POST /ingest/webhook", handleIngestWebhook(db))
@@ -55,7 +58,7 @@ func ServeHTTP(
 
 	log.Printf("tastastas HTTP server listening on %s", addr)
 	log.Printf("  MCP endpoint:   %s/mcp", addr)
-	log.Printf("  Ingest:         %s/ingest/{docwalk,gitrepo,obsidian}", addr)
+	log.Printf("  Ingest:         %s/ingest", addr)
 	log.Printf("  Webhook:        %s/ingest/webhook", addr)
 
 	var handler http.Handler = mux
@@ -125,59 +128,58 @@ func bearerMatches(r *http.Request, token string) bool {
 // GET /ingest/jobs/{job_id} for completion.
 func handleIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		adapter := r.PathValue("adapter")
 		var req struct {
-			Root       string `json:"root"`
-			ConfigPath string `json:"config_path"`
-			ProjectID  string `json:"project_id"`
+			Root      string `json:"root"`
+			ProjectID string `json:"project_id"`
 		}
 		body, _ := io.ReadAll(r.Body)
 		if err := json.Unmarshal(body, &req); err != nil {
 			http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
 			return
 		}
+		projectID := req.ProjectID
+		if projectID == "" {
+			projectID = "default"
+		}
+		root := req.Root
+		if root == "" {
+			http.Error(w, `{"error":"root is required"}`, http.StatusBadRequest)
+			return
+		}
 
 		job := jobs.create()
 		jobs.runAsync(job, func(ctx context.Context) (int, int, int, error) {
-			nodes, edges, filesWalked, filesSkipped, err := runIngestAdapter(
-				adapter,
-				req.Root,
-				req.ConfigPath,
-				req.ProjectID,
-			)
+			nodes, edges, _, filesWalked, filesSkipped, err := onboard.AutoDetectAdapters(ctx, db, root, projectID)
 			if err != nil {
-				return 0, 0, 0, fmt.Errorf("ingest: %w", err)
+				return 0, 0, 0, fmt.Errorf("detect adapters: %w", err)
 			}
-
-			// Walk phase done — push progress immediately so poll shows
-			// files_walked/files_skipped while embedding churns in background.
 			jobs.updateCounts(job.ID, filesWalked, filesSkipped)
-
 			for i := range nodes {
 				if err := db.UpsertNode(ctx, nodes[i]); err != nil {
 					return 0, 0, 0, fmt.Errorf("upsert node: %w", err)
 				}
 			}
-
 			for i := range edges {
 				if err := db.UpsertEdge(ctx, edges[i]); err != nil {
 					return 0, 0, 0, fmt.Errorf("upsert edge: %w", err)
 				}
 			}
-
 			chunkCount, err := chunkAndEmbedNodes(
-				ctx,
-				db,
-				embedder,
-				nodes,
-				func(n int) {
-					jobs.updateChunksEmbedded(job.ID, n)
-				},
+				ctx, db, embedder, nodes,
+				func(embedded, total int) { jobs.updateChunksEmbedded(job.ID, embedded, total) },
+				func() { jobs.updatePhase(job.ID, "persisting") },
 			)
 			if err != nil {
 				return 0, 0, 0, fmt.Errorf("chunk/embed: %w", err)
 			}
-
+			convNodes := onboard.InferConventions(ctx, db, projectID, nodes)
+			for _, cn := range convNodes {
+				_ = db.UpsertNode(ctx, cn)
+			}
+			nodes = append(nodes, convNodes...)
+			auto, proposals := onboard.Tier2ScoreAndLink(ctx, db, projectID, nodes)
+			_ = auto
+			_ = proposals
 			return len(nodes), len(edges), chunkCount, nil
 		})
 
@@ -275,5 +277,115 @@ func handleIngestWebhook(db store.Store) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"ingested":%d}`, ingested)
+	}
+}
+
+// handleGraphView serves the interactive graph visualization page.
+func HandleGraphView(db store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		projectID := r.PathValue("project")
+		if projectID == "" {
+			projectID = "default"
+		}
+
+		// Collect edges: structural + auto-linked.
+		edgeTypes := []string{
+			"specifies",
+			"implements",
+			"tests",
+			"calls",
+			"defines",
+			"imports",
+			"convention-member",
+			"auto-linked",
+			"references",
+			"contains",
+		}
+		maxEdges := 500 // default: 500 edges is enough for a useful graph; full project may have 50k+
+		if m := r.URL.Query().Get("max_edges"); m != "" {
+			if v, err := strconv.Atoi(m); err == nil && v > 0 {
+				maxEdges = v
+			}
+		}
+		results, total, err := db.ListEdgesByProject(r.Context(), projectID, edgeTypes, maxEdges, 0)
+		if err != nil {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+			return
+		}
+
+		// Build deduplicated node list with degree weight.
+		nodeMap := map[string]*struct {
+			id, title, ntype, group string
+			weight                  int
+		}{}
+		addNode := func(id, title, ntype, group string) {
+			if _, ok := nodeMap[id]; !ok {
+				nodeMap[id] = &struct {
+					id, title, ntype, group string
+					weight                  int
+				}{id: id, title: title, ntype: ntype, group: group}
+			}
+			nodeMap[id].weight++
+		}
+		type graphNode struct {
+			ID     string `json:"id"`
+			Title  string `json:"title"`
+			Type   string `json:"type"`
+			Group  string `json:"group"`
+			Weight int    `json:"weight"`
+		}
+		type graphEdge struct {
+			Source     string  `json:"source"`
+			Target     string  `json:"target"`
+			EdgeType   string  `json:"edge_type"`
+			Confidence float64 `json:"confidence"`
+		}
+		nodes := []graphNode{}
+		edges := []graphEdge{}
+		for _, r := range results {
+			addNode(r.FromID, r.FromTitle, r.FromType, r.FromGroup)
+			addNode(r.ToID, r.ToTitle, r.ToType, r.ToGroup)
+			edges = append(edges, graphEdge{
+				Source: r.FromID, Target: r.ToID,
+				EdgeType: r.EdgeType, Confidence: r.Confidence,
+			})
+		}
+		for _, n := range nodeMap {
+			nodes = append(nodes, graphNode{
+				ID: n.id, Title: n.title, Type: n.ntype, Group: n.group, Weight: n.weight,
+			})
+		}
+
+		data := struct {
+			ProjectID  string      `json:"project_id"`
+			TotalEdges int         `json:"total_edges"`
+			Returned   int         `json:"returned"`
+			Nodes      []graphNode `json:"nodes"`
+			Edges      []graphEdge `json:"edges"`
+		}{
+			ProjectID:  projectID,
+			TotalEdges: total,
+			Returned:   len(results),
+			Nodes:      nodes,
+			Edges:      edges,
+		}
+
+		jsonBytes, err := json.Marshal(data)
+		if err != nil {
+			http.Error(w, `{"error":"marshal"}`, http.StatusInternalServerError)
+			return
+		}
+
+		accept := r.Header.Get("Accept")
+		if strings.Contains(accept, "application/json") {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(jsonBytes)
+			return
+		}
+
+		// Serve HTML
+		page := strings.Replace(graphPageSource, "__DATA__", string(jsonBytes), 1)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(page))
 	}
 }
