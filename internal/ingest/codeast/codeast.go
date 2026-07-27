@@ -127,22 +127,51 @@ func (c *CodeastIngestor) ingestGo() ([]store.Node, []store.Edge, error) {
 			switch o := obj.(type) {
 			case *types.Func:
 				if o.Pkg() == pkg.Types { // only functions defined in this package
-					nodes = append(nodes, c.makeFuncNode(pkg, ident.Name, o))
+					// Skip interface method declarations (no body, Recv().Underlying()
+					// belongs to the interface, not a concrete type) — they're not
+					// separately-callable symbols and would collide with the
+					// concrete type's method of the same name.
+					if isInterfaceMethod(o) {
+						continue
+					}
+					n := c.makeFuncNode(pkg, ident.Name, o)
+					nodes = append(nodes, n)
+					edges = append(edges, store.Edge{
+						FromID: pkgNodeID, ToID: n.ID,
+						EdgeType: "defines", Confidence: 1.0,
+					})
 				}
 			case *types.TypeName:
 				if o.Pkg() == pkg.Types { // only types defined in this package
-					nodes = append(nodes, c.makeTypeNode(pkg, ident.Name, o))
+					n := c.makeTypeNode(pkg, ident.Name, o)
+					nodes = append(nodes, n)
+					edges = append(edges, store.Edge{
+						FromID: pkgNodeID, ToID: n.ID,
+						EdgeType: "defines", Confidence: 1.0,
+					})
 				}
 			}
 		}
 
-		// Extract call edges
+		// Extract call edges — resolve each FuncDecl's *types.Func via
+		// TypesInfo.Defs so the from-ID matches makeFuncNode's qualified
+		// (receiver-aware) naming exactly.
 		for _, file := range pkg.Syntax {
 			for _, decl := range file.Decls {
-				if fn, ok := decl.(*ast.FuncDecl); ok {
-					fnID := c.funcNodeID(pkg, fn.Name.Name)
-					c.extractCalls(pkg, fn, fnID, &edges)
+				fnDecl, ok := decl.(*ast.FuncDecl)
+				if !ok {
+					continue
 				}
+				fnObj, ok := pkg.TypesInfo.Defs[fnDecl.Name]
+				if !ok || fnObj == nil {
+					continue
+				}
+				fn, ok := fnObj.(*types.Func)
+				if !ok {
+					continue
+				}
+				fnID := c.funcNodeID(pkg, funcQualifiedName(fn))
+				c.extractCalls(pkg, fnDecl, fnID, &edges)
 			}
 		}
 
@@ -159,44 +188,42 @@ func (c *CodeastIngestor) ingestGo() ([]store.Node, []store.Edge, error) {
 		}
 	}
 
-	// Define edges from package to symbols
-	for _, n := range nodes {
-		// Format: "{projectID}/code:function/{pkgpath}.{name}" or "{projectID}/code:type/{pkgpath}.{name}"
-		// We need to find the matching package node.
-		var symType, rest string
-		switch {
-		case strings.HasPrefix(n.ID, c.cfg.ProjectID+"/code:function/"):
-			symType = "code:function/"
-			rest = strings.TrimPrefix(n.ID, c.cfg.ProjectID+"/code:function/")
-		case strings.HasPrefix(n.ID, c.cfg.ProjectID+"/code:type/"):
-			symType = "code:type/"
-			rest = strings.TrimPrefix(n.ID, c.cfg.ProjectID+"/code:type/")
-		default:
-			continue
-		}
-		_ = symType
-
-		// rest is "{pkgpath}.{name}" — split off last segment as name
-		idx := strings.LastIndex(rest, ".")
-		if idx < 0 {
-			continue
-		}
-		pkgPath := rest[:idx]
-		if pkgNodeID, ok := pkgNodes[pkgPath]; ok {
-			edges = append(edges, store.Edge{
-				FromID:     pkgNodeID,
-				ToID:       n.ID,
-				EdgeType:   "defines",
-				Confidence: 1.0,
-			})
-		}
-	}
-
 	return nodes, edges, nil
 }
 
+// funcQualifiedName returns a name unique within a package even when
+// methods on different receiver types share a name (Close, String, Error,
+// ...). Plain functions return just fn.Name(); methods return
+// "{RecvType}.{MethodName}" with any pointer "*" stripped.
+func funcQualifiedName(fn *types.Func) string {
+	sig, ok := fn.Type().(*types.Signature)
+	if !ok || sig.Recv() == nil {
+		return fn.Name()
+	}
+	recvType := sig.Recv().Type().String()
+	if idx := strings.LastIndexByte(recvType, '.'); idx >= 0 {
+		recvType = recvType[idx+1:] // strip package qualifier if any
+	}
+	recvType = strings.TrimPrefix(recvType, "*")
+	return recvType + "." + fn.Name()
+}
+
+// isInterfaceMethod reports whether fn is an interface method declaration
+// (no concrete receiver — the receiver type's underlying type is itself an
+// interface). These aren't separately-callable symbols and would collide
+// with a concrete type's method of the same name if ingested.
+func isInterfaceMethod(fn *types.Func) bool {
+	sig, ok := fn.Type().(*types.Signature)
+	if !ok || sig.Recv() == nil {
+		return false
+	}
+	_, isIface := sig.Recv().Type().Underlying().(*types.Interface)
+	return isIface
+}
+
 func (c *CodeastIngestor) makeFuncNode(pkg *packages.Package, ident string, fn *types.Func) store.Node {
-	fnID := fmt.Sprintf("%s/code:function/%s.%s", c.cfg.ProjectID, pkg.PkgPath, fn.Name())
+	qname := funcQualifiedName(fn)
+	fnID := fmt.Sprintf("%s/code:function/%s.%s", c.cfg.ProjectID, pkg.PkgPath, qname)
 	sig := fn.Type().String()
 	doc := ""
 	var bodySrc string
@@ -204,30 +231,39 @@ func (c *CodeastIngestor) makeFuncNode(pkg *packages.Package, ident string, fn *
 	// TODO: use hashmap instean of iterating over all files for each function
 	for _, file := range pkg.Syntax {
 		for _, decl := range file.Decls {
-			if fnDecl, ok := decl.(*ast.FuncDecl); ok && fnDecl.Name.Name == fn.Name() {
-				if fnDecl.Doc != nil {
-					doc = fnDecl.Doc.Text()
-				}
-				if fnDecl.Body != nil && pkg.Fset != nil {
-					start := pkg.Fset.Position(fnDecl.Body.Pos()).Offset
-					end := pkg.Fset.Position(fnDecl.Body.End()).Offset
-					if start >= 0 && end > start {
-						// Read source bytes from the actual file
-						if src, err := os.ReadFile(pkg.Fset.Position(fnDecl.Pos()).Filename); err == nil {
-							if end <= len(src) {
-								bodySrc = string(src[start:end])
-							}
+			fnDecl, ok := decl.(*ast.FuncDecl)
+			if !ok || fnDecl.Name.Name != fn.Name() {
+				continue
+			}
+			// Match receiver too — a bare name match alone conflates
+			// distinct methods that share a name across types.
+			if !declMatchesReceiver(fnDecl, fn) {
+				continue
+			}
+			if fnDecl.Doc != nil {
+				doc = fnDecl.Doc.Text()
+			}
+			if fnDecl.Body != nil && pkg.Fset != nil {
+				start := pkg.Fset.Position(fnDecl.Body.Pos()).Offset
+				end := pkg.Fset.Position(fnDecl.Body.End()).Offset
+				if start >= 0 && end > start {
+					// Read source bytes from the actual file
+					if src, err := os.ReadFile(pkg.Fset.Position(fnDecl.Pos()).Filename); err == nil {
+						if end <= len(src) {
+							bodySrc = string(src[start:end])
 						}
 					}
 				}
-				break
 			}
+			break
 		}
 	}
 
-	content := fmt.Sprintf("func %s %s", fn.Name(), sig)
+	filePath := resolveGoFilePath(pkg, fn, c.cfg.Root)
+
+	content := fmt.Sprintf("func %s %s", qname, sig)
 	if bodySrc != "" {
-		content += " " + truncateBody(bodySrc)
+		content += " " + bodySrc
 	}
 	if doc != "" {
 		content += " // " + doc
@@ -236,12 +272,12 @@ func (c *CodeastIngestor) makeFuncNode(pkg *packages.Package, ident string, fn *
 		ID:            fnID,
 		ProjectID:     c.cfg.ProjectID,
 		NodeType:      "code:function",
-		Title:         fn.Name(),
+		Title:         qname,
 		Content:       content,
 		ContentHash:   "",
 		Status:        "current",
 		SourceAdapter: "codeast",
-		SourcePath:    pkg.PkgPath,
+		SourcePath:    filePath,
 		Language:      "go",
 		Importance:    0.7,
 	}
@@ -264,8 +300,42 @@ func (c *CodeastIngestor) makeTypeNode(pkg *packages.Package, ident string, tn *
 	}
 }
 
-func (c *CodeastIngestor) funcNodeID(pkg *packages.Package, fnName string) string {
-	return fmt.Sprintf("%s/code:function/%s.%s", c.cfg.ProjectID, pkg.PkgPath, fnName)
+// funcNodeID builds a function/method node ID from its already-qualified
+// name (see funcQualifiedName — includes "{RecvType}." prefix for methods).
+func (c *CodeastIngestor) funcNodeID(pkg *packages.Package, qualifiedName string) string {
+	return fmt.Sprintf("%s/code:function/%s.%s", c.cfg.ProjectID, pkg.PkgPath, qualifiedName)
+}
+
+// declMatchesReceiver reports whether an *ast.FuncDecl and a resolved
+// *types.Func refer to the same declaration, disambiguating same-named
+// methods on different receiver types (both may have fnDecl.Name.Name ==
+// fn.Name()). Plain functions (no receiver on either side) always match.
+func declMatchesReceiver(fnDecl *ast.FuncDecl, fn *types.Func) bool {
+	sig, ok := fn.Type().(*types.Signature)
+	if !ok || sig.Recv() == nil {
+		return fnDecl.Recv == nil
+	}
+	if fnDecl.Recv == nil || len(fnDecl.Recv.List) == 0 {
+		return false
+	}
+	declRecvName := recvTypeName(fnDecl.Recv.List[0].Type)
+	funcRecvName := strings.TrimPrefix(sig.Recv().Type().String(), "*")
+	if idx := strings.LastIndexByte(funcRecvName, '.'); idx >= 0 {
+		funcRecvName = funcRecvName[idx+1:]
+	}
+	return declRecvName == funcRecvName
+}
+
+// recvTypeName extracts the bare type name from a receiver's AST type
+// expression, stripping the leading "*" for pointer receivers.
+func recvTypeName(expr ast.Expr) string {
+	if star, ok := expr.(*ast.StarExpr); ok {
+		expr = star.X
+	}
+	if ident, ok := expr.(*ast.Ident); ok {
+		return ident.Name
+	}
+	return ""
 }
 
 func (c *CodeastIngestor) extractCalls(pkg *packages.Package, fn *ast.FuncDecl, fromID string, edges *[]store.Edge) {
@@ -277,7 +347,7 @@ func (c *CodeastIngestor) extractCalls(pkg *packages.Package, fn *ast.FuncDecl, 
 
 		// Resolve callee using TypesInfo
 		if callee := resolveCallee(pkg.TypesInfo, call); callee != nil {
-			toID := c.funcNodeID(pkg, callee.Name())
+			toID := c.funcNodeID(pkg, funcQualifiedName(callee))
 			*edges = append(*edges, store.Edge{
 				FromID:     fromID,
 				ToID:       toID,
@@ -289,13 +359,22 @@ func (c *CodeastIngestor) extractCalls(pkg *packages.Package, fn *ast.FuncDecl, 
 	})
 }
 
-const maxBodyLen = 4096
-
-func truncateBody(s string) string {
-	if len(s) <= maxBodyLen {
-		return s
+// resolveGoFilePath extracts the relative file path for a Go function node.
+func resolveGoFilePath(pkg *packages.Package, fn *types.Func, root string) string {
+	// iterate syntax files to find this function's position
+	for _, file := range pkg.Syntax {
+		for _, decl := range file.Decls {
+			if fnDecl, ok := decl.(*ast.FuncDecl); ok && fnDecl.Name.Name == fn.Name() && pkg.Fset != nil {
+				if f := pkg.Fset.Position(fnDecl.Pos()).Filename; f != "" {
+					if rel, err := filepath.Rel(root, f); err == nil {
+						return rel
+					}
+					return f
+				}
+			}
+		}
 	}
-	return s[:maxBodyLen] + "..."
+	return pkg.PkgPath
 }
 
 func resolveCallee(info *types.Info, call *ast.CallExpr) *types.Func {

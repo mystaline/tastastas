@@ -106,6 +106,76 @@ func (w *Widget) Show() {
 	}
 }
 
+// TestCodeastSameNamedMethodsDifferentReceivers is a regression test for
+// the duplicate-ID bug: two types in the same package each with a method
+// of the same name (Close) used to collide on the same node ID
+// "{pkgpath}.Close", silently dropping one method's node and later
+// tripping a UNIQUE constraint when both were chunked. Each method must
+// now get a distinct, receiver-qualified ID and its own "calls" edges.
+func TestCodeastSameNamedMethodsDifferentReceivers(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module testpkg\n\ngo 1.24\n"), 0644)
+	os.WriteFile(filepath.Join(dir, "db.go"), []byte(`package testpkg
+
+type DB struct{}
+
+func (d *DB) Close() error { return dbClose() }
+func dbClose() error { return nil }
+
+type Conn struct{}
+
+func (c *Conn) Close() error { return connClose() }
+func connClose() error { return nil }
+`), 0644)
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	db, err := sqlite.Open(context.Background(), dbPath, 8)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	cfg := Config{Root: dir, ProjectID: "test", Languages: []string{"go"}}
+	ingestor := New(db, cfg)
+	nodes, edges, err := ingestor.Ingest(context.Background())
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	wantIDs := []string{
+		"test/code:function/testpkg.DB.Close",
+		"test/code:function/testpkg.Conn.Close",
+	}
+	seen := map[string]int{}
+	for _, n := range nodes {
+		seen[n.ID]++
+	}
+	for _, id := range wantIDs {
+		if seen[id] != 1 {
+			t.Errorf("expected exactly one node %s, got %d", id, seen[id])
+		}
+	}
+
+	// Each Close() must call its own package-level helper — proves the
+	// call-edge "from" side also resolved to the receiver-qualified ID,
+	// not a shared bare-name ID.
+	wantCalls := map[string]string{
+		"test/code:function/testpkg.DB.Close":   "test/code:function/testpkg.dbClose",
+		"test/code:function/testpkg.Conn.Close": "test/code:function/testpkg.connClose",
+	}
+	gotCalls := map[string]string{}
+	for _, e := range edges {
+		if e.EdgeType == "calls" {
+			gotCalls[e.FromID] = e.ToID
+		}
+	}
+	for from, wantTo := range wantCalls {
+		if gotCalls[from] != wantTo {
+			t.Errorf("calls edge from %s: want to=%s, got to=%s", from, wantTo, gotCalls[from])
+		}
+	}
+}
+
 func TestCodeastUnsupportedLanguage(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 	db, err := sqlite.Open(context.Background(), dbPath, 8)
