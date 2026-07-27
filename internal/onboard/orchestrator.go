@@ -38,9 +38,11 @@ type Result struct {
 	ImportEdges         int
 	GenericDocs         int
 	ConventionsInferred int
+	HierarchyNodes      int
 	AutoLinked          int
 	ProposalsQueued     int
 	FilesWalked         int
+	FilesSkipped        int
 	DurationMs          int64
 	AllNodes            []store.Node // all nodes ingested during this run
 }
@@ -239,19 +241,35 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 
 	// Embedding
 	if cfg.Embedder != nil {
-		if err := embedNodes(ctx, db, allNodes, cfg.Embedder); err != nil {
+		if err := EmbedNodes(ctx, db, allNodes, cfg.Embedder); err != nil {
 			return Result{}, err
 		}
 	}
 
-	// inferConventions
-	convNodes := inferConventions(ctx, db, cfg.ProjectID, allNodes)
+	// InferConventions
+	convNodes := InferConventions(ctx, db, cfg.ProjectID, allNodes)
 	for _, n := range convNodes {
 		if err := db.UpsertNode(ctx, n); err != nil {
 			return Result{}, err
 		}
 	}
 	allNodes = append(allNodes, convNodes...)
+
+	// Directory hierarchy backbone: synthetic nodes connecting every real
+	// node up to a single repo-root node via "contains" edges. Purely
+	// additive, derived from SourcePath only — see hierarchy.go.
+	hierNodes, hierEdges := BuildHierarchy(cfg.ProjectID, allNodes)
+	for _, n := range hierNodes {
+		if err := db.UpsertNode(ctx, n); err != nil {
+			return Result{}, err
+		}
+	}
+	for _, e := range hierEdges {
+		if err := db.UpsertEdge(ctx, e); err != nil {
+			return Result{}, err
+		}
+	}
+	allNodes = append(allNodes, hierNodes...)
 
 	// Tier 2 inline linking
 	auto, queued := Tier2ScoreAndLink(ctx, db, cfg.ProjectID, allNodes)
@@ -265,11 +283,109 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 		ImportEdges:         countImportEdges(allEdges),
 		GenericDocs:         countGenericDocs(allNodes),
 		ConventionsInferred: len(convNodes),
+		HierarchyNodes:      len(hierNodes),
 		AutoLinked:          auto,
 		ProposalsQueued:     queued,
 		FilesWalked:         filesWalked,
+		FilesSkipped:        filesSkipped,
 		AllNodes:            allNodes,
 	}, nil
+}
+
+// AutoDetectAdapters runs all matching adapters concurrently against root,
+// returns merged nodes, edges, detected adapter names, and file count.
+// Used by both onboard.Run() and the MCP ingest tool.
+func AutoDetectAdapters(ctx context.Context, db store.Store, root, projectID string) (nodes []store.Node, edges []store.Edge, adapters []string, filesWalked, filesSkipped int, err error) {
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	type adapterResult struct {
+		name   string
+		nodes  []store.Node
+		edges  []store.Edge
+		walked int
+		err    error
+	}
+	ch := make(chan adapterResult, 5)
+
+	startAdapter := func(name string, fn func() ([]store.Node, []store.Edge, int, error)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			n, e, w, er := fn()
+			ch <- adapterResult{name: name, nodes: n, edges: e, walked: w, err: er}
+		}()
+	}
+
+	// ---- detection + dispatch ----
+
+	if hasCodeast(root) {
+		langs := detectLanguages(root)
+		startAdapter("codeast", func() ([]store.Node, []store.Edge, int, error) {
+			ca := codeast.New(db, codeast.Config{Root: root, ProjectID: projectID, Languages: langs})
+			n, e, caErr := ca.Ingest(ctx)
+			return n, e, countFiles(root, langs), caErr
+		})
+	}
+	if hasFile(root, "MEMORY.md") {
+		startAdapter("gitrepo", func() ([]store.Node, []store.Edge, int, error) {
+			n, gitErr := gitrepo.Ingest(gitrepo.Config{Root: root, ProjectID: projectID})
+			return n, nil, countMEMORYFiles(root), gitErr
+		})
+	}
+	if exists(filepath.Join(root, ".memoryrc.yaml")) {
+		startAdapter("docwalk", func() ([]store.Node, []store.Edge, int, error) {
+			cfg, loadErr := docwalk.LoadConfig(filepath.Join(root, ".memoryrc.yaml"))
+			if loadErr != nil {
+				return nil, nil, 0, fmt.Errorf("docwalk load config: %w", loadErr)
+			}
+			// Don't override cfg.ProjectID — docwalk's .memoryrc.yaml is the
+			// source of truth. The caller's projectID (which may be "default"
+			// if unset) would overwrite a meaningful name like
+			// "example-vault" and create mismatched node IDs. Non-
+			// docwalk adapters (codeast, gitrepo, obsidian, markdown-glob)
+			// don't have their own config, so they still receive the caller's
+			// projectID below.
+			n, e, w, _, dwErr := docwalk.Ingest(root, cfg)
+			return n, e, w, dwErr
+		})
+	}
+	if exists(filepath.Join(root, ".obsidian")) {
+		startAdapter("obsidian", func() ([]store.Node, []store.Edge, int, error) {
+			n, e, obErr := obsidian.Ingest(obsidian.Config{Root: root, ProjectID: projectID})
+			return n, e, countFiles(root, nil), obErr
+		})
+	}
+	// markdown-glob is docwalk's untyped fallback: skip it when .memoryrc.yaml
+	// exists, since docwalk already walks every .md file (typed via mappings,
+	// or generic-doc via its catch-all). Running both races two adapters over
+	// the same paths — same node ID, different node_type — and whichever
+	// finishes last wins the UpsertNode ON CONFLICT, silently discarding the
+	// configured type.
+	if hasMD(root) && !exists(filepath.Join(root, ".memoryrc.yaml")) {
+		startAdapter("markdown-glob", func() ([]store.Node, []store.Edge, int, error) {
+			n, mdErr := markdownglob.Ingest(markdownglob.Config{Root: root, ProjectID: projectID})
+			return n, nil, countFiles(root, nil), mdErr
+		})
+	}
+
+	// ---- collect ----
+	go func() { wg.Wait(); close(ch) }()
+
+	for r := range ch {
+		mu.Lock()
+		adapters = append(adapters, r.name)
+		filesWalked += r.walked
+		if r.err != nil {
+			err = r.err
+			mu.Unlock()
+			return // first adapter error fails fast
+		}
+		nodes = append(nodes, r.nodes...)
+		edges = append(edges, r.edges...)
+		mu.Unlock()
+	}
+	return
 }
 
 func hasCodeast(root string) bool {
@@ -327,7 +443,8 @@ func hasMD(root string) bool {
 	return found
 }
 
-func embedNodes(ctx context.Context, db store.Store, nodes []store.Node, emb embed.EmbedderBackend) error {
+// EmbedNodes batch-embeds node content.
+func EmbedNodes(ctx context.Context, db store.Store, nodes []store.Node, emb embed.EmbedderBackend) error {
 	const batchSize = 32
 	for i := 0; i < len(nodes); i += batchSize {
 		end := i + batchSize
@@ -340,7 +457,7 @@ func embedNodes(ctx context.Context, db store.Store, nodes []store.Node, emb emb
 		var texts []string
 		var idx []int
 		for j := range batch {
-			if batch[j].Content != "" {
+			if batch[j].Content != "" && batch[j].NodeType != "directory" {
 				texts = append(texts, batch[j].Content)
 				idx = append(idx, j)
 			}
@@ -364,7 +481,7 @@ func embedNodes(ctx context.Context, db store.Store, nodes []store.Node, emb emb
 	return nil
 }
 
-func inferConventions(ctx context.Context, db store.Store, projectID string, nodes []store.Node) []store.Node {
+func InferConventions(ctx context.Context, db store.Store, projectID string, nodes []store.Node) []store.Node {
 	// Collect code:function and code:type nodes
 	type codeSym struct {
 		node store.Node
@@ -558,6 +675,7 @@ func Tier2ScoreAndLink(ctx context.Context, db store.Store, projectID string, ne
 			io := identifierOverlap(a.Title, b.Title)
 
 			score := 0.4*cos + 0.2*tc + 0.2*pp + 0.2*io
+			score += templateCollisionPenalty(a, b)
 			if score < 0.55 {
 				continue
 			}
