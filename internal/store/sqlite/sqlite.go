@@ -306,6 +306,12 @@ func (s *Store) SearchVector(
 
 // UpsertChunks deletes any existing chunks for the same parent nodes,
 // then inserts the new chunks. This makes re-ingestion idempotent.
+// upsertChunkBatch inserts up to batchSize chunks + their vectors in a
+// single multi-row INSERT each. Using prepared statements here is slower
+// with modernc.org/sqlite — each ExecContext has overhead that dominates
+// at N > 100, even within a transaction.
+const upsertChunkBatch = 100
+
 func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 	if len(chunks) == 0 {
 		return nil
@@ -318,14 +324,12 @@ func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 		_ = tx.Rollback()
 	}()
 
-	// Delete existing chunks for these parents — use a single DELETE per table
-	// to avoid N+1 and ensure FK order (vectors first, then chunks).
+	// Delete existing chunks for these parents — single DELETE per table.
 	parentIDs := make(map[string]bool)
 	for _, c := range chunks {
 		parentIDs[c.ParentNodeID] = true
 	}
 	if len(parentIDs) > 0 {
-		// Build IN clause
 		placeholders := make([]string, 0, len(parentIDs))
 		args := make([]any, 0, len(parentIDs))
 		for pid := range parentIDs {
@@ -334,20 +338,13 @@ func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 		}
 		inClause := strings.Join(placeholders, ",")
 
-		// Delete vectors first (FK to chunks.id)
-		_, err = tx.ExecContext(
-			ctx,
-			fmt.Sprintf(
-				`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE parent_node_id IN (%s))`,
-				inClause,
-			),
+		_, err = tx.ExecContext(ctx,
+			fmt.Sprintf(`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE parent_node_id IN (%s))`, inClause),
 			args...,
 		)
 		if err != nil {
 			return fmt.Errorf("sqlite: delete old chunk vectors: %w", err)
 		}
-
-		// Delete chunks
 		_, err = tx.ExecContext(ctx,
 			fmt.Sprintf(`DELETE FROM chunks WHERE parent_node_id IN (%s)`, inClause),
 			args...,
@@ -357,39 +354,72 @@ func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 		}
 	}
 
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO chunks (id, parent_node_id, chunk_index, chunk_type, heading_path, content, language)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		return fmt.Errorf("sqlite: prepare chunk insert: %w", err)
-	}
-	defer stmt.Close()
+	chunkCols := "(id, parent_node_id, chunk_index, chunk_type, heading_path, content, language, source_adapter, prev_chunk_id, next_chunk_id)"
 
-	vecStmt, err := tx.PrepareContext(ctx, `INSERT INTO chunk_vectors (chunk_id, embedding) VALUES (?, vec_f32(?))`)
-	if err != nil {
-		return fmt.Errorf("sqlite: prepare chunk vector insert: %w", err)
-	}
-	defer vecStmt.Close()
+	for i := 0; i < len(chunks); i += upsertChunkBatch {
+		end := i + upsertChunkBatch
+		if end > len(chunks) {
+			end = len(chunks)
+		}
+		batch := chunks[i:end]
 
-	for _, c := range chunks {
-		headingJSON, _ := json.Marshal(c.HeadingPath)
-		_, err := stmt.ExecContext(ctx,
-			c.ID, c.ParentNodeID, c.ChunkIndex, c.Type, string(headingJSON), c.Content, c.Language,
+		// Multi-row INSERT for chunks with ON CONFLICT to handle re-ingestion idempotency.
+		// The UNIQUE constraint is on (parent_node_id, chunk_index) — use DO UPDATE to
+		// replace content/heading_path/language when the same chunk slot is reused.
+		var chunkValStrings []string
+		var chunkArgs []any
+		for _, c := range batch {
+			headingJSON, _ := json.Marshal(c.HeadingPath)
+			chunkValStrings = append(chunkValStrings, "(?,?,?,?,?,?,?,?,?,?)")
+			chunkArgs = append(chunkArgs, c.ID, c.ParentNodeID, c.ChunkIndex, c.Type, string(headingJSON), c.Content, c.Language, c.SourceAdapter, c.PrevChunkID, c.NextChunkID)
+		}
+		_, err = tx.ExecContext(ctx,
+			fmt.Sprintf(`
+				INSERT INTO chunks %s VALUES %s
+				ON CONFLICT(parent_node_id, chunk_index) DO UPDATE SET
+					id             = excluded.id,
+					chunk_type     = excluded.chunk_type,
+					heading_path   = excluded.heading_path,
+					content        = excluded.content,
+					language       = excluded.language,
+					source_adapter = excluded.source_adapter,
+					created_at     = strftime('%%Y-%%m-%%dT%%H:%%M:%%fZ','now')
+			`, chunkCols, strings.Join(chunkValStrings, ",")),
+			chunkArgs...,
 		)
 		if err != nil {
-			return fmt.Errorf("sqlite: insert chunk %s: %w", c.ID, err)
+			return fmt.Errorf("sqlite: insert chunk batch %d-%d: %w", i, end, err)
 		}
-		if len(c.Embedding) > 0 {
+
+		// Multi-row INSERT for chunk_vectors with ON CONFLICT (chunk_id is PRIMARY KEY)
+		var vecValStrings []string
+		var vecArgs []any
+		for _, c := range batch {
+			if len(c.Embedding) == 0 {
+				continue
+			}
 			if len(c.Embedding) != s.dim {
-				return fmt.Errorf("sqlite: chunk %s embedding has dim %d, store configured for dim %d",
-					c.ID, len(c.Embedding), s.dim)
+				return fmt.Errorf("sqlite: chunk %s embedding has dim %d, store configured for dim %d", c.ID, len(c.Embedding), s.dim)
 			}
 
 			vecJSON, _ := json.Marshal(c.Embedding)
-			_, err := vecStmt.ExecContext(ctx, c.ID, string(vecJSON))
-			if err != nil {
-				return fmt.Errorf("sqlite: insert chunk vector %s: %w", c.ID, err)
+			vecValStrings = append(vecValStrings, "(?, vec_f32(?))")
+			vecArgs = append(vecArgs, c.ID, string(vecJSON))
+		}
+		if len(vecValStrings) > 0 {
+			for _, c := range batch {
+				if len(c.Embedding) == 0 {
+					continue
+				}
+				vecJSON, _ := json.Marshal(c.Embedding)
+				_, err = tx.ExecContext(ctx, `DELETE FROM chunk_vectors WHERE chunk_id = ?`, c.ID)
+				if err != nil {
+					return fmt.Errorf("sqlite: delete chunk vector %s: %w", c.ID, err)
+				}
+				_, err = tx.ExecContext(ctx, `INSERT INTO chunk_vectors (chunk_id, embedding) VALUES (?, vec_f32(?))`, c.ID, string(vecJSON))
+				if err != nil {
+					return fmt.Errorf("sqlite: insert chunk vector %s: %w", c.ID, err)
+				}
 			}
 		}
 	}

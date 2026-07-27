@@ -125,7 +125,10 @@ func (s *Store) initSchema(ctx context.Context) error {
 			chunk_type    TEXT NOT NULL,
 			heading_path  TEXT NOT NULL DEFAULT '[]',
 			content       TEXT NOT NULL,
-			language      TEXT NOT NULL DEFAULT ''
+			language      TEXT NOT NULL DEFAULT '',
+			source_adapter TEXT NOT NULL DEFAULT '',
+			prev_chunk_id TEXT NOT NULL DEFAULT '',
+			next_chunk_id TEXT NOT NULL DEFAULT ''
 		)
 	`)
 	if err != nil {
@@ -344,7 +347,7 @@ func (s *Store) SearchLexical(ctx context.Context, projectID, query string, limi
 	var out []store.ScoredNode
 	for rows.Next() {
 		var sn store.ScoredNode
-		if err := rows.Scan(&sn.ID, &sn.ProjectID, &sn.NodeType, &sn.Title, &sn.Content, &sn.ContentHash, &sn.Status, &sn.SourceAdapter, &sn.SourcePath, &sn.Importance, &sn.Language, &sn.CreatedAt, &sn.UpdatedAt, &sn.Score); err != nil {
+		if err := rows.Scan(&sn.ID, &sn.ProjectID, &sn.NodeType, &sn.Title, &sn.Content, &sn.ContentHash, &sn.Status, &sn.SourceAdapter, &sn.SourcePath, &sn.Importance, &sn.Language, &sn.CreatedAt, &sn.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("libsql: scan scored node: %w", err)
 		}
 		out = append(out, sn)
@@ -401,7 +404,9 @@ func (s *Store) SearchVector(
 	return out, rows.Err()
 }
 
-// UpsertChunks deletes existing chunks for parents and inserts new ones.
+// upsertChunkBatch — same constant as sqlite implementation.
+const upsertChunkBatch = 100
+
 func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 	if len(chunks) == 0 {
 		return nil
@@ -427,7 +432,6 @@ func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 		}
 		inClause := strings.Join(placeholders, ",")
 
-		// Delete vectors first (FK to chunks.id)
 		_, err = tx.ExecContext(
 			ctx,
 			fmt.Sprintf(
@@ -440,7 +444,6 @@ func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 			return fmt.Errorf("libsql: delete old chunk vectors: %w", err)
 		}
 
-		// Delete chunks
 		_, err = tx.ExecContext(ctx,
 			fmt.Sprintf(`DELETE FROM chunks WHERE parent_node_id IN (%s)`, inClause),
 			args...,
@@ -450,40 +453,57 @@ func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 		}
 	}
 
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO chunks (id, parent_node_id, chunk_index, chunk_type, heading_path, content, language)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		return fmt.Errorf("libsql: prepare chunk insert: %w", err)
-	}
+	chunkCols := "(id, parent_node_id, chunk_index, chunk_type, heading_path, content, language, source_adapter, prev_chunk_id, next_chunk_id)"
 
-	defer stmt.Close()
+	for i := 0; i < len(chunks); i += upsertChunkBatch {
+		end := i + upsertChunkBatch
+		if end > len(chunks) {
+			end = len(chunks)
+		}
+		batch := chunks[i:end]
 
-	vecStmt, err := tx.PrepareContext(ctx, `INSERT INTO chunk_vectors (chunk_id, embedding) VALUES (?, vec_f32(?))`)
-	if err != nil {
-		return fmt.Errorf("libsql: prepare chunk vector insert: %w", err)
-	}
-
-	defer vecStmt.Close()
-
-	for _, c := range chunks {
-		headingJSON, _ := json.Marshal(c.HeadingPath)
-		_, err := stmt.ExecContext(
-			ctx,
-			c.ID,
-			c.ParentNodeID,
-			c.ChunkIndex,
-			c.Type,
-			string(headingJSON),
-			c.Content,
-			c.Language,
+		var chunkValStrings []string
+		var chunkArgs []any
+		for _, c := range batch {
+			headingJSON, _ := json.Marshal(c.HeadingPath)
+			chunkValStrings = append(chunkValStrings, "(?,?,?,?,?,?,?,?,?,?)")
+			chunkArgs = append(
+				chunkArgs,
+				c.ID,
+				c.ParentNodeID,
+				c.ChunkIndex,
+				c.Type,
+				string(headingJSON),
+				c.Content,
+				c.Language,
+				c.SourceAdapter,
+				c.PrevChunkID,
+				c.NextChunkID,
+			)
+		}
+		_, err = tx.ExecContext(ctx,
+			fmt.Sprintf(`
+				INSERT INTO chunks %s VALUES %s
+				ON CONFLICT(parent_node_id, chunk_index) DO UPDATE SET
+					id           = excluded.id,
+					chunk_type   = excluded.chunk_type,
+					heading_path = excluded.heading_path,
+					content      = excluded.content,
+					language     = excluded.language,
+					created_at   = strftime('%%Y-%%m-%%dT%%H:%%M:%%fZ','now')
+			`, chunkCols, strings.Join(chunkValStrings, ",")),
+			chunkArgs...,
 		)
 		if err != nil {
-			return fmt.Errorf("libsql: insert chunk %s: %w", c.ID, err)
+			return fmt.Errorf("libsql: insert chunk batch %d-%d: %w", i, end, err)
 		}
 
-		if len(c.Embedding) > 0 {
+		var vecValStrings []string
+		var vecArgs []any
+		for _, c := range batch {
+			if len(c.Embedding) == 0 {
+				continue
+			}
 			if len(c.Embedding) != s.dim {
 				return fmt.Errorf(
 					"libsql: chunk %s embedding has dim %d, store configured for dim %d",
@@ -492,11 +512,29 @@ func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 					s.dim,
 				)
 			}
-
 			vecJSON, _ := json.Marshal(c.Embedding)
-			_, err := vecStmt.ExecContext(ctx, c.ID, string(vecJSON))
-			if err != nil {
-				return fmt.Errorf("libsql: insert chunk vector %s: %w", c.ID, err)
+			vecValStrings = append(vecValStrings, "(?, vec_f32(?))")
+			vecArgs = append(vecArgs, c.ID, string(vecJSON))
+		}
+		if len(vecValStrings) > 0 {
+			for _, c := range batch {
+				if len(c.Embedding) == 0 {
+					continue
+				}
+				vecJSON, _ := json.Marshal(c.Embedding)
+				_, err = tx.ExecContext(ctx, `DELETE FROM chunk_vectors WHERE chunk_id = ?`, c.ID)
+				if err != nil {
+					return fmt.Errorf("libsql: delete chunk vector %s: %w", c.ID, err)
+				}
+				_, err = tx.ExecContext(
+					ctx,
+					`INSERT INTO chunk_vectors (chunk_id, embedding) VALUES (?, vec_f32(?))`,
+					c.ID,
+					string(vecJSON),
+				)
+				if err != nil {
+					return fmt.Errorf("libsql: insert chunk vector %s: %w", c.ID, err)
+				}
 			}
 		}
 	}

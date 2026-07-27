@@ -7,10 +7,26 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 )
 
 // ErrNotFound is returned by GetNode when the id doesn't exist.
 var ErrNotFound = errors.New("node not found")
+
+// DisplayName derives a human-readable label from a node ID when the node
+// itself wasn't ingested (stdlib symbols, cross-project refs — GetNode misses).
+// IDs look like "proj/code:function/pkg/path.Qualified.Name"; the last
+// slash-segment ("path.Qualified.Name") is the useful part. Falls back to the
+// whole id if there's no slash.
+func DisplayName(id string) string {
+	if id == "" {
+		return ""
+	}
+	if i := strings.LastIndex(id, "/"); i >= 0 && i < len(id)-1 {
+		return id[i+1:]
+	}
+	return id
+}
 
 // Node is a typed unit of memory: a doc, repo, service, extracted fact, etc.
 type Node struct {
@@ -54,6 +70,9 @@ type Chunk struct {
 	HeadingPath  []string
 	Content      string
 	Language     string
+	SourceAdapter string // populated from parent node during chunking
+	PrevChunkID  string // empty for first chunk
+	NextChunkID  string // empty for last chunk
 	Embedding    []float32
 }
 

@@ -190,13 +190,14 @@ func chunkForNode(
 		result := make([]store.Chunk, len(chunks))
 		for i, c := range chunks {
 			result[i] = store.Chunk{
-				ID:           c.ID,
-				ParentNodeID: c.ParentNodeID,
-				ChunkIndex:   c.ChunkIndex,
-				Type:         string(c.Type),
-				HeadingPath:  c.HeadingPath,
-				Content:      c.Content,
-				Language:     c.Language,
+				ID:            c.ID,
+				ParentNodeID:  c.ParentNodeID,
+				ChunkIndex:    c.ChunkIndex,
+				Type:          string(c.Type),
+				HeadingPath:   c.HeadingPath,
+				Content:       c.Content,
+				Language:      c.Language,
+				SourceAdapter: n.SourceAdapter,
 			}
 		}
 		return result
@@ -205,7 +206,7 @@ func chunkForNode(
 		if goLang != nil {
 			chunks, err := chunker.ChunkGoCode(n.ID, n.Content, goLang, cfg)
 			if err == nil && len(chunks) > 0 {
-				return chunkSlice(chunks)
+				return chunkSlice(chunks, n.SourceAdapter)
 			}
 		}
 		fallthrough
@@ -214,37 +215,50 @@ func chunkForNode(
 		if tsLang != nil {
 			chunks, err := chunker.ChunkTypeScript(n.ID, n.Content, tsLang, cfg)
 			if err == nil && len(chunks) > 0 {
-				return chunkSlice(chunks)
+				return chunkSlice(chunks, n.SourceAdapter)
 			}
 		}
 		fallthrough
 
 	default:
+		if n.Content == "" {
+			return nil
+		}
 		return []store.Chunk{{
-			ID:           n.ID + "/chunk/0",
-			ParentNodeID: n.ID,
-			ChunkIndex:   0,
-			Type:         "conversation_fact",
-			HeadingPath:  []string{},
-			Content:      n.Content,
-			Language:     "text",
+			ID:            n.ID + "/chunk/0",
+			ParentNodeID:  n.ID,
+			ChunkIndex:    0,
+			Type:          "conversation_fact",
+			HeadingPath:   []string{},
+			Content:       n.Content,
+			Language:      "text",
+			SourceAdapter: n.SourceAdapter,
 		}}
 	}
 }
 
-// chunkSlice converts chunker.Chunk slice to store.Chunk slice.
-func chunkSlice(chunks []chunker.Chunk) []store.Chunk {
+// chunkSlice converts chunker.Chunk slice to store.Chunk slice,
+// linking prev/next IDs along the way.
+func chunkSlice(chunks []chunker.Chunk, sourceAdapter string) []store.Chunk {
 	result := make([]store.Chunk, len(chunks))
 	for i, c := range chunks {
-		result[i] = store.Chunk{
-			ID:           c.ID,
-			ParentNodeID: c.ParentNodeID,
-			ChunkIndex:   c.ChunkIndex,
-			Type:         string(c.Type),
-			HeadingPath:  c.HeadingPath,
-			Content:      c.Content,
-			Language:     c.Language,
+		sc := store.Chunk{
+			ID:            c.ID,
+			ParentNodeID:  c.ParentNodeID,
+			ChunkIndex:    c.ChunkIndex,
+			Type:          string(c.Type),
+			HeadingPath:   c.HeadingPath,
+			Content:       c.Content,
+			Language:      c.Language,
+			SourceAdapter: sourceAdapter,
 		}
+		if i > 0 {
+			sc.PrevChunkID = result[i-1].ID
+		}
+		if i+1 < len(chunks) {
+			sc.NextChunkID = chunks[i+1].ID
+		}
+		result[i] = sc
 	}
 	return result
 }
