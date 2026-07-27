@@ -239,11 +239,10 @@ const nodeCols = "n.id, n.project_id, n.node_type, n.title, n.content, n.content
 
 func (s *Store) SearchLexical(ctx context.Context, projectID, query string, limit int) ([]store.ScoredNode, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT `+nodeCols+`, rank
+		SELECT `+nodeCols+`
 		FROM nodes_fts f
 		JOIN nodes n ON n.id = f.id
 		WHERE nodes_fts MATCH ? AND n.project_id = ?
-		ORDER BY rank
 		LIMIT ?
 	`, query, projectID, limit)
 	if err != nil {
@@ -255,7 +254,7 @@ func (s *Store) SearchLexical(ctx context.Context, projectID, query string, limi
 	var out []store.ScoredNode
 	for rows.Next() {
 		var sn store.ScoredNode
-		if err := rows.Scan(&sn.ID, &sn.ProjectID, &sn.NodeType, &sn.Title, &sn.Content, &sn.ContentHash, &sn.Status, &sn.SourceAdapter, &sn.SourcePath, &sn.Importance, &sn.Language, &sn.CreatedAt, &sn.UpdatedAt, &sn.Score); err != nil {
+		if err := rows.Scan(&sn.ID, &sn.ProjectID, &sn.NodeType, &sn.Title, &sn.Content, &sn.ContentHash, &sn.Status, &sn.SourceAdapter, &sn.SourcePath, &sn.Importance, &sn.Language, &sn.CreatedAt, &sn.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("sqlite: scan scored node: %w", err)
 		}
 		out = append(out, sn)

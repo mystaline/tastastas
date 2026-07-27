@@ -329,11 +329,10 @@ func (s *Store) SearchLexical(ctx context.Context, projectID, query string, limi
 	}
 
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT `+nodeCols+`, rank
+		SELECT `+nodeCols+`
 		FROM nodes_fts f
 		JOIN nodes n ON n.id = f.id
 		WHERE nodes_fts MATCH ? AND n.project_id = ?
-		ORDER BY rank
 		LIMIT ?
 	`, query, projectID, limit)
 	if err != nil {
