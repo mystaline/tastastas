@@ -52,6 +52,19 @@ var defaultSkipDirs = map[string]bool{
 	".idea": true, ".vscode": true,
 }
 
+// skipFilePrefixes are filename prefixes skipped unconditionally — sensitive
+// files that should never be ingested.
+var skipFilePrefixes = []string{".env"}
+
+// skipFileNames are exact filenames skipped unconditionally.
+var skipFileNames = map[string]bool{
+	"credentials": true, "credentials.yml": true, "credentials.yaml": true,
+	"secrets.yml": true, "secrets.yaml": true,
+}
+
+// skipFileGlobs are path suffix patterns matched at walk time.
+var skipFileGlobs = []string{".pem", ".key", ".secret", ".kubeconfig"}
+
 // maxFileSize skips files larger than this — binaries, datasets, lockfiles.
 // A doc/code file this big is not something you want chunked wholesale
 // anyway.
@@ -147,6 +160,12 @@ func Ingest(root string, cfg Config) ([]store.Node, []store.Edge, int, int, erro
 			return nil
 		}
 		rel = filepath.ToSlash(rel)
+
+		// Skip sensitive files (credentials, env, secrets, keys).
+		if shouldSkipFile(rel, d.Name()) {
+			filesSkipped++
+			return nil
+		}
 
 		nodeType, feature, matched := classify(rel, cfg.Mappings)
 		if !matched {
@@ -249,4 +268,23 @@ func crossLink(featureIndex map[string]map[string]string) []store.Edge {
 func nodeID(projectID, relPath string) string {
 	slug := strings.TrimSuffix(relPath, filepath.Ext(relPath))
 	return projectID + "/" + slug
+}
+
+// shouldSkipFile checks if a file path or name matches one of the built-in
+// security or noise skip lists.
+func shouldSkipFile(rel, name string) bool {
+	for _, pre := range skipFilePrefixes {
+		if strings.HasPrefix(name, pre) {
+			return true
+		}
+	}
+	if skipFileNames[name] {
+		return true
+	}
+	for _, suf := range skipFileGlobs {
+		if strings.HasSuffix(rel, suf) || strings.HasSuffix(name, suf) {
+			return true
+		}
+	}
+	return false
 }
