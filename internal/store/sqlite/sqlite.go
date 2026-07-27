@@ -656,11 +656,15 @@ func (s *Store) Stats(ctx context.Context, projectID string) (store.StoreStats, 
 	if err := row.Scan(&st.StaleCount); err != nil {
 		return st, fmt.Errorf("sqlite: stats stale: %w", err)
 	}
-
+	// VecCount = node_vectors + chunk_vectors scoped to project.
 	row = s.db.QueryRowContext(
 		ctx,
-		`SELECT COUNT(*) FROM node_vectors v JOIN nodes n ON n.id = v.node_id WHERE n.project_id = ?`,
-		projectID,
+		`SELECT (
+			SELECT COUNT(*) FROM node_vectors v JOIN nodes n ON n.id = v.node_id WHERE n.project_id = ?
+		) + (
+			SELECT COUNT(*) FROM chunk_vectors v JOIN chunks c ON c.id = v.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?
+		)`,
+		projectID, projectID,
 	)
 	if err := row.Scan(&st.VecCount); err != nil {
 		return st, fmt.Errorf("sqlite: stats vectors: %w", err)
