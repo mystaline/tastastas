@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -89,6 +90,12 @@ func isRemoteDSN(dsn string) bool {
 }
 
 func main() {
+	// Version probe — before any flag parsing
+	if len(os.Args) > 1 && (os.Args[1] == "-v" || os.Args[1] == "--version") {
+		fmt.Println(mcpserver.Version)
+		return
+	}
+
 	// Subcommand: update — run pending migrations then exit.
 	if len(os.Args) > 1 && os.Args[1] == "update" {
 		updateCmd := flag.NewFlagSet("update", flag.ExitOnError)

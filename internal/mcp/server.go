@@ -33,6 +33,9 @@ import (
 	"github.com/mystaline-dev/tastastas/internal/store"
 )
 
+// Version is set at build time via -ldflags. Falls back to "dev".
+var Version = "dev"
+
 var goLanguage = sync.OnceValue(func() *sitter.Language {
 	return sitter.NewLanguage(golang.Language())
 })
@@ -168,7 +171,7 @@ func NewServer(db store.Store, embedder embed.EmbedderBackend) *mcp.Server {
 	srv := mcp.NewServer(
 		&mcp.Implementation{
 			Name:    "tastastas",
-			Version: "0.1.0",
+			Version: Version,
 		},
 		nil,
 	)

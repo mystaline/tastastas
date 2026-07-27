@@ -221,12 +221,55 @@ Source → [AutoDetectAdapters] → n → [EmbedNodes] → n → [InferConventio
 
 ## API endpoints (`--serve` mode)
 
+### `GET /health` — Readiness probe
+
 ```
-POST /mcp                — MCP protocol (Streamable HTTP)
-GET  /graph/{project_id}  — D3 force-directed graph visualization
-POST /ingest              — Ingest from path (auto-detect adapters)
-GET  /health              — Health check
+→ 200  {"status":"ok","version":"v0.1.0"}
 ```
+
+Version reflects the binary build tag (via `-ldflags`). Exempt from auth. Used by Docker health checks and load balancers.
+
+### `POST /ingest` — Ingest repo path into memory
+
+Async. Returns immediately with a job ID. Poll `GET /ingest/jobs/{id}` for completion.
+Runs full pipeline: auto-detect adapters → chunk → embed → hierarchy → Tier2 link.
+
+```
+Request:
+{ "root": "/path/to/repo", "project_id": "my-project" }
+
+→ 202  {"job_id":"<ulid>","status":"running"}
+→ 400  {"error":"root is required"}          — missing root
+→ 400  {"error":"invalid JSON"}              — malformed body
+```
+
+Idempotent: unchanged files skip re-chunk + re-embed (content-hash skip).
+
+### `GET /ingest/jobs/{id}` — Poll ingest job
+
+```
+→ 200  {"id":"<ulid>","status":"running|done|error","phase":"detecting|chunking|embedding|persisting",
+         "nodes":5,"edges":3,"chunks":42,"error":"","started_at":"...","ended_at":"..."}
+→ 404  {"error":"job not found"}
+```
+
+### `GET /graph/{project}` — Graph visualization
+
+```
+?max_edges=500  (default 500, cap for large projects)
+
+Accept: application/json
+→ 200  {"project_id":"my-project","total_edges":36000,"returned":500,
+         "nodes":[{"id":"...","title":"...","type":"...","group":"...","weight":2},...],
+         "edges":[{"source":"...","target":"...","edge_type":"contains","confidence":1.0},...]}
+
+Accept: text/html (default)
+→ 200  D3 force-directed graph HTML page
+```
+
+### `POST /mcp` — MCP Streamable HTTP (all 13 tools)
+
+See [Tools (MCP)](#tools-mcp) section below. Request/response follows the [MCP Streamable HTTP spec](https://spec.modelcontextprotocol.io/).
 
 ## Ingesting docs
 
@@ -256,6 +299,28 @@ mappings:
 ```
 
 Without `.memoryrc.yaml` everything ingests as `generic-doc` — still searchable, just untyped.
+
+### Auto-update on git push (CI/CD)
+
+Tastastas `POST /ingest` is designed for CI/CD pipelines. After every git push, re-ingest the repo:
+
+```yaml
+# .github/workflows/tastastas-sync.yml (or any CI)
+on:
+  push:
+    branches: [main]
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update tastastas memory
+        run: |
+          curl -X POST http://your-server:8080/ingest \
+            -d '{"root": "$PWD", "project_id": "my-project"}'
+```
+
+Ingest is idempotent — unchanged files keep their existing chunks and embeddings (content-hash skip). Only changed files are re-processed.
 
 ## Technology Stack
 

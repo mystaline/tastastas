@@ -26,11 +26,10 @@ func ServeHTTP(
 ) error {
 	jobs := newJobStore(db)
 
-	// MCP-over-HTTP via Streamable HTTP handler
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
 		srv := mcp.NewServer(&mcp.Implementation{
 			Name:    "tastastas",
-			Version: "0.1.0",
+			Version: Version,
 		}, nil)
 		registerTools(srv, db, embedder)
 		return srv
@@ -38,28 +37,26 @@ func ServeHTTP(
 
 	mux := http.NewServeMux()
 
-	// MCP endpoint — all MCP protocol traffic
+	// MCP endpoint — all MCP tools available via Streamable HTTP
 	mux.Handle("/mcp", mcpHandler)
 
 	// Graph visualization — GET /graph/{project}
 	mux.HandleFunc("GET /graph/{project}", HandleGraphView(db))
 
-	// REST ingestion — POST /ingest auto-detects adapters.
-	mux.HandleFunc("POST /ingest", handleIngest(db, embedder, jobs))
-	mux.HandleFunc("POST /ingest/{adapter}", handleIngest(db, embedder, jobs))
+	// REST ingest — POST /ingest auto-detects adapters, same pipeline as MCP ingest tool.
+	mux.HandleFunc("POST /ingest", handleRESTIngest(db, embedder, jobs))
 	mux.HandleFunc("GET /ingest/jobs/{id}", handleIngestJobStatus(jobs))
-	mux.HandleFunc("POST /ingest/webhook", handleIngestWebhook(db))
 
-	// Health check
+	// Health check — exempt from auth
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"status":"ok","version":"0.1.0"}`)
+		fmt.Fprintf(w, `{"status":"ok","version":"%s"}`, Version)
 	})
 
 	log.Printf("tastastas HTTP server listening on %s", addr)
-	log.Printf("  MCP endpoint:   %s/mcp", addr)
-	log.Printf("  Ingest:         %s/ingest", addr)
-	log.Printf("  Webhook:        %s/ingest/webhook", addr)
+	log.Printf("  MCP endpoint: %s/mcp", addr)
+	log.Printf("  Graph:        %s/graph/{project}", addr)
+	log.Printf("  REST ingest:  %s/ingest", addr)
 
 	var handler http.Handler = mux
 	if authToken != "" {
@@ -75,8 +72,6 @@ func ServeHTTP(
 	return server.ListenAndServe()
 }
 
-// withBearerAuth returns middleware that checks Authorization: Bearer {token}.
-// GET /health is exempt (readiness probe).
 func withBearerAuth(token string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -95,7 +90,6 @@ func withBearerAuth(token string) func(http.Handler) http.Handler {
 	}
 }
 
-// bearerMatches checks the Authorization header against token in constant time.
 func bearerMatches(r *http.Request, token string) bool {
 	got := r.Header.Get("Authorization")
 	if !strings.HasPrefix(got, "Bearer ") {
@@ -105,182 +99,15 @@ func bearerMatches(r *http.Request, token string) bool {
 	if len(got) != len(token) {
 		return false
 	}
-	// ponytail: ct_eq constant-time, fine for bearer token.
-	// Use subtle.ConstantTimeCompare if token contains secrets.
 	ok := 0
 	for i := range got {
 		if got[i] == token[i] {
 			ok++
 		}
 	}
-	// Only return true if ALL bytes matched (no early exit = timing-safe)
 	return ok == len(token) && len(token) > 0
 }
 
-// handleIngest handles POST /ingest/{adapter} (docwalk, gitrepo, obsidian)
-// with JSON body: { "root": "/path", "config_path": "...", "project_id": "..." }
-// config_path only applies to the docwalk adapter.
-//
-// Runs asynchronously: returns {"job_id": "..."} immediately (HTTP 202) and
-// does the walk + chunk + embed in a background goroutine. Large directories
-// (whole workspaces, dozens of repos) can take minutes to embed — holding
-// the request open that long guarantees client/proxy timeouts. Poll
-// GET /ingest/jobs/{job_id} for completion.
-func handleIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobStore) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Root      string `json:"root"`
-			ProjectID string `json:"project_id"`
-		}
-		body, _ := io.ReadAll(r.Body)
-		if err := json.Unmarshal(body, &req); err != nil {
-			http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
-			return
-		}
-		projectID := req.ProjectID
-		if projectID == "" {
-			projectID = "default"
-		}
-		root := req.Root
-		if root == "" {
-			http.Error(w, `{"error":"root is required"}`, http.StatusBadRequest)
-			return
-		}
-
-		job := jobs.create()
-		jobs.runAsync(job, func(ctx context.Context) (int, int, int, error) {
-			nodes, edges, _, filesWalked, filesSkipped, err := onboard.AutoDetectAdapters(ctx, db, root, projectID)
-			if err != nil {
-				return 0, 0, 0, fmt.Errorf("detect adapters: %w", err)
-			}
-			jobs.updateCounts(job.ID, filesWalked, filesSkipped)
-			for i := range nodes {
-				if err := db.UpsertNode(ctx, nodes[i]); err != nil {
-					return 0, 0, 0, fmt.Errorf("upsert node: %w", err)
-				}
-			}
-			for i := range edges {
-				if err := db.UpsertEdge(ctx, edges[i]); err != nil {
-					return 0, 0, 0, fmt.Errorf("upsert edge: %w", err)
-				}
-			}
-			chunkCount, err := chunkAndEmbedNodes(
-				ctx, db, embedder, nodes,
-				func(embedded, total int) { jobs.updateChunksEmbedded(job.ID, embedded, total) },
-				func() { jobs.updatePhase(job.ID, "persisting") },
-			)
-			if err != nil {
-				return 0, 0, 0, fmt.Errorf("chunk/embed: %w", err)
-			}
-			convNodes := onboard.InferConventions(ctx, db, projectID, nodes)
-			for _, cn := range convNodes {
-				_ = db.UpsertNode(ctx, cn)
-			}
-			nodes = append(nodes, convNodes...)
-			auto, proposals := onboard.Tier2ScoreAndLink(ctx, db, projectID, nodes)
-			_ = auto
-			_ = proposals
-			return len(nodes), len(edges), chunkCount, nil
-		})
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusAccepted)
-		fmt.Fprintf(w, `{"job_id":%q,"status":"running"}`, job.ID)
-	}
-}
-
-// handleIngestJobStatus handles GET /ingest/jobs/{id} — poll an async
-// ingest job's status. Returns 404 if the job ID is unknown (server
-// restarted, or typo).
-func handleIngestJobStatus(jobs *jobStore) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		id := r.PathValue("id")
-		job, ok := jobs.get(id)
-
-		w.Header().Set("Content-Type", "application/json")
-		if !ok {
-			w.WriteHeader(http.StatusNotFound)
-			fmt.Fprintf(w, `{"error":"job not found"}`)
-			return
-		}
-
-		_ = json.NewEncoder(w).Encode(job)
-	}
-}
-
-// handleIngestWebhook handles POST /ingest/webhook — generic doc-change push endpoint.
-// Accepts JSON array of { "path": "...", "content": "...", "project_id": "..." }
-// or single object. Creates/updates generic-doc nodes.
-func handleIngestWebhook(db store.Store) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var items []struct {
-			Path      string `json:"path"`
-			Content   string `json:"content"`
-			ProjectID string `json:"project_id"`
-			NodeType  string `json:"node_type"`
-			Title     string `json:"title"`
-		}
-
-		body, _ := io.ReadAll(r.Body)
-		// Try array first, then single object
-		if err := json.Unmarshal(body, &items); err != nil {
-			var single struct {
-				Path      string `json:"path"`
-				Content   string `json:"content"`
-				ProjectID string `json:"project_id"`
-				NodeType  string `json:"node_type"`
-				Title     string `json:"title"`
-			}
-			if err2 := json.Unmarshal(body, &single); err2 != nil {
-				http.Error(w, `{"error":"invalid JSON (expected object or array)"}`, http.StatusBadRequest)
-				return
-			}
-			items = append(items, single)
-		}
-
-		ctx := r.Context()
-		ingested := 0
-		for _, item := range items {
-			projectID := item.ProjectID
-			if projectID == "" {
-				projectID = "default"
-			}
-			nodeType := item.NodeType
-			if nodeType == "" {
-				nodeType = "generic-doc"
-			}
-			title := item.Title
-			if title == "" {
-				parts := strings.Split(item.Path, "/")
-				title = parts[len(parts)-1]
-			}
-
-			n := store.Node{
-				ID:            fmt.Sprintf("%s/webhook/%s", projectID, item.Path),
-				ProjectID:     projectID,
-				NodeType:      nodeType,
-				Title:         title,
-				Content:       item.Content,
-				Status:        "current",
-				SourceAdapter: "webhook",
-				SourcePath:    item.Path,
-				Importance:    0.5,
-			}
-
-			if err := db.UpsertNode(ctx, n); err != nil {
-				http.Error(w, fmt.Sprintf(`{"error":"upsert: %s"}`, err), http.StatusInternalServerError)
-				return
-			}
-
-			ingested++
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"ingested":%d}`, ingested)
-	}
-}
-
-// handleGraphView serves the interactive graph visualization page.
 func HandleGraphView(db store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		projectID := r.PathValue("project")
@@ -288,7 +115,6 @@ func HandleGraphView(db store.Store) http.HandlerFunc {
 			projectID = "default"
 		}
 
-		// Collect edges: structural + auto-linked.
 		edgeTypes := []string{
 			"specifies",
 			"implements",
@@ -301,7 +127,7 @@ func HandleGraphView(db store.Store) http.HandlerFunc {
 			"references",
 			"contains",
 		}
-		maxEdges := 500 // default: 500 edges is enough for a useful graph; full project may have 50k+
+		maxEdges := 500
 		if m := r.URL.Query().Get("max_edges"); m != "" {
 			if v, err := strconv.Atoi(m); err == nil && v > 0 {
 				maxEdges = v
@@ -313,7 +139,6 @@ func HandleGraphView(db store.Store) http.HandlerFunc {
 			return
 		}
 
-		// Build deduplicated node list with degree weight.
 		nodeMap := map[string]*struct {
 			id, title, ntype, group string
 			weight                  int
@@ -383,9 +208,109 @@ func HandleGraphView(db store.Store) http.HandlerFunc {
 			return
 		}
 
-		// Serve HTML
 		page := strings.Replace(graphPageSource, "__DATA__", string(jsonBytes), 1)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write([]byte(page))
+	}
+}
+
+// handleRESTIngest handles POST /ingest — auto-detect adapters, same pipeline
+// as the MCP ingest tool. Async: returns { job_id, status } immediately.
+func handleRESTIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Root      string `json:"root"`
+			ProjectID string `json:"project_id"`
+		}
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &req); err != nil {
+			http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+			return
+		}
+		projectID := req.ProjectID
+		if projectID == "" {
+			projectID = "default"
+		}
+		root := req.Root
+		if root == "" {
+			http.Error(w, `{"error":"root is required"}`, http.StatusBadRequest)
+			return
+		}
+
+		job := jobs.create()
+		// same pipeline as MCP ingest tool (server.go:466-520)
+		safeGo(func() {
+			ctx := context.Background()
+			nodes, edges, _, filesWalked, filesSkipped, err := onboard.AutoDetectAdapters(ctx, db, root, projectID)
+			if err != nil {
+				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("detect adapters: %w", err))
+				return
+			}
+			jobs.updateCounts(job.ID, filesWalked, filesSkipped)
+			for _, n := range nodes {
+				if err := db.UpsertNode(ctx, n); err != nil {
+					jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert node: %w", err))
+					return
+				}
+			}
+			for _, e := range edges {
+				if err := db.UpsertEdge(ctx, e); err != nil {
+					jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert edge: %w", err))
+					return
+				}
+			}
+			chunkCount, err := chunkAndEmbedNodes(
+				ctx, db, embedder, nodes,
+				func(embedded, total int) { jobs.updateChunksEmbedded(job.ID, embedded, total) },
+				func() { jobs.updatePhase(job.ID, "persisting") },
+			)
+			if err != nil {
+				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("chunk/embed: %w", err))
+				return
+			}
+			if embedder != nil {
+				_ = onboard.EmbedNodes(ctx, db, nodes, embedder)
+			}
+			convNodes := onboard.InferConventions(ctx, db, projectID, nodes)
+			for _, cn := range convNodes {
+				_ = db.UpsertNode(ctx, cn)
+			}
+			nodes = append(nodes, convNodes...)
+			hierNodes, hierEdges := onboard.BuildHierarchy(projectID, nodes)
+			for _, n := range hierNodes {
+				if err := db.UpsertNode(ctx, n); err != nil {
+					jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert hierarchy node: %w", err))
+					return
+				}
+			}
+			for _, e := range hierEdges {
+				if err := db.UpsertEdge(ctx, e); err != nil {
+					jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert hierarchy edge: %w", err))
+					return
+				}
+			}
+			nodes = append(nodes, hierNodes...)
+			auto, proposals := onboard.Tier2ScoreAndLink(ctx, db, projectID, nodes)
+			jobs.finish(job.ID, len(nodes), len(edges), chunkCount, nil, len(convNodes), auto, proposals)
+		})
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		fmt.Fprintf(w, `{"job_id":%q,"status":"running"}`, job.ID)
+	}
+}
+
+// handleIngestJobStatus polls an async ingest job by ID.
+func handleIngestJobStatus(jobs *jobStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		job, ok := jobs.get(id)
+		w.Header().Set("Content-Type", "application/json")
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprintf(w, `{"error":"job not found"}`)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(job)
 	}
 }
