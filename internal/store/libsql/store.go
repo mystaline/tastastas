@@ -193,8 +193,40 @@ func (s *Store) initSchema(ctx context.Context) error {
 	return err
 }
 
-func (s *Store) Close() error {
-	return s.db.Close()
+func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) SetJobMarker(ctx context.Context) error {
+	_, err := s.db.ExecContext(
+		ctx,
+		`CREATE TABLE IF NOT EXISTS job_marker (id INTEGER PRIMARY KEY CHECK (id = 1), started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`,
+	)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(
+		ctx,
+		`INSERT INTO job_marker (id) VALUES (1) ON CONFLICT(id) DO UPDATE SET started_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
+	)
+	return err
+}
+
+func (s *Store) ClearJobMarker(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM job_marker WHERE id = 1`)
+	return err
+}
+
+func (s *Store) HasJobMarker(ctx context.Context) (bool, error) {
+	var exists int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM pragma_table_list WHERE name = 'job_marker'`).Scan(&exists)
+	if err != nil || exists == 0 {
+		return false, nil
+	}
+	var count int
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM job_marker WHERE id = 1`).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 var _ store.Store = (*Store)(nil)

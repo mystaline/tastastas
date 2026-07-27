@@ -104,6 +104,25 @@ func (s *Store) initSchema(ctx context.Context) error {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+func (s *Store) SetJobMarker(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO job_marker (id) VALUES (1) ON CONFLICT(id) DO UPDATE SET started_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`)
+	return err
+}
+
+func (s *Store) ClearJobMarker(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM job_marker WHERE id = 1`)
+	return err
+}
+
+func (s *Store) HasJobMarker(ctx context.Context) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM job_marker WHERE id = 1`).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 var _ store.Store = (*Store)(nil)
 
 func (s *Store) UpsertNode(ctx context.Context, n store.Node) error {
