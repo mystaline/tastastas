@@ -48,6 +48,7 @@ services:
       - ":9292"
     environment:
       - TASTASTAS_AUTH_TOKEN=${TASTASTAS_AUTH_TOKEN:-}
+      - TASTASTAS_OPENAI_KEY=${TASTASTAS_OPENAI_KEY:-}
     depends_on:
       ollama-init:
         condition: service_completed_successfully

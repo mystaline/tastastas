@@ -74,6 +74,17 @@ go build -o tastastas ./cmd/tastastas
 
 MCP client config: stdio mode → see [MCP Configuration](#mcp-configuration) → Stdio + Ollama. HTTP mode (`--serve`) → same as Option A, see → HTTP.
 
+### Option D: Single binary + OpenAI API (cloud, zero infra)
+
+**Cost:** ~$0.50/month for 30 users.
+
+```bash
+export TASTASTAS_OPENAI_KEY=sk-...
+./tastastas --serve :8080 --embed-backend openai
+```
+
+MCP client config: HTTP mode (`--serve`) → same as Option A, see → HTTP.
+
 ## MCP Configuration
 
 Config depends on how you started tastastas (Option A/B/C above). Pick the matching block.
@@ -183,10 +194,13 @@ tastastas is an MCP server connected to this project. If you see tastastas in yo
 | `--serve` | *(unset)* | HTTP address (`:8080`). Unset = stdio MCP mode. |
 | `--db` | `~/.local/share/tastastas/memory.db` | SQLite DB path (honors `$TASTASTAS_DB`, `$XDG_DATA_HOME`) |
 | `--embed-dim` | `0` = auto-detect | Vector dimension: 384 for sidecar, 768 for ollama, 0 = pick from backend |
-| `--embed-backend` | `sidecar` | `sidecar` (baked ONNX, zero deps), `ollama`, or `none` |
+| `--embed-backend` | `sidecar` | `sidecar` (baked ONNX, zero deps), `ollama` (local, 768-dim), `openai` (cloud API, 1536-dim), or `none` (lexical only) |
 | `--ollama-url` | `http://localhost:11434` | Ollama URL (`embed-backend=ollama`) |
 | `--ollama-model` | `nomic-embed-text` | Ollama embedding model (`embed-backend=ollama`) |
 | `--sidecar-workers` | `0` = 4 | Sidecar worker count (`embed-backend=sidecar`) |
+| `--openai-api-key` | *(env `$TASTASTAS_OPENAI_KEY`)* | OpenAI API key (prefer env var, not CLI flag) |
+| `--openai-model` | `text-embedding-3-small` | OpenAI model ID |
+| `--openai-base-url` | `https://api.openai.com/v1` | OpenAI-compatible base URL |
 | `--graph-addr` | *(unset)* | Graph visualization page on this address (`:9292`). Works alongside stdio MCP mode — no `--serve` needed. |
 | `--auth-token` | *(unset)* | Bearer token for HTTP server mode (empty = no auth) |
 

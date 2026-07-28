@@ -33,15 +33,19 @@ import (
 // newEmbedder picks an embedding backend based on --embed-backend:
 //   - "sidecar": baked ONNX binary, zero external deps, 384-dim fixed.
 //     Falls back to nil (lexical-only) if this platform has no baked binary.
+//   - "openai": HTTP call to OpenAI embeddings API (cloud, 1536-dim).
+//     Requires --openai-api-key or $TASTASTAS_OPENAI_KEY.
 //   - "ollama" (default): HTTP call to a local Ollama instance.
 //   - "none": explicit lexical-only mode, no embedder at all.
-func newEmbedder(backend, ollamaURL, ollamaModel string, sidecarWorkers int) embed.EmbedderBackend {
+func newEmbedder(backend string, sidecarWorkers int,
+	ollamaURL, ollamaModel string,
+	openaiKey, openaiModel, openaiBaseURL string,
+	embedDim int) embed.EmbedderBackend {
 	switch backend {
 	case "none":
 		return nil
 	case "sidecar":
 		if sidecarWorkers != 1 {
-			// Use pool for 0 (NumCPU) or >1 workers
 			p, err := embed.NewSidecarPool(sidecarWorkers)
 			if err != nil {
 				log.Printf("embed: sidecar pool unavailable (%v), falling back to lexical-only", err)
@@ -49,13 +53,17 @@ func newEmbedder(backend, ollamaURL, ollamaModel string, sidecarWorkers int) emb
 			}
 			return p
 		}
-		// Single worker (original behavior)
 		sc, err := embed.NewSidecar()
 		if err != nil {
 			log.Printf("embed: sidecar unavailable (%v), falling back to lexical-only", err)
 			return nil
 		}
 		return sc
+	case "openai":
+		if openaiKey == "" {
+			log.Fatal("embed: --openai-api-key or $TASTASTAS_OPENAI_KEY required for --embed-backend=openai")
+		}
+		return embed.NewOpenAI(openaiKey, openaiModel, openaiBaseURL, embedDim)
 	default:
 		return embed.New(embed.Config{OllamaURL: ollamaURL, Model: ollamaModel})
 	}
@@ -106,6 +114,8 @@ func main() {
 
 		if *embedDim <= 0 {
 			switch *embedBackend {
+			case "openai":
+				*embedDim = 1536
 			case "ollama":
 				*embedDim = 768
 			default:
@@ -138,8 +148,15 @@ func main() {
 	ollamaURL := flag.String("ollama-url", "http://localhost:11434", "Ollama base URL (used when --embed-backend=ollama)")
 	ollamaModel := flag.String("ollama-model", "nomic-embed-text", "Ollama embedding model (used when --embed-backend=ollama)")
 	sidecarWorkers := flag.Int("sidecar-workers", 0, "number of sidecar workers (0 = 4, only for --embed-backend=sidecar)")
+	openaiKey := flag.String("openai-api-key", "", "OpenAI API key (prefer $TASTASTAS_OPENAI_KEY env var)")
+	openaiModel := flag.String("openai-model", "text-embedding-3-small", "OpenAI model ID (used when --embed-backend=openai)")
+	openaiBaseURL := flag.String("openai-base-url", "https://api.openai.com/v1", "OpenAI API base URL (used when --embed-backend=openai)")
 	authToken := flag.String("auth-token", "", "bearer token for HTTP server mode (empty = no auth)")
 	flag.Parse()
+
+	if *openaiKey == "" {
+		*openaiKey = os.Getenv("TASTASTAS_OPENAI_KEY")
+	}
 
 	// Ensure DB directory exists (for local SQLite, not remote DSN).
 	if !isRemoteDSN(*dbPath) {
@@ -149,6 +166,8 @@ func main() {
 	// Auto-detect embed dim when not explicitly set (0 = default).
 	if *embedDim <= 0 {
 		switch *embedBackend {
+		case "openai":
+			*embedDim = 1536
 		case "ollama":
 			*embedDim = 768
 		default:
@@ -172,7 +191,8 @@ func main() {
 		log.Println("WARNING: previous ingest/onboard was interrupted. Re-run to complete. Ingest is idempotent (upsert + content-hash skip), so re-running is safe.")
 	}
 
-	embedder := newEmbedder(*embedBackend, *ollamaURL, *ollamaModel, *sidecarWorkers)
+	embedder := newEmbedder(*embedBackend, *sidecarWorkers, *ollamaURL, *ollamaModel,
+		*openaiKey, *openaiModel, *openaiBaseURL, *embedDim)
 	closeEmbedder := func() {
 		if closer, ok := embedder.(interface{ Close() error }); ok {
 			_ = closer.Close()
