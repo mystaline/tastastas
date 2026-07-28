@@ -8,6 +8,12 @@ import (
 
 	"github.com/mystaline-dev/tastastas/internal/store"
 )
+
+// ingestMu serializes access to the embedder for ingest jobs. Only one
+// goroutine calls chunkAndEmbedNodes at a time; others set their job phase
+// to "waiting" so callers see the queue position.
+var ingestMu sync.Mutex
+
 // ingestJob tracks one async ingest run. Big-directory ingests (docwalk over
 // a whole workspace) can take minutes — long enough to blow past any client
 // or reverse-proxy HTTP timeout. Rather than hold the request open, POST
@@ -15,8 +21,8 @@ import (
 // a goroutine; GET /ingest/jobs/{id} polls status.
 type ingestJob struct {
 	ID              string             `json:"id"`
-	Status          string             `json:"status"` // "running" | "done" | "error"
-	Phase           string             `json:"phase,omitempty"` // "walking" | "embedding" | "persisting"
+	Status          string             `json:"status"`          // "running" | "done" | "error"
+	Phase           string             `json:"phase,omitempty"` // "walking" | "syncing" | "waiting" | "chunking" | "embedding" | "persisting" | "linking" | "" (done/error)
 	Nodes           int                `json:"nodes_ingested,omitempty"`
 	Edges           int                `json:"edges_created,omitempty"`
 	Chunks          int                `json:"chunks_created,omitempty"`
@@ -39,8 +45,8 @@ type ingestJob struct {
 // status flips to "done".
 type jobStore struct {
 	store store.Store // for interrupted-run marker
-	mu   sync.RWMutex
-	jobs map[string]*ingestJob
+	mu    sync.RWMutex
+	jobs  map[string]*ingestJob
 }
 
 func newJobStore(st store.Store) *jobStore {
@@ -120,9 +126,10 @@ func (js *jobStore) finish(
 		_ = js.store.ClearJobMarker(context.Background())
 	}
 }
+
 // updateCounts lets the background goroutine push progress (files walked/skipped)
-// before the job completes. Also flips phase to "embedding" — the walk is
-// done and chunk+embed is about to start. Caller must hold no other locks.
+// before the job completes. Also flips phase to "syncing" — the walk is
+// done and upserting nodes+edges to DB is about to start.
 func (js *jobStore) updateCounts(
 	id string,
 	filesWalked, filesSkipped int,
@@ -135,7 +142,7 @@ func (js *jobStore) updateCounts(
 		return
 	}
 	j.FilesWalked, j.FilesSkipped = filesWalked, filesSkipped
-	j.Phase = "embedding"
+	j.Phase = "syncing"
 }
 
 // updateChunksEmbedded lets the background goroutine push embedding progress.

@@ -55,6 +55,7 @@ func chunkAndEmbedNodes(
 	db store.Store,
 	embedder embed.EmbedderBackend,
 	nodes []store.Node,
+	batchSize int,
 	progress func(embedded, total int),
 	onPersisting func(),
 ) (int, error) {
@@ -124,7 +125,9 @@ func chunkAndEmbedNodes(
 	if len(needEmbed) == 0 {
 		return len(allChunks), nil
 	}
-	const batchSize = 32 // ponytail: 64 for sidecar (ONNX CPU, padding-insensitive), 32 for ollama safer. Both work.
+	if batchSize <= 0 {
+		batchSize = 32
+	}
 	for i := 0; i < len(needEmbed); i += batchSize {
 		end := i + batchSize
 		if end > len(needEmbed) {
@@ -167,7 +170,7 @@ func safeGo(fn func()) {
 	}()
 }
 
-func NewServer(db store.Store, embedder embed.EmbedderBackend) *mcp.Server {
+func NewServer(db store.Store, embedder embed.EmbedderBackend, batchSize int) *mcp.Server {
 	srv := mcp.NewServer(
 		&mcp.Implementation{
 			Name:    "tastastas",
@@ -176,11 +179,11 @@ func NewServer(db store.Store, embedder embed.EmbedderBackend) *mcp.Server {
 		nil,
 	)
 
-	registerTools(srv, db, embedder)
+	registerTools(srv, db, embedder, batchSize)
 	return srv
 }
 
-func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBackend) {
+func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBackend, batchSize int) {
 	retriever := retrieve.New(db, retrieve.DefaultConfig())
 	extractor := extract.New(extract.Config{})
 	jobs := newJobStore(db)
@@ -244,12 +247,23 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 				// Report walk counts and transition phase to "embedding" — same as ingest path.
 				jobs.updateCounts(job.ID, result.FilesWalked, result.FilesSkipped)
 
+				// Wait for embedder if another ingest is running.
+				jobs.updatePhase(job.ID, "waiting")
+				ingestMu.Lock()
+				jobs.updatePhase(job.ID, "chunking")
+
+				embedOnce := sync.OnceFunc(func() { jobs.updatePhase(job.ID, "embedding") })
+
 				// Chunk + embed for RAG-level recall.
 				chunkCount, err := chunkAndEmbedNodes(
-					context.Background(), db, embedder, result.AllNodes,
-					func(embedded, total int) { jobs.updateChunksEmbedded(job.ID, embedded, total) },
+					context.Background(), db, embedder, result.AllNodes, batchSize,
+					func(embedded, total int) {
+						embedOnce()
+						jobs.updateChunksEmbedded(job.ID, embedded, total)
+					},
 					func() { jobs.updatePhase(job.ID, "persisting") },
 				)
+				ingestMu.Unlock()
 				if err != nil {
 					return fmt.Errorf("chunk/embed: %w", err)
 				}
@@ -319,7 +333,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 		srv,
 		&mcp.Tool{
 			Name:        "remember",
-			Description: "Store or update a fact/entity in memory. Computes content hash automatically. If an embedder is configured, embeds content for vector search; if not, stores without embedding (degrades gracefully).",
+			Description: "Store or update a fact/entity in memory. Computes content hash automatically. If an embedder is configured, embeds content for vector search; if not, stores without embedding (degrades gracefully). Use `links` to reference existing node IDs this fact relates to — creates `references` edges visible in the graph.",
 		},
 		func(ctx context.Context, req *mcp.CallToolRequest, args RememberInput) (*mcp.CallToolResult, RememberOutput, error) {
 			projectID := args.ProjectID
@@ -349,12 +363,19 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			}
 
 			if _, err := chunkAndEmbedNodes(
-				ctx,
-				db,
-				embedder,
-				[]store.Node{n}, nil, nil,
+				ctx, db, embedder, []store.Node{n},
+				batchSize, nil, nil,
 			); err != nil {
 				return errorResult(err), RememberOutput{}, nil
+			}
+
+			for _, target := range args.Links {
+				_ = db.UpsertEdge(ctx, store.Edge{
+					FromID:     id,
+					ToID:       target,
+					EdgeType:   "references",
+					Confidence: 1.0,
+				})
 			}
 
 			toolResult := &mcp.CallToolResult{
@@ -395,13 +416,13 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 				Limit:         limit,
 				LinkThreshold: args.LinkThreshold,
 			}
-	if embedder != nil {
-		embedCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		defer cancel()
-		if vec, err := embedder.Embed(embedCtx, args.Query); err == nil {
-			params.Embedding = vec
-		}
-	}
+			if embedder != nil {
+				embedCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+				defer cancel()
+				if vec, err := embedder.Embed(embedCtx, args.Query); err == nil {
+					params.Embedding = vec
+				}
+			}
 
 			result, err := retriever.Recall(ctx, params)
 			if err != nil {
@@ -623,25 +644,38 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 					return
 				}
 			}
-			for _, e := range edges {
-				if err := db.UpsertEdge(context.Background(), e); err != nil {
-					jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert edge: %w", err))
-					return
-				}
+			if err := db.UpsertEdges(context.Background(), edges); err != nil {
+				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert edges: %w", err))
+				return
 			}
+
+			jobs.updatePhase(job.ID, "waiting")
+			ingestMu.Lock()
+			jobs.updatePhase(job.ID, "chunking")
+
+			embedOnce := sync.OnceFunc(func() { jobs.updatePhase(job.ID, "embedding") })
 			chunkCount, err := chunkAndEmbedNodes(
-				context.Background(), db, embedder, nodes,
-				func(embedded, total int) { jobs.updateChunksEmbedded(job.ID, embedded, total) },
+				context.Background(), db, embedder, nodes, batchSize,
+				func(embedded, total int) {
+					embedOnce()
+					jobs.updateChunksEmbedded(job.ID, embedded, total)
+				},
 				func() { jobs.updatePhase(job.ID, "persisting") },
 			)
 			if err != nil {
+				ingestMu.Unlock()
 				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("chunk/embed: %w", err))
 				return
 			}
-			if err := onboard.EmbedNodes(context.Background(), db, nodes, embedder); err != nil {
+			if err := onboard.EmbedNodes(context.Background(), db, nodes, embedder, batchSize); err != nil {
+				ingestMu.Unlock()
 				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("embed nodes: %w", err))
 				return
 			}
+			ingestMu.Unlock()
+
+			jobs.updatePhase(job.ID, "linking")
+
 			convNodes := onboard.InferConventions(context.Background(), db, projectID, nodes)
 			for _, cn := range convNodes {
 				_ = db.UpsertNode(context.Background(), cn)
@@ -655,11 +689,9 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 					return
 				}
 			}
-			for _, e := range hierEdges {
-				if err := db.UpsertEdge(context.Background(), e); err != nil {
-					jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert hierarchy edge: %w", err))
-					return
-				}
+			if err := db.UpsertEdges(context.Background(), hierEdges); err != nil {
+				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert hierarchy edges: %w", err))
+				return
 			}
 			nodes = append(nodes, hierNodes...)
 
@@ -761,7 +793,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 					storedNodes = append(storedNodes, node)
 				}
 
-				chunkAndEmbedNodes(context.Background(), db, embedder, storedNodes, nil, nil)
+				chunkAndEmbedNodes(context.Background(), db, embedder, storedNodes, batchSize, nil, nil)
 				return nil
 			}())
 		})
