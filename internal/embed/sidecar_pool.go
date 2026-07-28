@@ -8,14 +8,20 @@ import (
 
 // SidecarPool manages N SidecarEmbedder workers for parallel embedding.
 type SidecarPool struct {
-	workers []*SidecarEmbedder
-	next    int // round-robin
+	workers  []*SidecarEmbedder
+	next     int // round-robin
+	maxBatch int // per-worker limit (all workers share same config)
 }
 
-// NewSidecarPool creates a pool of N workers (defaults to runtime.NumCPU()).
+// NewSidecarPool creates a pool of N workers (defaults to 4).
 // Extracts the baked ONNX binary once and spawns N subprocesses from the
 // same path — avoids writing 150 MB × numCPU to temp.
 func NewSidecarPool(n int) (*SidecarPool, error) {
+	return NewSidecarPoolWithConfig(n, SidecarConfig{})
+}
+
+// NewSidecarPoolWithConfig creates a pool with the given sidecar config.
+func NewSidecarPoolWithConfig(n int, cfg SidecarConfig) (*SidecarPool, error) {
 	if n <= 0 {
 		n = 4
 	}
@@ -25,7 +31,7 @@ func NewSidecarPool(n int) (*SidecarPool, error) {
 	}
 	workers := make([]*SidecarEmbedder, n)
 	for i := 0; i < n; i++ {
-		w, err := startSidecar(binPath)
+		w, err := startSidecar(binPath, cfg)
 		if err != nil {
 			for j := 0; j < i; j++ {
 				_ = workers[j].Close()
@@ -34,7 +40,7 @@ func NewSidecarPool(n int) (*SidecarPool, error) {
 		}
 		workers[i] = w
 	}
-	return &SidecarPool{workers: workers}, nil
+	return &SidecarPool{workers: workers, maxBatch: cfg.maxBatch()}, nil
 }
 
 // EmbedBatch distributes the batch across workers in round-robin fashion.
@@ -45,8 +51,12 @@ func (p *SidecarPool) EmbedBatch(ctx context.Context, texts []string) ([][]float
 	if len(texts) == 0 {
 		return nil, nil
 	}
-	if len(texts) > 32*len(p.workers) {
-		return nil, fmt.Errorf("embed: total batch size %d exceeds pool capacity %d", len(texts), 32*len(p.workers))
+	if len(texts) > p.maxBatch*len(p.workers) {
+		return nil, fmt.Errorf(
+			"embed: total batch size %d exceeds pool capacity %d",
+			len(texts),
+			p.maxBatch*len(p.workers),
+		)
 	}
 
 	// Per-batch deadline prevents a single dead worker from hanging

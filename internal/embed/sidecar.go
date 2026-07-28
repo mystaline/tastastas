@@ -9,8 +9,7 @@
 //	out: {"embeddings": [[...]], "error": null}
 //
 // One request in flight at a time (mutex-guarded) — the sidecar is a
-// single persistent subprocess, not a pool. Batches of up to 32 chunks
-// keep this fast enough in practice (ingest already batches at 32).
+// single persistent subprocess, not a pool.
 package embed
 
 import (
@@ -34,15 +33,36 @@ var sidecarBinFS embed.FS
 
 const sidecarDim = 384
 
+// SidecarConfig controls sidecar subprocess behaviour.
+type SidecarConfig struct {
+	IntraThreads int // 0 = ONNX default (all cores)
+	MaxBatchSize int // 0 = default 32
+}
+
+func (c SidecarConfig) intraThreadsArgs() []string {
+	if c.IntraThreads <= 0 {
+		return nil
+	}
+	return []string{"--intra-threads", fmt.Sprint(c.IntraThreads)}
+}
+
+func (c SidecarConfig) maxBatch() int {
+	if c.MaxBatchSize <= 0 {
+		return 32
+	}
+	return c.MaxBatchSize
+}
+
 // SidecarEmbedder shells out to the baked ONNX binary for embeddings.
 // Implements the same interface as Embedder (Embed / EmbedBatch), so it's
 // a drop-in swap wherever *embed.Embedder is used.
 type SidecarEmbedder struct {
-	mu      sync.Mutex
-	cmd     *exec.Cmd
-	in      io.WriteCloser
-	out     *bufio.Reader
-	binPath string
+	mu       sync.Mutex
+	cmd      *exec.Cmd
+	in       io.WriteCloser
+	out      *bufio.Reader
+	binPath  string
+	maxBatch int
 }
 
 type sidecarRequest struct {
@@ -82,17 +102,23 @@ func extractSidecarBin() (string, error) {
 // a persistent subprocess. For pool usage, prefer extractSidecarBin + startSidecar
 // to avoid extracting the binary N times.
 func NewSidecar() (*SidecarEmbedder, error) {
+	return NewSidecarWithConfig(SidecarConfig{})
+}
+
+// NewSidecarWithConfig creates a sidecar with the given config.
+func NewSidecarWithConfig(cfg SidecarConfig) (*SidecarEmbedder, error) {
 	binPath, err := extractSidecarBin()
 	if err != nil {
 		return nil, err
 	}
-	return startSidecar(binPath)
+	return startSidecar(binPath, cfg)
 }
 
 // startSidecar starts a sidecar subprocess from an existing binary path.
 // Used by SidecarPool to spawn N workers from one extracted binary.
-func startSidecar(binPath string) (*SidecarEmbedder, error) {
-	cmd := exec.Command(binPath)
+func startSidecar(binPath string, cfg SidecarConfig) (*SidecarEmbedder, error) {
+	args := cfg.intraThreadsArgs()
+	cmd := exec.Command(binPath, args...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("embed: sidecar stdin pipe: %w", err)
@@ -108,10 +134,11 @@ func startSidecar(binPath string) (*SidecarEmbedder, error) {
 	}
 
 	return &SidecarEmbedder{
-		cmd:     cmd,
-		in:      stdin,
-		out:     bufio.NewReader(stdout),
-		binPath: binPath,
+		cmd:      cmd,
+		in:       stdin,
+		out:      bufio.NewReader(stdout),
+		binPath:  binPath,
+		maxBatch: cfg.maxBatch(),
 	}, nil
 }
 
@@ -137,14 +164,13 @@ func (s *SidecarEmbedder) Embed(ctx context.Context, text string) ([]float32, er
 	return vecs[0], nil
 }
 
-// EmbedBatch embeds up to 32 texts in a single sidecar round-trip.
-// Respects context cancellation.
+// EmbedBatch embeds up to maxBatch texts in a single sidecar round-trip.
 func (s *SidecarEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, nil
 	}
-	if len(texts) > 32 {
-		return nil, fmt.Errorf("embed: batch size %d exceeds max 32", len(texts))
+	if len(texts) > s.maxBatch {
+		return nil, fmt.Errorf("embed: batch size %d exceeds max %d", len(texts), s.maxBatch)
 	}
 
 	// Lock with context awareness — TryLock polling loop avoids blocking

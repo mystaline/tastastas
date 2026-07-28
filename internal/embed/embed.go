@@ -23,14 +23,23 @@ type EmbedderBackend interface {
 
 // Config holds embedder settings.
 type Config struct {
-	OllamaURL string // e.g. "http://localhost:11434"
-	Model     string // e.g. "nomic-embed-text"
+	OllamaURL    string // e.g. "http://localhost:11434"
+	Model        string // e.g. "nomic-embed-text"
+	MaxBatchSize int    // 0 = default 32
+}
+
+func (c Config) maxBatch() int {
+	if c.MaxBatchSize <= 0 {
+		return 32
+	}
+	return c.MaxBatchSize
 }
 
 // Embedder calls a local Ollama embedding model.
 type Embedder struct {
-	cfg    Config
-	client *http.Client
+	cfg      Config
+	client   *http.Client
+	maxBatch int
 }
 
 // New creates an Embedder with the given config.
@@ -42,8 +51,9 @@ func New(cfg Config) *Embedder {
 		cfg.Model = "nomic-embed-text"
 	}
 	return &Embedder{
-		cfg:    cfg,
-		client: &http.Client{Timeout: 60 * time.Second},
+		cfg:      cfg,
+		client:   &http.Client{Timeout: 60 * time.Second},
+		maxBatch: cfg.maxBatch(),
 	}
 }
 
@@ -68,14 +78,13 @@ func (e *Embedder) Embed(ctx context.Context, text string) ([]float32, error) {
 	return vecs[0], nil
 }
 
-	// EmbedBatch embeds up to 64 texts in a single Ollama /api/embed
-// overhead. Callers with more than 32 texts must chunk themselves.
+// EmbedBatch embeds texts in a single Ollama /api/embed call.
 func (e *Embedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, nil
 	}
-	if len(texts) > 32 {
-		return nil, fmt.Errorf("embed: batch size %d exceeds max 32", len(texts))
+	if len(texts) > e.maxBatch {
+		return nil, fmt.Errorf("embed: batch size %d exceeds max %d", len(texts), e.maxBatch)
 	}
 
 	body, err := json.Marshal(embedRequest{Model: e.cfg.Model, Input: texts})

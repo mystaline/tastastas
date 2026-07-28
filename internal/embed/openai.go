@@ -14,11 +14,12 @@ import (
 )
 
 type OpenAIEmbedder struct {
-	apiKey  string
-	model   string
-	baseURL string
-	dim     int
-	client  *http.Client
+	apiKey   string
+	model    string
+	baseURL  string
+	dim      int
+	client   *http.Client
+	maxBatch int
 }
 
 type openaiEmbedRequest struct {
@@ -39,13 +40,13 @@ type openaiEmbedUsage struct {
 }
 
 type openaiEmbedResponse struct {
-	Object string           `json:"object"`
+	Object string            `json:"object"`
 	Data   []openaiEmbedData `json:"data"`
-	Model  string           `json:"model"`
-	Usage  openaiEmbedUsage `json:"usage"`
+	Model  string            `json:"model"`
+	Usage  openaiEmbedUsage  `json:"usage"`
 }
 
-func NewOpenAI(apiKey, model, baseURL string, dim int) *OpenAIEmbedder {
+func NewOpenAI(apiKey, model, baseURL string, dim, maxBatchSize int) *OpenAIEmbedder {
 	if baseURL == "" {
 		baseURL = "https://api.openai.com/v1"
 	}
@@ -55,12 +56,16 @@ func NewOpenAI(apiKey, model, baseURL string, dim int) *OpenAIEmbedder {
 	if dim <= 0 {
 		dim = 1536
 	}
+	if maxBatchSize <= 0 {
+		maxBatchSize = 2048
+	}
 	return &OpenAIEmbedder{
-		apiKey:  apiKey,
-		model:   model,
-		baseURL: strings.TrimRight(baseURL, "/"),
-		dim:     dim,
-		client:  &http.Client{Timeout: 30 * time.Second},
+		apiKey:   apiKey,
+		model:    model,
+		baseURL:  strings.TrimRight(baseURL, "/"),
+		dim:      dim,
+		maxBatch: maxBatchSize,
+		client:   &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
@@ -79,8 +84,8 @@ func (o *OpenAIEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 	if len(texts) == 0 {
 		return nil, nil
 	}
-	if len(texts) > 2048 {
-		return nil, fmt.Errorf("openai: batch size %d exceeds max 2048", len(texts))
+	if len(texts) > o.maxBatch {
+		return nil, fmt.Errorf("openai: batch size %d exceeds max %d", len(texts), o.maxBatch)
 	}
 
 	body, err := json.Marshal(openaiEmbedRequest{
