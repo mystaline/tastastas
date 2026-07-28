@@ -78,7 +78,8 @@ func (s *Store) initSchema(ctx context.Context) error {
 		if exists != 0 {
 			// Check current dimension
 			var sqlStr string
-			s.db.QueryRowContext(ctx, "SELECT sql FROM sqlite_master WHERE name = ? AND type = 'table'", tbl).Scan(&sqlStr)
+			s.db.QueryRowContext(ctx, "SELECT sql FROM sqlite_master WHERE name = ? AND type = 'table'", tbl).
+				Scan(&sqlStr)
 			wantDim := fmt.Sprintf("float[%d]", s.dim)
 			if !strings.Contains(sqlStr, wantDim) {
 				if _, err := s.db.ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl); err != nil {
@@ -105,7 +106,10 @@ func (s *Store) initSchema(ctx context.Context) error {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) SetJobMarker(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO job_marker (id) VALUES (1) ON CONFLICT(id) DO UPDATE SET started_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`)
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO job_marker (id) VALUES (1) ON CONFLICT(id) DO UPDATE SET started_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
+	)
 	return err
 }
 
@@ -205,6 +209,53 @@ func (s *Store) UpsertEdge(ctx context.Context, e store.Edge) error {
 		return fmt.Errorf("sqlite: upsert edge %s->%s(%s): %w", e.FromID, e.ToID, e.EdgeType, err)
 	}
 	return nil
+}
+
+func (s *Store) UpsertEdges(ctx context.Context, edges []store.Edge) error {
+	if len(edges) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlite: begin edge upsert tx: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	for i := 0; i < len(edges); i += upsertEdgeBatch {
+		end := i + upsertEdgeBatch
+		if end > len(edges) {
+			end = len(edges)
+		}
+		batch := edges[i:end]
+
+		var valStrings []string
+		var args []any
+		for _, e := range batch {
+			if e.FromID == "" || e.ToID == "" || e.EdgeType == "" {
+				return errors.New("sqlite: edge requires from_id, to_id, edge_type")
+			}
+			if e.Confidence == 0 {
+				e.Confidence = 1.0
+			}
+			valStrings = append(valStrings, "(?,?,?,?)")
+			args = append(args, e.FromID, e.ToID, e.EdgeType, e.Confidence)
+		}
+		_, err = tx.ExecContext(ctx,
+			fmt.Sprintf(`
+				INSERT INTO edges (from_id, to_id, edge_type, confidence)
+				VALUES %s
+				ON CONFLICT(from_id, to_id, edge_type) DO UPDATE SET confidence = excluded.confidence
+			`, strings.Join(valStrings, ",")),
+			args...,
+		)
+		if err != nil {
+			return fmt.Errorf("sqlite: upsert edge batch %d-%d: %w", i, end, err)
+		}
+	}
+
+	return tx.Commit()
 }
 
 func (s *Store) DeleteNode(ctx context.Context, id string) error {
@@ -330,6 +381,7 @@ func (s *Store) SearchVector(
 // with modernc.org/sqlite — each ExecContext has overhead that dominates
 // at N > 100, even within a transaction.
 const upsertChunkBatch = 100
+const upsertEdgeBatch = 100
 
 func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 	if len(chunks) == 0 {
@@ -357,8 +409,12 @@ func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 		}
 		inClause := strings.Join(placeholders, ",")
 
-		_, err = tx.ExecContext(ctx,
-			fmt.Sprintf(`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE parent_node_id IN (%s))`, inClause),
+		_, err = tx.ExecContext(
+			ctx,
+			fmt.Sprintf(
+				`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE parent_node_id IN (%s))`,
+				inClause,
+			),
 			args...,
 		)
 		if err != nil {
@@ -390,7 +446,19 @@ func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 		for _, c := range batch {
 			headingJSON, _ := json.Marshal(c.HeadingPath)
 			chunkValStrings = append(chunkValStrings, "(?,?,?,?,?,?,?,?,?,?)")
-			chunkArgs = append(chunkArgs, c.ID, c.ParentNodeID, c.ChunkIndex, c.Type, string(headingJSON), c.Content, c.Language, c.SourceAdapter, c.PrevChunkID, c.NextChunkID)
+			chunkArgs = append(
+				chunkArgs,
+				c.ID,
+				c.ParentNodeID,
+				c.ChunkIndex,
+				c.Type,
+				string(headingJSON),
+				c.Content,
+				c.Language,
+				c.SourceAdapter,
+				c.PrevChunkID,
+				c.NextChunkID,
+			)
 		}
 		_, err = tx.ExecContext(ctx,
 			fmt.Sprintf(`
@@ -418,7 +486,12 @@ func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 				continue
 			}
 			if len(c.Embedding) != s.dim {
-				return fmt.Errorf("sqlite: chunk %s embedding has dim %d, store configured for dim %d", c.ID, len(c.Embedding), s.dim)
+				return fmt.Errorf(
+					"sqlite: chunk %s embedding has dim %d, store configured for dim %d",
+					c.ID,
+					len(c.Embedding),
+					s.dim,
+				)
 			}
 			vecJSON, _ := json.Marshal(c.Embedding)
 			vecValStrings = append(vecValStrings, "(?, vec_f32(?))")
@@ -434,7 +507,12 @@ func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 				if err != nil {
 					return fmt.Errorf("sqlite: delete chunk vector %s: %w", c.ID, err)
 				}
-				_, err = tx.ExecContext(ctx, `INSERT INTO chunk_vectors (chunk_id, embedding) VALUES (?, vec_f32(?))`, c.ID, string(vecJSON))
+				_, err = tx.ExecContext(
+					ctx,
+					`INSERT INTO chunk_vectors (chunk_id, embedding) VALUES (?, vec_f32(?))`,
+					c.ID,
+					string(vecJSON),
+				)
 				if err != nil {
 					return fmt.Errorf("sqlite: insert chunk vector %s: %w", c.ID, err)
 				}
