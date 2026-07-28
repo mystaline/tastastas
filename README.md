@@ -83,11 +83,11 @@ export TASTASTAS_OPENAI_KEY=sk-...
 ./tastastas --serve :8080 --embed-backend openai
 ```
 
-MCP client config: HTTP mode (`--serve`) → same as Option A, see → HTTP.
+MCP client config: stdio mode → see [MCP Configuration](#mcp-configuration) → Stdio + OpenAI. HTTP mode (`--serve`) → same as Option A, see → HTTP.
 
 ## MCP Configuration
 
-Config depends on how you started tastastas (Option A/B/C above). Pick the matching block.
+Config depends on how you started tastastas (Option A/B/C/D above). Pick the matching block.
 
 Only Claude Code and Kilo Code shown below — other agents just adjust to that agent's own MCP config format/file.
 
@@ -174,6 +174,45 @@ Kilo Code:
     "--embed-backend", "ollama",
     "--graph-addr", ":9292"
   ],
+  "enabled": true
+}
+```
+
+**Stdio + OpenAI (Option D):**
+
+Claude Code:
+```json
+{
+  "mcpServers": {
+    "tastastas": {
+      "type": "stdio",
+      "command": "/path/to/tastastas",
+      "env": {
+        "TASTASTAS_OPENAI_KEY": "sk-..."
+      },
+      "args": [
+        "--db", "~/.local/share/tastastas/memory.db",
+        "--embed-backend", "openai",
+        "--graph-addr", ":9292"
+      ]
+    }
+  }
+}
+```
+
+Kilo Code:
+```json
+"tastastas": {
+  "type": "local",
+  "command": [
+    "/path/to/tastastas",
+    "--db", "~/.local/share/tastastas/memory.db",
+    "--embed-backend", "openai",
+    "--graph-addr", ":9292"
+  ],
+  "env": {
+    "TASTASTAS_OPENAI_KEY": "sk-..."
+  },
   "enabled": true
 }
 ```
