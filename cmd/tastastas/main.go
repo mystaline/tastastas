@@ -112,6 +112,13 @@ func main() {
 		embedBackend := updateCmd.String("embed-backend", "sidecar", "embedder backend")
 		updateCmd.Parse(os.Args[2:])
 
+		if strings.HasPrefix(*dbPath, "~/") {
+			home, err := os.UserHomeDir()
+			if err == nil {
+				*dbPath = filepath.Join(home, (*dbPath)[2:])
+			}
+		}
+
 		if *embedDim <= 0 {
 			switch *embedBackend {
 			case "openai":
@@ -143,8 +150,8 @@ func main() {
 	serve := flag.String("serve", "", "run as HTTP server on given address (e.g. :8080)")
 	graphAddr := flag.String("graph-addr", "", "serve graph visualization page on this address (e.g. :9292) — works in both stdio and HTTP mode")
 	dbPath := flag.String("db", defaultDBPath(), "path to SQLite database file (default: $XDG_DATA_HOME/tastastas/memory.db — cwd-independent so all projects share one source of truth)")
-	embedDim := flag.Int("embed-dim", 0, "embedding vector dimension (0 = auto-detect: 384 for sidecar, 768 for ollama)")
-	embedBackend := flag.String("embed-backend", "sidecar", "embedder backend: sidecar (baked ONNX, zero deps, 384-dim), ollama (HTTP, 768-dim default with nomic-embed-text), or none (lexical only)")
+	embedDim := flag.Int("embed-dim", 0, "embedding vector dimension (0 = auto-detect: 384 for sidecar, 768 for ollama, 1536 for openai)")
+	embedBackend := flag.String("embed-backend", "sidecar", "embedder backend: sidecar (baked ONNX, zero deps, 384-dim), ollama (HTTP, 768-dim), openai (cloud API, 1536-dim), or none (lexical only)")
 	ollamaURL := flag.String("ollama-url", "http://localhost:11434", "Ollama base URL (used when --embed-backend=ollama)")
 	ollamaModel := flag.String("ollama-model", "nomic-embed-text", "Ollama embedding model (used when --embed-backend=ollama)")
 	sidecarWorkers := flag.Int("sidecar-workers", 0, "number of sidecar workers (0 = 4, only for --embed-backend=sidecar)")
@@ -156,6 +163,15 @@ func main() {
 
 	if *openaiKey == "" {
 		*openaiKey = os.Getenv("TASTASTAS_OPENAI_KEY")
+	}
+
+	// Expand ~/ in dbPath — MCP clients spawn without shell, so tilde
+	// isn't expanded by the OS.
+	if strings.HasPrefix(*dbPath, "~/") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			*dbPath = filepath.Join(home, (*dbPath)[2:])
+		}
 	}
 
 	// Ensure DB directory exists (for local SQLite, not remote DSN).

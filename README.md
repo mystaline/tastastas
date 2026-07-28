@@ -180,6 +180,12 @@ Kilo Code:
 
 **Stdio + OpenAI (Option D):**
 
+```bash
+# Prefer env var (not in process list)
+export TASTASTAS_OPENAI_KEY=sk-...
+./tastastas --embed-backend openai
+```
+
 Claude Code:
 ```json
 {
@@ -187,14 +193,14 @@ Claude Code:
     "tastastas": {
       "type": "stdio",
       "command": "/path/to/tastastas",
-      "env": {
-        "TASTASTAS_OPENAI_KEY": "sk-..."
-      },
       "args": [
         "--db", "~/.local/share/tastastas/memory.db",
         "--embed-backend", "openai",
         "--graph-addr", ":9292"
-      ]
+      ],
+      "env": {
+        "TASTASTAS_OPENAI_KEY": "sk-..."
+      }
     }
   }
 }
@@ -232,7 +238,7 @@ tastastas is an MCP server connected to this project. If you see tastastas in yo
 |------|---------|-------------|
 | `--serve` | *(unset)* | HTTP address (`:8080`). Unset = stdio MCP mode. |
 | `--db` | `~/.local/share/tastastas/memory.db` | SQLite DB path (honors `$TASTASTAS_DB`, `$XDG_DATA_HOME`) |
-| `--embed-dim` | `0` = auto-detect | Vector dimension: 384 for sidecar, 768 for ollama, 0 = pick from backend |
+| `--embed-dim` | `0` = auto-detect | Vector dimension: 384 for sidecar, 768 for ollama, 1536 for openai, 0 = pick from backend |
 | `--embed-backend` | `sidecar` | `sidecar` (baked ONNX, zero deps), `ollama` (local, 768-dim), `openai` (cloud API, 1536-dim), or `none` (lexical only) |
 | `--ollama-url` | `http://localhost:11434` | Ollama URL (`embed-backend=ollama`) |
 | `--ollama-model` | `nomic-embed-text` | Ollama embedding model (`embed-backend=ollama`) |
