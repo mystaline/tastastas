@@ -110,7 +110,11 @@ func (p *SidecarPool) EmbedBatch(ctx context.Context, texts []string) ([][]float
 }
 
 // Embed delegates to the next worker (round-robin).
+// Wraps ctx with 10s timeout as safety net — prevents indefinite blocking
+// if caller forgets to set a deadline (e.g. future code paths).
 func (p *SidecarPool) Embed(ctx context.Context, text string) ([]float32, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	w := p.workers[p.next%len(p.workers)]
 	p.next++
 	return w.Embed(ctx, text)
