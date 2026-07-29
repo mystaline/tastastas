@@ -416,7 +416,7 @@ func (c *CodeastIngestor) ingestTreeSitter(lang string) ([]store.Node, []store.E
 			return err
 		}
 		if d.IsDir() {
-			if strings.HasPrefix(d.Name(), ".") && path != c.cfg.Root {
+			if path != c.cfg.Root && (strings.HasPrefix(d.Name(), ".") || d.Name() == "vendor" || d.Name() == "node_modules" || d.Name() == "dist" || d.Name() == "bin") {
 				return filepath.SkipDir
 			}
 			return nil

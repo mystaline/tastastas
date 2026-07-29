@@ -191,6 +191,26 @@ type Store interface {
 	// HasJobMarker returns true if a previous run was interrupted.
 	HasJobMarker(ctx context.Context) (bool, error)
 
+	// GetEmbedModelID returns the stored model identity for a project.
+	// Returns empty string if no record exists.
+	GetEmbedModelID(ctx context.Context, projectID string) (string, error)
+
+	// GetEmbedModelStatus returns the dirty/clean status for a project.
+	// Returns empty string if no record exists.
+	GetEmbedModelStatus(ctx context.Context, projectID string) (string, error)
+
+	// InitEmbedConfig creates the config row as 'clean' if not exists.
+	// Used by remember/extract_and_remember — single-input tools.
+	InitEmbedConfig(ctx context.Context, projectID, modelID string) error
+
+	// SetEmbedModelDirty creates/updates the config row as 'dirty'.
+	// Used by onboard/ingest at goroutine start (guardIngest).
+	SetEmbedModelDirty(ctx context.Context, projectID, modelID string) error
+
+	// SetEmbedModelClean updates the config row status to 'clean'.
+	// Used by onboard/ingest after success.
+	SetEmbedModelClean(ctx context.Context, projectID string) error
+
 	Close() error
 }
 
@@ -207,10 +227,11 @@ type EdgeProposal struct {
 
 // StoreStats holds aggregate project-level counts for inspection tools.
 type StoreStats struct {
-	NodeCount     int `json:"node_count"`
-	EdgeCount     int `json:"edge_count"`
-	ChunkCount    int `json:"chunk_count"`
-	VecCount      int `json:"vec_count"`
-	StaleCount    int `json:"stale_count"`
-	ConventionCnt int `json:"convention_count"`
+	NodeCount     int    `json:"node_count"`
+	EdgeCount     int    `json:"edge_count"`
+	ChunkCount    int    `json:"chunk_count"`
+	VecCount      int    `json:"vec_count"`
+	StaleCount    int    `json:"stale_count"`
+	ConventionCnt int    `json:"convention_count"`
+	EmbedModelID  string `json:"embed_model_id,omitempty"`
 }

@@ -855,7 +855,29 @@ func (s *Store) Stats(ctx context.Context, projectID string) (store.StoreStats, 
 		return st, fmt.Errorf("libsql: stats conventions: %w", err)
 	}
 
+	st.EmbedModelID, _ = s.GetEmbedModelID(ctx, projectID)
+
 	return st, nil
+}
+
+func (s *Store) GetEmbedModelID(ctx context.Context, projectID string) (string, error) {
+	return "", nil
+}
+
+func (s *Store) GetEmbedModelStatus(ctx context.Context, projectID string) (string, error) {
+	return "", nil
+}
+
+func (s *Store) InitEmbedConfig(ctx context.Context, projectID, modelID string) error {
+	return nil
+}
+
+func (s *Store) SetEmbedModelDirty(ctx context.Context, projectID, modelID string) error {
+	return nil
+}
+
+func (s *Store) SetEmbedModelClean(ctx context.Context, projectID string) error {
+	return nil
 }
 
 func (s *Store) EdgeTypeCounts(ctx context.Context, projectID string) (map[string]int, error) {

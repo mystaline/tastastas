@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -33,6 +34,35 @@ func (c Config) maxBatch() int {
 		return 32
 	}
 	return c.MaxBatchSize
+}
+
+// ProbeOllamaDim sends a single test embed request to Ollama and returns the
+// native output dimension for the given model.
+func ProbeOllamaDim(url, model string) (int, error) {
+	if url == "" {
+		url = "http://localhost:11434"
+	}
+	if model == "" {
+		model = "nomic-embed-text"
+	}
+	body, _ := json.Marshal(embedRequest{Model: model, Input: []string{"test"}})
+	resp, err := http.Post(strings.TrimRight(url, "/")+"/api/embed", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return 0, fmt.Errorf("ollama probe: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("ollama probe: %s: %s", resp.Status, strings.TrimSpace(string(b)))
+	}
+	var out embedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, fmt.Errorf("ollama probe: decode: %w", err)
+	}
+	if len(out.Embeddings) == 0 {
+		return 0, fmt.Errorf("ollama probe: empty embeddings")
+	}
+	return len(out.Embeddings[0]), nil
 }
 
 // Embedder calls a local Ollama embedding model.

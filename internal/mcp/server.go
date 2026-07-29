@@ -140,7 +140,8 @@ func chunkAndEmbedNodes(
 		}
 		vecs, err := embedder.EmbedBatch(ctx, texts)
 		if err != nil {
-			return 0, fmt.Errorf("embed batch %d-%d: %w", i, end, err)
+			log.Printf("chunkAndEmbedNodes: batch %d-%d failed (%v), skipping", i, end, err)
+			continue
 		}
 		for j := range batch {
 			allChunks[needEmbedIdx[i+j]].Embedding = vecs[j]
@@ -170,7 +171,7 @@ func safeGo(fn func()) {
 	}()
 }
 
-func NewServer(db store.Store, embedder embed.EmbedderBackend, batchSize int) *mcp.Server {
+func NewServer(db store.Store, embedder embed.EmbedderBackend, batchSize int, modelID string) *mcp.Server {
 	srv := mcp.NewServer(
 		&mcp.Implementation{
 			Name:    "tastastas",
@@ -179,11 +180,50 @@ func NewServer(db store.Store, embedder embed.EmbedderBackend, batchSize int) *m
 		nil,
 	)
 
-	registerTools(srv, db, embedder, batchSize)
+	registerTools(srv, db, embedder, batchSize, modelID)
 	return srv
 }
 
-func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBackend, batchSize int) {
+// checkEmbedModel returns an error if the project already has a stored
+// embed model that differs from the current modelID.
+func checkEmbedModel(ctx context.Context, db store.Store, projectID, modelID string) error {
+	if modelID == "" {
+		return nil // lexical-only mode
+	}
+	// If project has no nodes, allow regardless of config row
+	// (handles: forget all nodes → re-onboard with different model)
+	stats, err := db.Stats(ctx, projectID)
+	if err == nil && stats.NodeCount == 0 {
+		return nil
+	}
+	stored, err := db.GetEmbedModelID(ctx, projectID)
+	if err != nil || stored == "" {
+		return nil // no prior data
+	}
+	if stored != modelID {
+		return fmt.Errorf(
+			"embed model mismatch: stored=%q current=%q — re-ingest with 'onboard' or 'ingest' to migrate",
+			stored, modelID,
+		)
+	}
+	return nil
+}
+
+// checkEmbedClean blocks recall if stored data is dirty (incomplete from crash).
+// Bypasses if project has no nodes (stale dirty from crash-before-first-node).
+func checkEmbedClean(ctx context.Context, db store.Store, projectID string) error {
+	status, err := db.GetEmbedModelStatus(ctx, projectID)
+	if err != nil || status == "" || status == "clean" {
+		return nil
+	}
+	stats, _ := db.Stats(ctx, projectID)
+	if stats.NodeCount == 0 {
+		return nil // no data = dirty irrelevant
+	}
+	return fmt.Errorf("previous ingest was interrupted — data may be incomplete. Run 'onboard' to complete")
+}
+
+func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBackend, batchSize int, modelID string) {
 	retriever := retrieve.New(db, retrieve.DefaultConfig())
 	extractor := extract.New(extract.Config{})
 	jobs := newJobStore(db)
@@ -202,7 +242,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
   3. Prefer 'link' (create edges) over 'remember' (store text or quick memorable notes) for complex relationships (ERD, PRD, API spec).
   4. 'recall' returns ranked structural edges + inferred links; use 'query_graph' to inspect proposals.
   5. Ingest is idempotent; run on every push.`
-		output := InitOutput{Help: help}
+		output := InitOutput{Help: help, ModelID: modelID}
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: help}}}, output, nil
 	})
 
@@ -225,8 +265,16 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			}
 		}
 
+		if err := checkEmbedModel(ctx, db, projectID, modelID); err != nil {
+			return errorResult(err), OnboardOutput{}, nil
+		}
+
 		job := jobs.create()
 		safeGo(func() {
+			bctx := context.Background()
+			if modelID != "" {
+				_ = db.SetEmbedModelDirty(bctx, projectID, modelID)
+			}
 			defer jobs.finish(job.ID, 0, 0, 0, func() error {
 				result, err := onboard.Run(
 					context.Background(),
@@ -241,9 +289,12 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 				if err != nil {
 					return err
 				}
-				if result.AlreadyOnboarded {
-					return nil
+			if result.AlreadyOnboarded {
+				if modelID != "" {
+					_ = db.SetEmbedModelClean(bctx, projectID)
 				}
+				return nil
+			}
 				// Report walk counts and transition phase to "embedding" — same as ingest path.
 				jobs.updateCounts(job.ID, result.FilesWalked, result.FilesSkipped)
 
@@ -268,9 +319,11 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 					return fmt.Errorf("chunk/embed: %w", err)
 				}
 				_ = chunkCount
+				if modelID != "" {
+					_ = db.SetEmbedModelClean(bctx, projectID)
+				}
 				return nil
 			}())
-			// Report walk counts and transition phase to "embedding" — same as ingest path.
 		})
 		// Report walk counts and transition phase to "embedding" — same as ingest path.
 
@@ -353,6 +406,13 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 				importance = 0.5
 			}
 
+			if err := checkEmbedModel(ctx, db, projectID, modelID); err != nil {
+				return errorResult(err), RememberOutput{}, nil
+			}
+			if modelID != "" {
+				_ = db.InitEmbedConfig(ctx, projectID, modelID)
+			}
+
 			n := store.Node{
 				ID: id, NodeType: nodeType, Title: args.Title, Content: args.Content,
 				ProjectID: projectID, Importance: importance, SourceAdapter: "mcp",
@@ -410,6 +470,14 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			if limit == 0 {
 				limit = 10
 			}
+
+			if err := checkEmbedModel(ctx, db, projectID, modelID); err != nil {
+				return errorResult(err), RecallOutput{}, nil
+			}
+			if err := checkEmbedClean(ctx, db, projectID); err != nil {
+				return errorResult(err), RecallOutput{}, nil
+			}
+
 			params := retrieve.RecallParams{
 				ProjectID:     projectID,
 				Query:         args.Query,
@@ -625,8 +693,22 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			}
 		}
 
+		if err := checkEmbedModel(ctx, db, projectID, modelID); err != nil {
+			return errorResult(err), IngestOutput{}, nil
+		}
+
 		job := jobs.create()
 		safeGo(func() {
+			bctx := context.Background()
+			ingestDone := false
+			if modelID != "" {
+				_ = db.SetEmbedModelDirty(bctx, projectID, modelID)
+				defer func() {
+					if ingestDone {
+						_ = db.SetEmbedModelClean(bctx, projectID)
+					}
+				}()
+			}
 			nodes, edges, _, filesWalked, filesSkipped, err := onboard.AutoDetectAdapters(
 				context.Background(),
 				db,
@@ -696,6 +778,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			nodes = append(nodes, hierNodes...)
 
 			auto, proposals := onboard.Tier2ScoreAndLink(context.Background(), db, projectID, nodes)
+			ingestDone = true
 			jobs.finish(job.ID, len(nodes), len(edges), chunkCount, nil, len(convNodes), auto, proposals)
 		})
 
@@ -751,9 +834,19 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			projectID = "default"
 		}
 
+		if err := checkEmbedModel(ctx, db, projectID, modelID); err != nil {
+			return errorResult(err), ExtractAndRememberOutput{}, nil
+		}
+
 		job := jobs.create()
 		safeGo(func() {
 			defer jobs.finish(job.ID, 0, 0, 0, func() error {
+				if modelID != "" {
+					_ = db.InitEmbedConfig(context.Background(), projectID, modelID)
+				}
+				if embedder == nil {
+					return fmt.Errorf("extract_and_remember requires a configured embedder")
+				}
 				facts, err := extractor.Extract(context.Background(), args.Conversation)
 				if err != nil {
 					return fmt.Errorf("extract: %w", err)

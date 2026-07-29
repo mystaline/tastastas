@@ -757,7 +757,51 @@ func (s *Store) Stats(ctx context.Context, projectID string) (store.StoreStats, 
 		return st, fmt.Errorf("sqlite: stats conventions: %w", err)
 	}
 
+	st.EmbedModelID, _ = s.GetEmbedModelID(ctx, projectID) // best-effort
+
 	return st, nil
+}
+
+func (s *Store) GetEmbedModelID(ctx context.Context, projectID string) (string, error) {
+	var modelID string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT model_id FROM project_embed_config WHERE project_id = ?`, projectID).Scan(&modelID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return modelID, err
+}
+
+func (s *Store) GetEmbedModelStatus(ctx context.Context, projectID string) (string, error) {
+	var status string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT status FROM project_embed_config WHERE project_id = ?`, projectID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return status, err
+}
+
+func (s *Store) InitEmbedConfig(ctx context.Context, projectID, modelID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO project_embed_config (project_id, model_id, status, created_at)
+		 VALUES (?, ?, 'clean', strftime('%Y-%m-%dT%H:%M:%fZ','now'))`,
+		projectID, modelID)
+	return err
+}
+
+func (s *Store) SetEmbedModelDirty(ctx context.Context, projectID, modelID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT OR REPLACE INTO project_embed_config (project_id, model_id, status, created_at)
+		 VALUES (?, ?, 'dirty', strftime('%Y-%m-%dT%H:%M:%fZ','now'))`,
+		projectID, modelID)
+	return err
+}
+
+func (s *Store) SetEmbedModelClean(ctx context.Context, projectID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE project_embed_config SET status = 'clean' WHERE project_id = ?`, projectID)
+	return err
 }
 
 func (s *Store) EdgeTypeCounts(ctx context.Context, projectID string) (map[string]int, error) {

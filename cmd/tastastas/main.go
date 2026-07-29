@@ -230,9 +230,20 @@ func main() {
 	if *embedDim <= 0 {
 		switch *embedBackend {
 		case "openai":
-			*embedDim = 1536
+			if *openaiKey == "" {
+				log.Fatal("embed: --openai-api-key or $TASTASTAS_OPENAI_KEY required for --embed-backend=openai")
+			}
+			probed, err := embed.ProbeOpenAIDim(*openaiKey, *openaiModel, *openaiBaseURL)
+			if err != nil {
+				log.Fatalf("embed: probe openai dim: %v", err)
+			}
+			*embedDim = probed
 		case "ollama":
-			*embedDim = 768
+			probed, err := embed.ProbeOllamaDim(*ollamaURL, *ollamaModel)
+			if err != nil {
+				log.Fatalf("embed: probe ollama dim: %v", err)
+			}
+			*embedDim = probed
 		default:
 			*embedDim = 384
 		}
@@ -259,6 +270,17 @@ func main() {
 	embedder := newEmbedder(*embedBackend, *sidecarWorkers, *sidecarIntraThreads, *batchSize,
 		*ollamaURL, *ollamaModel,
 		*openaiKey, *openaiModel, *openaiBaseURL, *embedDim)
+
+	modelID := ""
+	switch *embedBackend {
+	case "sidecar":
+		modelID = "sidecar:bge-small-en-v1.5:384"
+	case "openai":
+		modelID = fmt.Sprintf("openai:%s:%d", *openaiModel, *embedDim)
+	case "ollama":
+		modelID = fmt.Sprintf("ollama:%s", *ollamaModel)
+	}
+
 	closeEmbedder := func() {
 		if closer, ok := embedder.(interface{ Close() error }); ok {
 			_ = closer.Close()
@@ -279,7 +301,7 @@ func main() {
 	if *serve != "" {
 		// HTTP server mode
 		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-		err := mcpserver.ServeHTTP(ctx, db, embedder, *serve, *authToken, *batchSize)
+		err := mcpserver.ServeHTTP(ctx, db, embedder, *serve, *authToken, *batchSize, modelID)
 		cancel()
 		db.Close() // close before exit: log.Fatalf below skips defers
 		closeEmbedder()
@@ -290,7 +312,7 @@ func main() {
 	}
 
 	// Stdio MCP server mode (default)
-	srv := mcpserver.NewServer(db, embedder, *batchSize)
+	srv := mcpserver.NewServer(db, embedder, *batchSize, modelID)
 	if err := srv.Run(context.Background(), &mcpsdk.StdioTransport{}); err != nil {
 		db.Close() // close before os.Exit
 		closeEmbedder()

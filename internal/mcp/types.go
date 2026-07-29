@@ -11,7 +11,8 @@ import (
 // --- Input/Output types (Go types auto-generate MCP JSON schema) ---
 
 type InitOutput struct {
-	Help string `json:"help"`
+	Help    string `json:"help"`
+	ModelID string `json:"model_id,omitempty"`
 }
 
 type RememberInput struct {
@@ -308,6 +309,9 @@ func chunkForNode(
 				return chunkSlice(chunks, n.SourceAdapter)
 			}
 		}
+		if chunks, err := chunker.ChunkCodeByPattern(n.ID, n.Content, "go", cfg); err == nil && len(chunks) > 0 {
+			return chunkSlice(chunks, n.SourceAdapter)
+		}
 		fallthrough
 
 	case "typescript", "javascript":
@@ -316,6 +320,9 @@ func chunkForNode(
 			if err == nil && len(chunks) > 0 {
 				return chunkSlice(chunks, n.SourceAdapter)
 			}
+		}
+		if chunks, err := chunker.ChunkCodeByPattern(n.ID, n.Content, "typescript", cfg); err == nil && len(chunks) > 0 {
+			return chunkSlice(chunks, n.SourceAdapter)
 		}
 		fallthrough
 
