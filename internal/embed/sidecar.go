@@ -147,21 +147,21 @@ func (s *SidecarEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]f
 		return nil, fmt.Errorf("embed: batch size %d exceeds max 32", len(texts))
 	}
 
-	// Lock with context awareness
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
+	// Lock with context awareness — TryLock polling loop avoids blocking
+	// indefinitely when context is cancelled (e.g. recall timeout).
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if s.mu.TryLock() {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
 	}
-
-	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-	}
 
 	body, err := json.Marshal(sidecarRequest{Texts: texts})
 	if err != nil {

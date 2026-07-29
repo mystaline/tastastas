@@ -395,11 +395,13 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 				Limit:         limit,
 				LinkThreshold: args.LinkThreshold,
 			}
-			if embedder != nil {
-				if vec, err := embedder.Embed(ctx, args.Query); err == nil {
-					params.Embedding = vec
-				}
-			}
+	if embedder != nil {
+		embedCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		if vec, err := embedder.Embed(embedCtx, args.Query); err == nil {
+			params.Embedding = vec
+		}
+	}
 
 			result, err := retriever.Recall(ctx, params)
 			if err != nil {
