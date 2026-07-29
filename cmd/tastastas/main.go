@@ -259,6 +259,17 @@ func main() {
 	embedder := newEmbedder(*embedBackend, *sidecarWorkers, *sidecarIntraThreads, *batchSize,
 		*ollamaURL, *ollamaModel,
 		*openaiKey, *openaiModel, *openaiBaseURL, *embedDim)
+
+	modelID := ""
+	switch *embedBackend {
+	case "sidecar":
+		modelID = "sidecar:bge-small-en-v1.5:384"
+	case "openai":
+		modelID = fmt.Sprintf("openai:%s:%d", *openaiModel, *embedDim)
+	case "ollama":
+		modelID = fmt.Sprintf("ollama:%s", *ollamaModel)
+	}
+
 	closeEmbedder := func() {
 		if closer, ok := embedder.(interface{ Close() error }); ok {
 			_ = closer.Close()
@@ -279,7 +290,7 @@ func main() {
 	if *serve != "" {
 		// HTTP server mode
 		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-		err := mcpserver.ServeHTTP(ctx, db, embedder, *serve, *authToken, *batchSize)
+		err := mcpserver.ServeHTTP(ctx, db, embedder, *serve, *authToken, *batchSize, modelID)
 		cancel()
 		db.Close() // close before exit: log.Fatalf below skips defers
 		closeEmbedder()
@@ -290,7 +301,7 @@ func main() {
 	}
 
 	// Stdio MCP server mode (default)
-	srv := mcpserver.NewServer(db, embedder, *batchSize)
+	srv := mcpserver.NewServer(db, embedder, *batchSize, modelID)
 	if err := srv.Run(context.Background(), &mcpsdk.StdioTransport{}); err != nil {
 		db.Close() // close before os.Exit
 		closeEmbedder()

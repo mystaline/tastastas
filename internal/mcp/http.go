@@ -25,6 +25,7 @@ func ServeHTTP(
 	embedder embed.EmbedderBackend,
 	addr, authToken string,
 	batchSize int,
+	modelID string,
 ) error {
 	jobs := newJobStore(db)
 
@@ -33,7 +34,7 @@ func ServeHTTP(
 			Name:    "tastastas",
 			Version: Version,
 		}, nil)
-		registerTools(srv, db, embedder, batchSize)
+		registerTools(srv, db, embedder, batchSize, modelID)
 		return srv
 	}, nil)
 
