@@ -882,7 +882,7 @@ func (s *Store) ListEdgesByProject(
 	limit, offset int,
 ) ([]store.EdgeResult, int, error) {
 	// Use COUNT(*) OVER() windowed to get total count in same query.
-	q := `SELECT e.from_id, fn.title, fn.node_type, e.to_id, tn.title, tn.node_type, e.edge_type, e.confidence,
+	q := `SELECT e.from_id, fn.title, fn.node_type, LENGTH(fn.content), e.to_id, tn.title, tn.node_type, LENGTH(tn.content), e.edge_type, e.confidence,
 	       COUNT(*) OVER() AS total
 		FROM edges e
 		JOIN nodes fn ON fn.id = e.from_id
@@ -913,7 +913,7 @@ func (s *Store) ListEdgesByProject(
 		var er store.EdgeResult
 		var fromTitle, fromType, toTitle, toType string
 		var totalRow int
-		if err := rows.Scan(&er.FromID, &fromTitle, &fromType, &er.ToID, &toTitle, &toType, &er.EdgeType, &er.Confidence, &totalRow); err != nil {
+		if err := rows.Scan(&er.FromID, &fromTitle, &fromType, &er.FromSize, &er.ToID, &toTitle, &toType, &er.ToSize, &er.EdgeType, &er.Confidence, &totalRow); err != nil {
 			return nil, 0, fmt.Errorf("sqlite: scan edge result: %w", err)
 		}
 		total = totalRow

@@ -126,10 +126,11 @@ func HandleGraphView(db store.Store) http.HandlerFunc {
 			"imports",
 			"convention-member",
 			"auto-linked",
+			"proposed",
 			"references",
 			"contains",
 		}
-		maxEdges := 500
+		maxEdges := 2000
 		if m := r.URL.Query().Get("max_edges"); m != "" {
 			if v, err := strconv.Atoi(m); err == nil && v > 0 {
 				maxEdges = v
@@ -143,14 +144,14 @@ func HandleGraphView(db store.Store) http.HandlerFunc {
 
 		nodeMap := map[string]*struct {
 			id, title, ntype, group string
-			weight                  int
+			weight, size            int
 		}{}
-		addNode := func(id, title, ntype, group string) {
+		addNode := func(id, title, ntype, group string, size int) {
 			if _, ok := nodeMap[id]; !ok {
 				nodeMap[id] = &struct {
 					id, title, ntype, group string
-					weight                  int
-				}{id: id, title: title, ntype: ntype, group: group}
+					weight, size            int
+				}{id: id, title: title, ntype: ntype, group: group, size: size}
 			}
 			nodeMap[id].weight++
 		}
@@ -159,6 +160,7 @@ func HandleGraphView(db store.Store) http.HandlerFunc {
 			Title  string `json:"title"`
 			Type   string `json:"type"`
 			Group  string `json:"group"`
+			Size   int    `json:"size"`
 			Weight int    `json:"weight"`
 		}
 		type graphEdge struct {
@@ -167,57 +169,44 @@ func HandleGraphView(db store.Store) http.HandlerFunc {
 			EdgeType   string  `json:"edge_type"`
 			Confidence float64 `json:"confidence"`
 		}
+
 		nodes := []graphNode{}
-		edges := []graphEdge{}
+		structuralEdges := []graphEdge{}
+		proposedEdges := []graphEdge{}
 		for _, r := range results {
-			addNode(r.FromID, r.FromTitle, r.FromType, r.FromGroup)
-			addNode(r.ToID, r.ToTitle, r.ToType, r.ToGroup)
-			edges = append(edges, graphEdge{
+			addNode(r.FromID, r.FromTitle, r.FromType, r.FromGroup, r.FromSize)
+			addNode(r.ToID, r.ToTitle, r.ToType, r.ToGroup, r.ToSize)
+			edge := graphEdge{
 				Source: r.FromID, Target: r.ToID,
 				EdgeType: r.EdgeType, Confidence: r.Confidence,
-			})
+			}
+			if r.EdgeType == "proposed" {
+				proposedEdges = append(proposedEdges, edge)
+			} else {
+				structuralEdges = append(structuralEdges, edge)
+			}
 		}
 		for _, n := range nodeMap {
 			nodes = append(nodes, graphNode{
-				ID: n.id, Title: n.title, Type: n.ntype, Group: n.group, Weight: n.weight,
+				ID: n.id, Title: n.title, Type: n.ntype, Group: n.group,
+				Size: n.size, Weight: n.weight,
 			})
 		}
 
-		if q := r.URL.Query().Get("q"); q != "" {
-			q = strings.ToLower(q)
-			var filtered []graphNode
-			for _, n := range nodes {
-				if strings.Contains(strings.ToLower(n.Title), q) || strings.Contains(strings.ToLower(n.ID), q) {
-					filtered = append(filtered, n)
-				}
-			}
-			// Keep only edges that connect filtered nodes
-			keep := map[string]bool{}
-			for _, n := range filtered {
-				keep[n.ID] = true
-			}
-			var fe []graphEdge
-			for _, e := range edges {
-				if keep[e.Source] && keep[e.Target] {
-					fe = append(fe, e)
-				}
-			}
-			nodes = filtered
-			edges = fe
-		}
-
 		data := struct {
-			ProjectID  string      `json:"project_id"`
-			TotalEdges int         `json:"total_edges"`
-			Returned   int         `json:"returned"`
-			Nodes      []graphNode `json:"nodes"`
-			Edges      []graphEdge `json:"edges"`
+			ProjectID       string      `json:"project_id"`
+			TotalEdges      int         `json:"total_edges"`
+			Returned        int         `json:"returned"`
+			Nodes           []graphNode `json:"nodes"`
+			StructuralEdges []graphEdge `json:"structural_edges"`
+			ProposedEdges   []graphEdge `json:"proposed_edges"`
 		}{
-			ProjectID:  projectID,
-			TotalEdges: total,
-			Returned:   len(results),
-			Nodes:      nodes,
-			Edges:      edges,
+			ProjectID:       projectID,
+			TotalEdges:      total,
+			Returned:        len(results),
+			Nodes:           nodes,
+			StructuralEdges: structuralEdges,
+			ProposedEdges:   proposedEdges,
 		}
 
 		jsonBytes, err := json.Marshal(data)

@@ -62,10 +62,12 @@ type EdgeResult struct {
 	FromTitle  string  `json:"from_title"`
 	FromType   string  `json:"from_type"`
 	FromGroup  string  `json:"from_group"`
+	FromSize   int     `json:"from_size"`
 	ToID       string  `json:"to_id"`
 	ToTitle    string  `json:"to_title"`
 	ToType     string  `json:"to_type"`
 	ToGroup    string  `json:"to_group"`
+	ToSize     int     `json:"to_size"`
 	EdgeType   string  `json:"edge_type"`
 	Confidence float64 `json:"confidence"`
 }
