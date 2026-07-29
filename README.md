@@ -240,10 +240,10 @@ Recommended configuration per hardware spec. Sidecar = baked ONNX (`--embed-back
 
 | Hardware | Users | Mode | `--sidecar-workers` | `--sidecar-intra-threads` | `--batch-size` | Notes |
 |----------|-------|------|--------------------:|--------------------------:|---------------:|-------|
-| 2 vCPU, 2GB RAM | 1-2 | stdio | 1 | 1 | 8 | Ingest ~20s for 4K chunks. Recall quality unaffected. |
+| 2 vCPU, 2GB RAM | 1-2 | stdio | 1 | 1 | 8 | Ingest serial. Recall parallel. |
 | 4 vCPU, 4GB RAM | 5-10 | `--serve` | 1 | 2 | 16 | Queue ingest (1 at a time). 30 user recall fine. |
-| 4 vCPU, 4GB RAM | 30 | `--serve` | 1 | 2 | 16 | Same as above. Recall parallel, ingest serial per user. |
-| 8 vCPU, 16GB RAM | 10-30 | `--serve` | 2 | 4 | 32 | Balance throughput vs CPU. Ingest ~4s for 4K chunks. |
+| 4 vCPU, 4GB RAM | 30 | `--serve` | 1 | 2 | 16 | Recall parallel, ingest serial per user. |
+| 8 vCPU, 16GB RAM | 10-30 | `--serve` | 2 | 4 | 32 | Balance throughput vs CPU. |
 | 16+ vCPU, 32GB RAM | 30+ | `--serve` | 4 | 0 (all) | 32 | Default — max throughput. Good CI/on-prem build server. |
 | Any + NVIDIA GPU | any | stdio/serve | 1 | N/A (GPU) | 32 | Sidecar uses CPU ONNX; GPU path needs CUDA EP build. |
 
