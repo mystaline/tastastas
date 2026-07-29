@@ -58,7 +58,7 @@ MCP client config: stdio mode → see [MCP Configuration](#mcp-configuration) �
 
 **Prerequisites:** Go 1.26+, Ollama running + `ollama pull nomic-embed-text`
 
-> ⚠️ **Ollama + model must be running** before starting tastastas. Verify with `ollama list`. Change `--ollama-model` and `--embed-dim` for different models — check dimension via `curl -X POST http://localhost:11434/api/embeddings -d '{"model":"your-model","prompt":"test"}' | jq '.embedding | length'`.
+> ⚠️ **Ollama + model must be running** before starting tastastas. Verify with `ollama list`. Dimension auto-detected via API probe — `--embed-dim` not needed. Change `--ollama-model` for different models.
 
 ```bash
 go build -o tastastas ./cmd/tastastas
@@ -74,14 +74,29 @@ go build -o tastastas ./cmd/tastastas
 
 MCP client config: stdio mode → see [MCP Configuration](#mcp-configuration) → Stdio + Ollama. HTTP mode (`--serve`) → same as Option A, see → HTTP.
 
-### Option D: Single binary + OpenAI API (cloud, zero infra)
+### Option D: Single binary + OpenAI-compatible API (cloud, zero infra)
 
-**Cost:** ~$0.50/month for 30 users.
+**Cost:** ~$0.50/month for 30 users (OpenAI). Free models via OpenRouter (nemotron-3-embed-1b).
 
 ```bash
+# OpenAI
 export TASTASTAS_OPENAI_KEY=sk-...
 ./tastastas --serve :8080 --embed-backend openai
+
+# OpenRouter (any OpenAI-compatible provider)
+export TASTASTAS_OPENAI_KEY=sk-or-v1-...
+./tastastas --serve :8080 --embed-backend openai \
+  --openai-base-url https://openrouter.ai/api/v1
+
+# Free model via OpenRouter
+./tastastas --serve :8080 --embed-backend openai \
+  --openai-base-url https://openrouter.ai/api/v1 \
+  --openai-model nvidia/nemotron-3-embed-1b:free
 ```
+
+Embedding dimension auto-detected via API probe — no `--embed-dim` needed. Model identity is per-model, not per-project. Multiple embedding models can coexist in the same project — each model's vectors stored separately. Recall with current config only searches vectors matching that model's identity; switching config just changes which model's vectors are queried, no re-ingest needed.
+
+Supports any OpenAI-compatible endpoint: OpenAI, OpenRouter, Together AI, Groq, etc.
 
 MCP client config: stdio mode → see [MCP Configuration](#mcp-configuration) → Stdio + OpenAI. HTTP mode (`--serve`) → same as Option A, see → HTTP.
 
@@ -255,9 +270,27 @@ Recommended configuration per hardware spec. Sidecar = baked ONNX (`--embed-back
 | 8 vCPU, 16GB RAM | 10-30 | `--serve` | `nomic-embed-text` | 32 | Standard team setup. |
 | 16+ vCPU, 32GB RAM | 30+ | `--serve` | `bge-m3` | 32 | Higher quality (1024-dim). Requires more RAM. |
 
-### OpenAI backend (cloud API, 1536-dim)
+### OpenAI / OpenAI-compatible backend (cloud API)
 
-No hardware tuning needed — embedding runs on OpenAI servers. Set `--embed-backend openai --openai-api-key $TASTASTAS_OPENAI_KEY`. `--batch-size` up to 2048 (OpenAI limit). Best for resource-constrained hosts or when quality is priority.
+| Model | Dim | Cost/M tok | Context | Notes |
+|-------|:---:|:---------:|:-------:|-------|
+| text-embedding-3-small | 1536 | $0.02 | 8K | Default. Best quality/$ for general use. |
+| nvidia/nemotron-3-embed-1b:free | 2048 | **free** | 33K | Free via OpenRouter. Good code retrieval. |
+| baai/bge-m3 | 1024 | $0.01 | 8K | Multilingual 100+ languages, multi-provider. |
+
+No hardware tuning needed — embedding runs on remote API. Supports OpenAI, OpenRouter, Together AI, Groq, or any OpenAI-compatible endpoint via `--openai-base-url`.
+
+```
+# Probe API → auto-detect dimension → config row written per project
+# Switch model → new vectors coexist; recall filters by current model_id
+tastastas --embed-backend openai \
+  --openai-base-url https://openrouter.ai/api/v1 \
+  --openai-model nvidia/nemotron-3-embed-1b:free
+```
+
+Model identity is per-model. Multiple models can coexist in the same project — each model's vectors stored separately with composite primary keys (model_id:node_id). Recall filters by current session's model_id, returning results only from that model's vectors. Switching config adds new vectors without affecting existing ones; old model's vectors remain queryable by switching back to that config.
+
+`--batch-size` up to 2048 (OpenAI limit). Best for resource-constrained hosts or when quality is priority.
 
 ### Ingestion serialization
 
@@ -269,7 +302,7 @@ In `--serve` mode with 1 sidecar worker, ingest jobs queue behind the embedder m
 |------|---------|-------------|
 | `--serve` | *(unset)* | HTTP address (`:8080`). Unset = stdio MCP mode. |
 | `--db` | `~/.local/share/tastastas/memory.db` | SQLite DB path (honors `$TASTASTAS_DB`, `$XDG_DATA_HOME`) |
-| `--embed-dim` | `0` = auto-detect | Vector dimension: 384 for sidecar, 768 for ollama, 1536 for openai, 0 = pick from backend |
+| `--embed-dim` | `0` = auto-detect | Vector dimension. Auto-detected via API probe (openai/ollama) or hardcoded for sidecar (384). Usually not needed — only set to override for custom truncation (e.g. text-embedding-3-small at 384) |
 | `--embed-backend` | `sidecar` | `sidecar` (baked ONNX, zero deps), `ollama` (local, 768-dim), `openai` (cloud API, 1536-dim), or `none` (lexical only) |
 | `--ollama-url` | `http://localhost:11434` | Ollama URL (`embed-backend=ollama`) |
 | `--ollama-model` | `nomic-embed-text` | Ollama embedding model (`embed-backend=ollama`) |
@@ -296,6 +329,18 @@ Source → [AutoDetectAdapters] → n → [EmbedNodes] → n → [InferConventio
 4. **BuildHierarchy** generates synthetic `directory` nodes connected by `contains` edges — every file becomes reachable from the repo root. Single-child pass-through folders collapse.
 5. **Tier2ScoreAndLink** pairs every two nodes: `0.4·cos + 0.2·typeCompat + 0.2·pathProximity + 0.2·identifierOverlap - templateCollisionPenalty`. Above 0.80 = `auto-linked`. Above 0.55 = `proposed` (review queue). Below = skipped.
 6. **Graph view** at `GET /graph/{project_id}` renders structural edges + auto-linked edges as a force-directed D3 visualization. Proposed edges hidden — use `query_graph` to inspect.
+
+### Model identity & isolation
+
+Embedding models produce different vector spaces. tastastas stores vectors with composite primary keys (`{model_id}:{node_id}`) so multiple models coexist per project without conflict:
+
+- Switching models adds new vectors — recall only searches vectors matching the current model, not all models
+- Per-model dirty/clean status tracks crash residue without affecting other models
+- Recall filters by the current session's model_id automatically
+- Models can be listed via `init` tool per project
+- Re-ingest after crash is idempotent (content-hash skip)
+
+Embeds use API probes to auto-detect dimension — no `--embed-dim` flag needed for most setups.
 
 ### Architecture notes
 

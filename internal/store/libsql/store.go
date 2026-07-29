@@ -441,6 +441,7 @@ func (s *Store) SearchVector(
 	projectID string,
 	embedding []float32,
 	limit int,
+	modelID string,
 ) ([]store.ScoredNode, error) {
 	if len(embedding) != s.dim {
 		return nil, fmt.Errorf("libsql: query embedding has dim %d, store configured for dim %d", len(embedding), s.dim)
@@ -621,7 +622,7 @@ func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 	return tx.Commit()
 }
 
-func (s *Store) DeleteChunksByParent(ctx context.Context, parentNodeID string) error {
+func (s *Store) DeleteChunksByParent(ctx context.Context, parentNodeID string, modelID string) error {
 	_, err := s.db.ExecContext(
 		ctx,
 		`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE parent_node_id = ?)`,
@@ -645,6 +646,7 @@ func (s *Store) SearchChunks(
 	projectID string,
 	embedding []float32,
 	limit int,
+	modelID string,
 ) ([]store.ScoredChunk, error) {
 	if len(embedding) != s.dim {
 		return nil, fmt.Errorf("libsql: query embedding has dim %d, store configured for dim %d", len(embedding), s.dim)
@@ -864,7 +866,7 @@ func (s *Store) GetEmbedModelID(ctx context.Context, projectID string) (string, 
 	return "", nil
 }
 
-func (s *Store) GetEmbedModelStatus(ctx context.Context, projectID string) (string, error) {
+func (s *Store) GetEmbedModelStatus(ctx context.Context, projectID, modelID string) (string, error) {
 	return "", nil
 }
 
@@ -876,8 +878,12 @@ func (s *Store) SetEmbedModelDirty(ctx context.Context, projectID, modelID strin
 	return nil
 }
 
-func (s *Store) SetEmbedModelClean(ctx context.Context, projectID string) error {
+func (s *Store) SetEmbedModelClean(ctx context.Context, projectID, modelID string) error {
 	return nil
+}
+
+func (s *Store) ListEmbedModels(ctx context.Context, projectID string) ([]store.ModelInfo, error) {
+	return nil, nil
 }
 
 func (s *Store) EdgeTypeCounts(ctx context.Context, projectID string) (map[string]int, error) {

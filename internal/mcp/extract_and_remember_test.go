@@ -56,7 +56,7 @@ func TestExtractAndRememberDedupe(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Embed: %v", err)
 			}
-			candidates, err := db.SearchVector(ctx, "default", vec, 5)
+			candidates, err := db.SearchVector(ctx, "default", vec, 5, "")
 			if err != nil {
 				t.Fatalf("SearchVector: %v", err)
 			}

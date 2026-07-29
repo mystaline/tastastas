@@ -41,6 +41,7 @@ type Node struct {
 	SourcePath    string
 	Importance    float64
 	Embedding     []float32 // optional; nil if not embedded yet
+	ModelID       string    `json:"-"` // set during embedding for composite vec0 PK
 	Language      string    // programming language for code files (go, python, etc.)
 	HasChunks     bool      // true if this node has been chunked+embedded
 	CreatedAt     string
@@ -91,6 +92,7 @@ type Chunk struct {
 	PrevChunkID   string // empty for first chunk
 	NextChunkID   string // empty for last chunk
 	Embedding     []float32
+	ModelID       string `json:"-"` // set during embedding for composite vec0 PK
 }
 
 // ScoredChunk is a Chunk with a retrieval score attached.
@@ -111,13 +113,13 @@ type Store interface {
 	// Returns scored nodes where Score is the FTS5 BM25 rank (lower = better match).
 	SearchLexical(ctx context.Context, projectID, query string, limit int) ([]ScoredNode, error)
 
-	// SearchVector runs a nearest-neighbor query scoped to a project.
-	SearchVector(ctx context.Context, projectID string, embedding []float32, limit int) ([]ScoredNode, error)
+	// SearchVector runs a nearest-neighbor query scoped to a project and model.
+	SearchVector(ctx context.Context, projectID string, embedding []float32, limit int, modelID string) ([]ScoredNode, error)
 
 	// Chunk operations for unified embeddings
 	UpsertChunks(ctx context.Context, chunks []Chunk) error
-	DeleteChunksByParent(ctx context.Context, parentNodeID string) error
-	SearchChunks(ctx context.Context, projectID string, embedding []float32, limit int) ([]ScoredChunk, error)
+	DeleteChunksByParent(ctx context.Context, parentNodeID string, modelID string) error
+	SearchChunks(ctx context.Context, projectID string, embedding []float32, limit int, modelID string) ([]ScoredChunk, error)
 
 	// GetChunksByParent returns chunks for a parent node, ordered by chunk_index.
 	GetChunksByParent(ctx context.Context, parentNodeID string, limit, offset int) ([]Chunk, error)
@@ -195,9 +197,9 @@ type Store interface {
 	// Returns empty string if no record exists.
 	GetEmbedModelID(ctx context.Context, projectID string) (string, error)
 
-	// GetEmbedModelStatus returns the dirty/clean status for a project.
+	// GetEmbedModelStatus returns the dirty/clean status for a project+model.
 	// Returns empty string if no record exists.
-	GetEmbedModelStatus(ctx context.Context, projectID string) (string, error)
+	GetEmbedModelStatus(ctx context.Context, projectID, modelID string) (string, error)
 
 	// InitEmbedConfig creates the config row as 'clean' if not exists.
 	// Used by remember/extract_and_remember — single-input tools.
@@ -207,9 +209,11 @@ type Store interface {
 	// Used by onboard/ingest at goroutine start (guardIngest).
 	SetEmbedModelDirty(ctx context.Context, projectID, modelID string) error
 
-	// SetEmbedModelClean updates the config row status to 'clean'.
-	// Used by onboard/ingest after success.
-	SetEmbedModelClean(ctx context.Context, projectID string) error
+	// SetEmbedModelClean updates the config row status to 'clean' for a model.
+	SetEmbedModelClean(ctx context.Context, projectID, modelID string) error
+
+	// ListEmbedModels returns all models with their status for a project.
+	ListEmbedModels(ctx context.Context, projectID string) ([]ModelInfo, error)
 
 	Close() error
 }
@@ -225,13 +229,20 @@ type EdgeProposal struct {
 	Status     string // pending | accepted | rejected
 }
 
+// ModelInfo holds per-model status for a project.
+type ModelInfo struct {
+	ModelID string `json:"model_id"`
+	Status  string `json:"status"` // "dirty" | "clean"
+}
+
 // StoreStats holds aggregate project-level counts for inspection tools.
 type StoreStats struct {
-	NodeCount     int    `json:"node_count"`
-	EdgeCount     int    `json:"edge_count"`
-	ChunkCount    int    `json:"chunk_count"`
-	VecCount      int    `json:"vec_count"`
-	StaleCount    int    `json:"stale_count"`
-	ConventionCnt int    `json:"convention_count"`
-	EmbedModelID  string `json:"embed_model_id,omitempty"`
+	NodeCount     int         `json:"node_count"`
+	EdgeCount     int         `json:"edge_count"`
+	ChunkCount    int         `json:"chunk_count"`
+	VecCount      int         `json:"vec_count"`
+	StaleCount    int         `json:"stale_count"`
+	ConventionCnt int         `json:"convention_count"`
+	EmbedModelID  string      `json:"embed_model_id,omitempty"`
+	Models        []ModelInfo `json:"models,omitempty"`
 }

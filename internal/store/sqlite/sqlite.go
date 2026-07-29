@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/mystaline-dev/tastastas/internal/store"
@@ -69,38 +70,189 @@ func (s *Store) initSchema(ctx context.Context) error {
 	}
 
 	// 3. vec0 tables are dimension-specific. If an existing vec0 table has a
-	// different dimension (e.g. user switched embedder from ollama 768-dim to
-	// sidecar 384-dim), drop + re-create automatically. vec0 doesn't support
-	// ALTER TABLE to change float[N].
-	for _, tbl := range []string{"node_vectors", "chunk_vectors"} {
-		exists := 0
-		s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_list WHERE name = ?", tbl).Scan(&exists)
-		if exists != 0 {
-			// Check current dimension
-			var sqlStr string
-			s.db.QueryRowContext(ctx, "SELECT sql FROM sqlite_master WHERE name = ? AND type = 'table'", tbl).
-				Scan(&sqlStr)
-			wantDim := fmt.Sprintf("float[%d]", s.dim)
-			if !strings.Contains(sqlStr, wantDim) {
-				if _, err := s.db.ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl); err != nil {
-					return fmt.Errorf("sqlite: drop stale %s: %w", tbl, err)
+		// different dimension (e.g. user switched embedder from ollama 768-dim to
+		// sidecar 384-dim), drop + re-create automatically. vec0 doesn't support
+		// ALTER TABLE to change float[N].
+		for _, tbl := range []string{"node_vectors", "chunk_vectors"} {
+			exists := 0
+			s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_list WHERE name = ?", tbl).Scan(&exists)
+			if exists != 0 {
+				// Check current dimension
+				var sqlStr string
+				s.db.QueryRowContext(ctx, "SELECT sql FROM sqlite_master WHERE name = ? AND type = 'table'", tbl).
+					Scan(&sqlStr)
+				wantDim := fmt.Sprintf("float[%d]", s.dim)
+				if !strings.Contains(sqlStr, wantDim) {
+					if _, err := s.db.ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl); err != nil {
+						return fmt.Errorf("sqlite: drop stale %s: %w", tbl, err)
+					}
+				}
+			}
+			colName := "node_id"
+			if tbl == "chunk_vectors" {
+				colName = "chunk_id"
+			}
+			stmt := fmt.Sprintf(
+				`CREATE VIRTUAL TABLE IF NOT EXISTS %s USING vec0(%s TEXT PRIMARY KEY, embedding float[%d])`,
+				tbl, colName, s.dim,
+			)
+			if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("sqlite: create %s: %w", tbl, err)
+			}
+		}
+
+		// 4. Backfill legacy vec0 rows to composite PK format.
+		// Must run after vec0 tables are confirmed to exist and match dimension.
+		if err := s.backfillVec0ModelIDs(ctx); err != nil {
+			return fmt.Errorf("sqlite: backfill vec0 model ids: %w", err)
+		}
+		return nil
+}
+
+// backfillVec0ModelIDs migrates legacy vec0 rows (pre-V2) to composite PK
+// format. Legacy node_vectors had PK = node_id; V2 uses PK = "model_id:node_id".
+// Runs in a transaction: on failure, old tables are untouched and retry on
+// next startup.
+func (s *Store) backfillVec0ModelIDs(ctx context.Context) error {
+	var needBackfill int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM node_vectors WHERE node_id NOT LIKE '%:%'`).Scan(&needBackfill)
+	if err != nil {
+		// Table may not exist yet on fresh DB; skip silently.
+		return nil
+	}
+	if needBackfill == 0 {
+		return nil
+	}
+
+	type vecRow struct {
+		id  string
+		emb []float32
+	}
+	readVecs := func(table, idCol string) ([]vecRow, error) {
+		q, err := s.db.QueryContext(ctx,
+			fmt.Sprintf(`SELECT %s, embedding FROM %s`, idCol, table))
+		if err != nil {
+			return nil, err
+		}
+		defer q.Close()
+
+		var rows []vecRow
+		for q.Next() {
+			var r vecRow
+			var blob []byte
+			if err := q.Scan(&r.id, &blob); err != nil {
+				return nil, err
+			}
+			r.emb = blobToFloat32Slice(blob, s.dim)
+			rows = append(rows, r)
+		}
+		return rows, q.Err()
+	}
+
+	nodeVecs, err := readVecs("node_vectors", "node_id")
+	if err != nil {
+		return fmt.Errorf("backfill: read node_vectors: %w", err)
+	}
+	chunkVecs, err := readVecs("chunk_vectors", "chunk_id")
+	if err != nil {
+		return fmt.Errorf("backfill: read chunk_vectors: %w", err)
+	}
+
+	// Resolve model_id for each node from config, fallback to "default".
+	modelForNode := map[string]string{}
+	cfgRows, err := s.db.QueryContext(ctx,
+		`SELECT model_id FROM project_embed_config ORDER BY created_at DESC LIMIT 1`)
+	if err == nil {
+		defer cfgRows.Close()
+		if cfgRows.Next() {
+			var mid string
+			cfgRows.Scan(&mid)
+			if mid != "" {
+				for _, r := range nodeVecs {
+					modelForNode[r.id] = mid
 				}
 			}
 		}
-		stmt := fmt.Sprintf(
-			`CREATE VIRTUAL TABLE IF NOT EXISTS %s USING vec0(%s TEXT PRIMARY KEY, embedding float[%d])`,
-			tbl,
-			map[string]string{
-				"node_vectors":  "node_id",
-				"chunk_vectors": "chunk_id",
-			}[tbl],
-			s.dim,
-		)
-		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("sqlite: create %s: %w", tbl, err)
+	}
+	defaultModel := "default"
+	for _, r := range nodeVecs {
+		if modelForNode[r.id] == "" {
+			modelForNode[r.id] = defaultModel
 		}
 	}
-	return nil
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("backfill: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	for _, tbl := range []string{"node_vectors", "chunk_vectors"} {
+		if _, err := tx.ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl); err != nil {
+			return fmt.Errorf("backfill: drop %s: %w", tbl, err)
+		}
+		colName := "node_id"
+		if tbl == "chunk_vectors" {
+			colName = "chunk_id"
+		}
+		stmt := fmt.Sprintf(
+			`CREATE VIRTUAL TABLE %s USING vec0(%s TEXT PRIMARY KEY, embedding float[%d])`,
+			tbl, colName, s.dim,
+		)
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("backfill: create %s: %w", tbl, err)
+		}
+	}
+
+	for _, r := range nodeVecs {
+		modelID := modelForNode[r.id]
+		newID := modelID + ":" + r.id
+		vecJSON, _ := json.Marshal(r.emb)
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO node_vectors (node_id, embedding) VALUES (?, vec_f32(?))`,
+			newID, string(vecJSON)); err != nil {
+			return fmt.Errorf("backfill: insert node vector %s: %w", r.id, err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO node_vector_model (id, node_id, model_id) VALUES (?, ?, ?)`,
+			newID, r.id, modelID); err != nil {
+			return fmt.Errorf("backfill: insert node mapping %s: %w", r.id, err)
+		}
+	}
+	for _, r := range chunkVecs {
+		modelID := defaultModel
+		newID := modelID + ":" + r.id
+		vecJSON, _ := json.Marshal(r.emb)
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO chunk_vectors (chunk_id, embedding) VALUES (?, vec_f32(?))`,
+			newID, string(vecJSON)); err != nil {
+			return fmt.Errorf("backfill: insert chunk vector %s: %w", r.id, err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO chunk_vector_model (id, chunk_id, model_id) VALUES (?, ?, ?)`,
+			newID, r.id, modelID); err != nil {
+			return fmt.Errorf("backfill: insert chunk mapping %s: %w", r.id, err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// blobToFloat32Slice converts a raw vec0 blob (big-endian float32 bytes) into
+// a []float32 slice. vec0 stores embeddings as raw bytes internally.
+func blobToFloat32Slice(blob []byte, dim int) []float32 {
+	if len(blob) == 0 {
+		return nil
+	}
+	// vec0 uses platform-native float32 storage (4 bytes per element).
+	out := make([]float32, dim)
+	for i := 0; i < dim && i*4+4 <= len(blob); i++ {
+		// Read as big-endian IEEE 754 float32
+		bits := uint32(blob[i*4])<<24 | uint32(blob[i*4+1])<<16 | uint32(blob[i*4+2])<<8 | uint32(blob[i*4+3])
+		out[i] = float32(math.Float32frombits(bits))
+	}
+	return out
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -172,18 +324,30 @@ func (s *Store) UpsertNode(ctx context.Context, n store.Node) error {
 		if err != nil {
 			return fmt.Errorf("sqlite: marshal embedding for %s: %w", n.ID, err)
 		}
-		_, err = s.db.ExecContext(ctx, `DELETE FROM node_vectors WHERE node_id = ?`, n.ID)
+		nodeVecID := n.ID
+		if n.ModelID != "" {
+			nodeVecID = n.ModelID + ":" + n.ID
+		}
+		_, err = s.db.ExecContext(ctx, `DELETE FROM node_vectors WHERE node_id = ?`, nodeVecID)
 		if err != nil {
 			return fmt.Errorf("sqlite: delete stale vector for %s: %w", n.ID, err)
 		}
 		_, err = s.db.ExecContext(
 			ctx,
 			`INSERT INTO node_vectors (node_id, embedding) VALUES (?, vec_f32(?))`,
-			n.ID,
+			nodeVecID,
 			string(vecJSON),
 		)
 		if err != nil {
 			return fmt.Errorf("sqlite: insert vector for %s: %w", n.ID, err)
+		}
+		if n.ModelID != "" {
+			_, err = s.db.ExecContext(ctx,
+				`INSERT OR REPLACE INTO node_vector_model (id, node_id, model_id) VALUES (?, ?, ?)`,
+				nodeVecID, n.ID, n.ModelID)
+			if err != nil {
+				return fmt.Errorf("sqlite: insert node vector model mapping for %s: %w", n.ID, err)
+			}
 		}
 	}
 
@@ -259,6 +423,8 @@ func (s *Store) UpsertEdges(ctx context.Context, edges []store.Edge) error {
 }
 
 func (s *Store) DeleteNode(ctx context.Context, id string) error {
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM node_vectors WHERE node_id LIKE ? || ':%'`, id)
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM node_vectors WHERE node_id = ?`, id)
 	res, err := s.db.ExecContext(ctx, `DELETE FROM nodes WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("sqlite: delete node %s: %w", id, err)
@@ -338,6 +504,7 @@ func (s *Store) SearchVector(
 	projectID string,
 	embedding []float32,
 	limit int,
+	modelID string,
 ) ([]store.ScoredNode, error) {
 	if len(embedding) != s.dim {
 		return nil, fmt.Errorf("sqlite: query embedding has dim %d, store configured for dim %d", len(embedding), s.dim)
@@ -346,14 +513,28 @@ func (s *Store) SearchVector(
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: marshal query embedding: %w", err)
 	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT `+nodeCols+`, vec_distance_cosine(v.embedding, vec_f32(?)) AS distance
-		FROM node_vectors v
-		JOIN nodes n ON n.id = v.node_id
-		WHERE n.project_id = ?
-		ORDER BY distance
-		LIMIT ?
-	`, string(vecJSON), projectID, limit)
+
+	var rows *sql.Rows
+	if modelID != "" {
+		rows, err = s.db.QueryContext(ctx, `
+			SELECT `+nodeCols+`, vec_distance_cosine(v.embedding, vec_f32(?)) AS distance
+			FROM node_vectors v
+			JOIN node_vector_model nvm ON nvm.id = v.node_id
+			JOIN nodes n ON n.id = nvm.node_id
+			WHERE nvm.model_id = ? AND n.project_id = ?
+			ORDER BY distance
+			LIMIT ?
+		`, string(vecJSON), modelID, projectID, limit)
+	} else {
+		rows, err = s.db.QueryContext(ctx, `
+			SELECT `+nodeCols+`, vec_distance_cosine(v.embedding, vec_f32(?)) AS distance
+			FROM node_vectors v
+			JOIN nodes n ON n.id = v.node_id
+			WHERE n.project_id = ?
+			ORDER BY distance
+			LIMIT ?
+		`, string(vecJSON), projectID, limit)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: search vector: %w", err)
 	}
@@ -503,18 +684,30 @@ func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 					continue
 				}
 				vecJSON, _ := json.Marshal(c.Embedding)
-				_, err = tx.ExecContext(ctx, `DELETE FROM chunk_vectors WHERE chunk_id = ?`, c.ID)
+				chunkVecID := c.ID
+				if c.ModelID != "" {
+					chunkVecID = c.ModelID + ":" + c.ID
+				}
+				_, err = tx.ExecContext(ctx, `DELETE FROM chunk_vectors WHERE chunk_id = ?`, chunkVecID)
 				if err != nil {
 					return fmt.Errorf("sqlite: delete chunk vector %s: %w", c.ID, err)
 				}
 				_, err = tx.ExecContext(
 					ctx,
 					`INSERT INTO chunk_vectors (chunk_id, embedding) VALUES (?, vec_f32(?))`,
-					c.ID,
+					chunkVecID,
 					string(vecJSON),
 				)
 				if err != nil {
 					return fmt.Errorf("sqlite: insert chunk vector %s: %w", c.ID, err)
+				}
+				if c.ModelID != "" {
+					_, err = tx.ExecContext(ctx,
+						`INSERT OR REPLACE INTO chunk_vector_model (id, chunk_id, model_id) VALUES (?, ?, ?)`,
+						chunkVecID, c.ID, c.ModelID)
+					if err != nil {
+						return fmt.Errorf("sqlite: insert chunk vector model mapping for %s: %w", c.ID, err)
+					}
 				}
 			}
 		}
@@ -522,12 +715,25 @@ func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 	return tx.Commit()
 }
 
-func (s *Store) DeleteChunksByParent(ctx context.Context, parentNodeID string) error {
-	_, err := s.db.ExecContext(
-		ctx,
-		`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE parent_node_id = ?)`,
-		parentNodeID,
-	)
+func (s *Store) DeleteChunksByParent(ctx context.Context, parentNodeID string, modelID string) error {
+	var err error
+	if modelID != "" {
+		_, err = s.db.ExecContext(
+			ctx,
+			`DELETE FROM chunk_vectors WHERE chunk_id IN (
+				SELECT cvm.id FROM chunk_vector_model cvm
+				JOIN chunks c ON c.id = cvm.chunk_id
+				WHERE c.parent_node_id = ? AND cvm.model_id = ?
+			)`,
+			parentNodeID, modelID,
+		)
+	} else {
+		_, err = s.db.ExecContext(
+			ctx,
+			`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE parent_node_id = ?)`,
+			parentNodeID,
+		)
+	}
 	if err != nil {
 		return fmt.Errorf("sqlite: delete chunk vectors for %s: %w", parentNodeID, err)
 	}
@@ -543,6 +749,7 @@ func (s *Store) SearchChunks(
 	projectID string,
 	embedding []float32,
 	limit int,
+	modelID string,
 ) ([]store.ScoredChunk, error) {
 	if len(embedding) != s.dim {
 		return nil, fmt.Errorf("sqlite: query embedding has dim %d, store configured for dim %d", len(embedding), s.dim)
@@ -551,16 +758,32 @@ func (s *Store) SearchChunks(
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: marshal query embedding: %w", err)
 	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT c.id, c.parent_node_id, c.chunk_index, c.chunk_type, c.heading_path, c.content, c.language, c.source_adapter, c.prev_chunk_id, c.next_chunk_id,
-		       vec_distance_cosine(v.embedding, vec_f32(?)) AS distance
-		FROM chunk_vectors v
-		JOIN chunks c ON c.id = v.chunk_id
-		JOIN nodes n ON n.id = c.parent_node_id
-		WHERE n.project_id = ?
-		ORDER BY distance
-		LIMIT ?
-	`, string(vecJSON), projectID, limit)
+
+	var rows *sql.Rows
+	if modelID != "" {
+		rows, err = s.db.QueryContext(ctx, `
+			SELECT c.id, c.parent_node_id, c.chunk_index, c.chunk_type, c.heading_path, c.content, c.language, c.source_adapter, c.prev_chunk_id, c.next_chunk_id,
+			       vec_distance_cosine(v.embedding, vec_f32(?)) AS distance
+			FROM chunk_vectors v
+			JOIN chunk_vector_model cvm ON cvm.id = v.chunk_id
+			JOIN chunks c ON c.id = cvm.chunk_id
+			JOIN nodes n ON n.id = c.parent_node_id
+			WHERE cvm.model_id = ? AND n.project_id = ?
+			ORDER BY distance
+			LIMIT ?
+		`, string(vecJSON), modelID, projectID, limit)
+	} else {
+		rows, err = s.db.QueryContext(ctx, `
+			SELECT c.id, c.parent_node_id, c.chunk_index, c.chunk_type, c.heading_path, c.content, c.language, c.source_adapter, c.prev_chunk_id, c.next_chunk_id,
+			       vec_distance_cosine(v.embedding, vec_f32(?)) AS distance
+			FROM chunk_vectors v
+			JOIN chunks c ON c.id = v.chunk_id
+			JOIN nodes n ON n.id = c.parent_node_id
+			WHERE n.project_id = ?
+			ORDER BY distance
+			LIMIT ?
+		`, string(vecJSON), projectID, limit)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: search chunks: %w", err)
 	}
@@ -735,12 +958,13 @@ func (s *Store) Stats(ctx context.Context, projectID string) (store.StoreStats, 
 		return st, fmt.Errorf("sqlite: stats stale: %w", err)
 	}
 	// VecCount = node_vectors + chunk_vectors scoped to project.
+	// Route through mapping tables since vec0 PK is now composite.
 	row = s.db.QueryRowContext(
 		ctx,
 		`SELECT (
-			SELECT COUNT(*) FROM node_vectors v JOIN nodes n ON n.id = v.node_id WHERE n.project_id = ?
+			SELECT COUNT(*) FROM node_vectors v JOIN node_vector_model nvm ON nvm.id = v.node_id JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ?
 		) + (
-			SELECT COUNT(*) FROM chunk_vectors v JOIN chunks c ON c.id = v.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?
+			SELECT COUNT(*) FROM chunk_vectors v JOIN chunk_vector_model cvm ON cvm.id = v.chunk_id JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?
 		)`,
 		projectID, projectID,
 	)
@@ -758,6 +982,7 @@ func (s *Store) Stats(ctx context.Context, projectID string) (store.StoreStats, 
 	}
 
 	st.EmbedModelID, _ = s.GetEmbedModelID(ctx, projectID) // best-effort
+	st.Models, _ = s.ListEmbedModels(ctx, projectID)        // best-effort
 
 	return st, nil
 }
@@ -772,10 +997,10 @@ func (s *Store) GetEmbedModelID(ctx context.Context, projectID string) (string, 
 	return modelID, err
 }
 
-func (s *Store) GetEmbedModelStatus(ctx context.Context, projectID string) (string, error) {
+func (s *Store) GetEmbedModelStatus(ctx context.Context, projectID, modelID string) (string, error) {
 	var status string
 	err := s.db.QueryRowContext(ctx,
-		`SELECT status FROM project_embed_config WHERE project_id = ?`, projectID).Scan(&status)
+		`SELECT status FROM project_embed_config WHERE project_id = ? AND model_id = ?`, projectID, modelID).Scan(&status)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -798,10 +1023,29 @@ func (s *Store) SetEmbedModelDirty(ctx context.Context, projectID, modelID strin
 	return err
 }
 
-func (s *Store) SetEmbedModelClean(ctx context.Context, projectID string) error {
+func (s *Store) SetEmbedModelClean(ctx context.Context, projectID, modelID string) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE project_embed_config SET status = 'clean' WHERE project_id = ?`, projectID)
+		`UPDATE project_embed_config SET status = 'clean' WHERE project_id = ? AND model_id = ?`, projectID, modelID)
 	return err
+}
+
+func (s *Store) ListEmbedModels(ctx context.Context, projectID string) ([]store.ModelInfo, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT model_id, status FROM project_embed_config WHERE project_id = ? ORDER BY created_at`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []store.ModelInfo
+	for rows.Next() {
+		var mi store.ModelInfo
+		if err := rows.Scan(&mi.ModelID, &mi.Status); err != nil {
+			return nil, err
+		}
+		out = append(out, mi)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) EdgeTypeCounts(ctx context.Context, projectID string) (map[string]int, error) {
