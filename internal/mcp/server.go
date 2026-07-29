@@ -85,7 +85,7 @@ func chunkAndEmbedNodes(
 			}
 		}
 		// Content changed (or first time) — delete stale chunks, re-chunk.
-		_ = db.DeleteChunksByParent(ctx, n.ID, "")
+		_ = db.DeleteChunksByParent(ctx, n.ID, modelID)
 		chunkable = append(chunkable, n)
 	}
 	if len(chunkable) > 0 {
@@ -1085,6 +1085,49 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 		}
 
 		return toolResult, output, nil
+	})
+
+	// Tool 15: clear_project — synchronous, requires confirm
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "clear_project",
+		Description: "Delete all data for a project, or only vectors for a specific model. Requires confirm: true to prevent accidental deletion.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args ClearProjectInput) (*mcp.CallToolResult, ClearProjectOutput, error) {
+		if !args.Confirm {
+			return errorResult(fmt.Errorf("clear_project requires confirm: true")), ClearProjectOutput{}, nil
+		}
+		if args.ProjectID == "" {
+			return errorResult(fmt.Errorf("project_id is required")), ClearProjectOutput{}, nil
+		}
+
+		result, err := db.ClearProject(ctx, args.ProjectID, args.ModelID)
+		if err != nil {
+			return errorResult(err), ClearProjectOutput{}, nil
+		}
+
+		out := ClearProjectOutput{
+			Status:        "cleared",
+			DeletedNodes:  result.Nodes,
+			DeletedEdges:  result.Edges,
+			DeletedChunks: result.Chunks,
+			DeletedVecs:   result.Vectors,
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
+		}, out, nil
+	})
+
+	// Tool 16: list_projects — synchronous, read-only
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "list_projects", Description: "List all projects with basic stats (node count, edge count). Read-only.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct{}) (*mcp.CallToolResult, ListProjectsOutput, error) {
+		projects, err := db.ListProjects(ctx)
+		if err != nil {
+			return errorResult(err), ListProjectsOutput{}, nil
+		}
+		out := ListProjectsOutput{Projects: projects}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
+		}, out, nil
 	})
 }
 

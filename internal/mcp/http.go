@@ -157,12 +157,13 @@ func HandleGraphView(db store.Store) http.HandlerFunc {
 			nodeMap[id].weight++
 		}
 		type graphNode struct {
-			ID     string `json:"id"`
-			Title  string `json:"title"`
-			Type   string `json:"type"`
-			Group  string `json:"group"`
-			Size   int    `json:"size"`
-			Weight int    `json:"weight"`
+			ID        string `json:"id"`
+			Title     string `json:"title"`
+			Type      string `json:"type"`
+			Group     string `json:"group"`
+			Size      int    `json:"size"`
+			Weight    int    `json:"weight"`
+			ProjectID string `json:"project_id"`
 		}
 		type graphEdge struct {
 			Source     string  `json:"source"`
@@ -191,6 +192,7 @@ func HandleGraphView(db store.Store) http.HandlerFunc {
 			nodes = append(nodes, graphNode{
 				ID: n.id, Title: n.title, Type: n.ntype, Group: n.group,
 				Size: n.size, Weight: n.weight,
+				ProjectID: projectID,
 			})
 		}
 

@@ -213,6 +213,9 @@ type Store interface {
 	SetEmbedModelClean(ctx context.Context, projectID, modelID string) error
 
 	// ListEmbedModels returns all models with their status for a project.
+	ClearProject(ctx context.Context, projectID, modelID string) (ClearProjectResult, error)
+	ListProjects(ctx context.Context) ([]ProjectInfo, error)
+
 	ListEmbedModels(ctx context.Context, projectID string) ([]ModelInfo, error)
 
 	Close() error
@@ -246,3 +249,17 @@ type StoreStats struct {
 	EmbedModelID  string      `json:"embed_model_id,omitempty"`
 	Models        []ModelInfo `json:"models,omitempty"`
 }
+
+type ClearProjectResult struct {
+	Nodes   int
+	Edges   int
+	Chunks  int
+	Vectors int
+}
+
+type ProjectInfo struct {
+	ProjectID string `json:"project_id"`
+	NodeCount int    `json:"node_count"`
+	EdgeCount int    `json:"edge_count"`
+}
+

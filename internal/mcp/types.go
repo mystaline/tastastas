@@ -256,6 +256,24 @@ type GraphEdge struct {
 	Confidence float64 `json:"confidence"`
 }
 
+type ClearProjectInput struct {
+	ProjectID string `json:"project_id"`
+	ModelID   string `json:"model_id,omitempty"`
+	Confirm   bool   `json:"confirm"`
+}
+
+type ClearProjectOutput struct {
+	Status        string `json:"status"`
+	DeletedNodes  int    `json:"deleted_nodes"`
+	DeletedEdges  int    `json:"deleted_edges"`
+	DeletedChunks int    `json:"deleted_chunks"`
+	DeletedVecs   int    `json:"deleted_vectors"`
+}
+
+type ListProjectsOutput struct {
+	Projects []store.ProjectInfo `json:"projects"`
+}
+
 type JobStatusInput struct {
 	JobID string `json:"id"`
 }

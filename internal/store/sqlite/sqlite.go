@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"log"
 	"strings"
 
 	"github.com/mystaline-dev/tastastas/internal/store"
@@ -1313,4 +1314,139 @@ func (s *Store) ResolveUnresolved(ctx context.Context, projectID, nodeID, nodeTi
 		_, _ = s.db.ExecContext(ctx, `DELETE FROM unresolved_references WHERE id = ?`, r.id)
 	}
 	return len(refs), nil
+}
+
+func (s *Store) ClearProject(ctx context.Context, projectID, modelID string) (store.ClearProjectResult, error) {
+	if projectID == "" {
+		return store.ClearProjectResult{}, errors.New("sqlite: project_id must not be empty")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.ClearProjectResult{}, fmt.Errorf("sqlite: begin clear project tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if modelID != "" {
+		var nodeVecs, chunkVecs int
+		_ = tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM node_vector_model WHERE model_id = ? AND node_id IN (SELECT id FROM nodes WHERE project_id = ?)`,
+			modelID, projectID).Scan(&nodeVecs)
+		_ = tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM chunk_vector_model WHERE model_id = ? AND chunk_id IN (SELECT c.id FROM chunks c JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`,
+			modelID, projectID).Scan(&chunkVecs)
+
+		_, _ = tx.ExecContext(ctx,
+			`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunk_vector_model WHERE model_id = ? AND chunk_id IN (SELECT c.id FROM chunks c JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?))`,
+			modelID, projectID)
+		_, _ = tx.ExecContext(ctx,
+			`DELETE FROM node_vectors WHERE node_id IN (SELECT id FROM node_vector_model WHERE model_id = ? AND node_id IN (SELECT id FROM nodes WHERE project_id = ?))`,
+			modelID, projectID)
+		_, _ = tx.ExecContext(ctx, `DELETE FROM node_vector_model WHERE model_id = ? AND node_id IN (SELECT id FROM nodes WHERE project_id = ?)`, modelID, projectID)
+		_, _ = tx.ExecContext(ctx, `DELETE FROM chunk_vector_model WHERE model_id = ? AND chunk_id IN (SELECT c.id FROM chunks c JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`, modelID, projectID)
+		_, _ = tx.ExecContext(ctx, `DELETE FROM project_embed_config WHERE project_id = ? AND model_id = ?`, projectID, modelID)
+
+		if err := tx.Commit(); err != nil {
+			return store.ClearProjectResult{}, fmt.Errorf("sqlite: commit model clear: %w", err)
+		}
+		return store.ClearProjectResult{Vectors: nodeVecs + chunkVecs}, nil
+	}
+
+	// Full clear.
+	var nodes, edges, chunks, nodeVecs, chunkVecs int
+	_ = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM nodes WHERE project_id = ?`, projectID).Scan(&nodes)
+	_ = tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM edges WHERE from_id IN (SELECT id FROM nodes WHERE project_id = ?) OR to_id IN (SELECT id FROM nodes WHERE project_id = ?)`,
+		projectID, projectID).Scan(&edges)
+	_ = tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM chunks c JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?`,
+		projectID).Scan(&chunks)
+	_ = tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM node_vectors WHERE node_id IN (SELECT nvm.id FROM node_vector_model nvm JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ?)`,
+		projectID).Scan(&nodeVecs)
+	_ = tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM chunk_vectors WHERE chunk_id IN (SELECT cvm.id FROM chunk_vector_model cvm JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`,
+		projectID).Scan(&chunkVecs)
+
+	_, _ = tx.ExecContext(ctx,
+		`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT cvm.id FROM chunk_vector_model cvm JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`,
+		projectID)
+	_, _ = tx.ExecContext(ctx,
+		`DELETE FROM node_vectors WHERE node_id IN (SELECT nvm.id FROM node_vector_model nvm JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ?)`,
+		projectID)
+	_, _ = tx.ExecContext(ctx, `DELETE FROM node_vector_model WHERE node_id IN (SELECT id FROM nodes WHERE project_id = ?)`, projectID)
+	_, _ = tx.ExecContext(ctx, `DELETE FROM chunk_vector_model WHERE chunk_id IN (SELECT c.id FROM chunks c JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`, projectID)
+	_, _ = tx.ExecContext(ctx, `DELETE FROM project_embed_config WHERE project_id = ?`, projectID)
+	_, _ = tx.ExecContext(ctx,
+		`DELETE FROM edge_proposals WHERE from_id IN (SELECT id FROM nodes WHERE project_id = ?) OR to_id IN (SELECT id FROM nodes WHERE project_id = ?)`,
+		projectID, projectID)
+	_, _ = tx.ExecContext(ctx, `DELETE FROM unresolved_references WHERE project_id = ?`, projectID)
+	_, _ = tx.ExecContext(ctx, `DELETE FROM nodes WHERE project_id = ?`, projectID)
+
+	if err := tx.Commit(); err != nil {
+		return store.ClearProjectResult{}, fmt.Errorf("sqlite: commit clear project: %w", err)
+	}
+
+	return store.ClearProjectResult{
+		Nodes:   nodes,
+		Edges:   edges,
+		Chunks:  chunks,
+		Vectors: nodeVecs + chunkVecs,
+	}, nil
+}
+
+func (s *Store) ListProjects(ctx context.Context) ([]store.ProjectInfo, error) {
+	nodeRows, err := s.db.QueryContext(ctx, `SELECT project_id, COUNT(*) FROM nodes GROUP BY project_id`)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: list projects node count: %w", err)
+	}
+	defer nodeRows.Close()
+
+	nodeMap := map[string]int{}
+	for nodeRows.Next() {
+		var pid string
+		var count int
+		if err := nodeRows.Scan(&pid, &count); err != nil {
+			return nil, fmt.Errorf("sqlite: scan project node count: %w", err)
+		}
+		nodeMap[pid] = count
+	}
+	if err := nodeRows.Err(); err != nil {
+		return nil, err
+	}
+
+	edgeRows, err := s.db.QueryContext(ctx,
+		`SELECT n.project_id, COUNT(*) FROM edges e JOIN nodes n ON n.id = e.from_id GROUP BY n.project_id`)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: list projects edge count: %w", err)
+	}
+	defer edgeRows.Close()
+
+	edgeMap := map[string]int{}
+	for edgeRows.Next() {
+		var pid string
+		var count int
+		if err := edgeRows.Scan(&pid, &count); err != nil {
+			return nil, fmt.Errorf("sqlite: scan project edge count: %w", err)
+		}
+		edgeMap[pid] = count
+	}
+	if err := edgeRows.Err(); err != nil {
+		return nil, err
+	}
+
+	out := make([]store.ProjectInfo, 0, len(nodeMap))
+	for pid, nc := range nodeMap {
+		out = append(out, store.ProjectInfo{
+			ProjectID: pid,
+			NodeCount: nc,
+			EdgeCount: edgeMap[pid],
+		})
+	}
+	for pid := range edgeMap {
+		if _, ok := nodeMap[pid]; !ok {
+			log.Printf("sqlite: orphan edges found for project %q (nodes missing)", pid)
+		}
+	}
+	return out, nil
 }
