@@ -91,17 +91,22 @@ func isDeclarationLine(line string) bool {
 	return false
 }
 
+// derives the last word in a line that looks like an identifier.
+var identSuffix = regexp.MustCompile(`[.\w]+\s*$`)
+
 // derivePatternHeading extracts a short heading from the first line of a chunk.
 // e.g. "func (s *Store) GetNodes" → "GetNodes"
+// e.g. "export default function handler(req, res) {" → "handler"
 func derivePatternHeading(line string) string {
-	// Try to extract the name after func/function/def/type/class
+	// Strip export and async prefixes before matching
+	stripped := exportPrefix.ReplaceAllString(line, "")
 	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`^(func|function|def|fn)\s+(\([^)]*\)\s+)?([.\w]+)`),
+		regexp.MustCompile(`^(async\s+)?(func|function|def|fn)\s+(\([^)]*\)\s+)?([.\w]+)`),
 		regexp.MustCompile(`^(type|class|struct|interface|enum|trait)\s+(\w+)`),
 		regexp.MustCompile(`^(const|var|let)\s+(\w+)`),
 	}
 	for _, re := range patterns {
-		m := re.FindStringSubmatch(line)
+		m := re.FindStringSubmatch(stripped)
 		if len(m) > 2 && m[len(m)-1] != "" {
 			return m[len(m)-1]
 		}
@@ -109,7 +114,12 @@ func derivePatternHeading(line string) string {
 			return m[1]
 		}
 	}
-	// Fallback: return the first 40 chars
+	// Fallback on stripped line then original
+	for _, s := range []string{stripped, line} {
+		if m := identSuffix.FindString(s); m != "" && len(m) < 60 {
+			return m
+		}
+	}
 	if len(line) > 40 {
 		return line[:40] + "..."
 	}
