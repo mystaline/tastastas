@@ -15,12 +15,13 @@ type InitOutput struct {
 }
 
 type RememberInput struct {
-	ProjectID  string  `json:"project_id,omitempty"`
-	NodeType   string  `json:"node_type,omitempty"`
-	ID         string  `json:"id,omitempty"`
-	Title      string  `json:"title,omitempty"`
-	Content    string  `json:"content"`
-	Importance float64 `json:"importance,omitempty"`
+	ProjectID  string   `json:"project_id,omitempty"`
+	NodeType   string   `json:"node_type,omitempty"`
+	ID         string   `json:"id,omitempty"`
+	Title      string   `json:"title,omitempty"`
+	Content    string   `json:"content"`
+	Importance float64  `json:"importance,omitempty"`
+	Links      []string `json:"links,omitempty"` // node IDs this fact references — creates "references" edges
 }
 
 type RememberOutput struct {
@@ -29,24 +30,24 @@ type RememberOutput struct {
 }
 
 type RecallInput struct {
-	ProjectID    string  `json:"project_id,omitempty"`
-	Query        string  `json:"query"`
-	Limit        int     `json:"limit,omitempty"`
+	ProjectID     string  `json:"project_id,omitempty"`
+	Query         string  `json:"query"`
+	Limit         int     `json:"limit,omitempty"`
 	LinkThreshold float64 `json:"link_threshold,omitempty"` // override default 0.75
 }
 
 type RecallItem struct {
-	ID             string         `json:"id"`
-	Title          string         `json:"title"`
-	Excerpt        string         `json:"excerpt"`
-	NodeType       string         `json:"node_type"`
-	Score          float64        `json:"score"`
-	MatchType      string         `json:"match_type"`
-	PreviewChunks  []string       `json:"preview_chunks,omitempty"`  // first 3 chunk contents
-	TotalChunks    int            `json:"total_chunks"`              // e.g. 15
-	MoreAvailable  bool           `json:"more_available"`            // total_chunks > len(preview_chunks)
-	NextChunkStart int            `json:"next_chunk_start"`          // where to resume paging, or -1
-	Edges          []RecallEdge   `json:"edges,omitempty"`
+	ID             string       `json:"id"`
+	Title          string       `json:"title"`
+	Excerpt        string       `json:"excerpt"`
+	NodeType       string       `json:"node_type"`
+	Score          float64      `json:"score"`
+	MatchType      string       `json:"match_type"`
+	PreviewChunks  []string     `json:"preview_chunks,omitempty"` // first 3 chunk contents
+	TotalChunks    int          `json:"total_chunks"`             // e.g. 15
+	MoreAvailable  bool         `json:"more_available"`           // total_chunks > len(preview_chunks)
+	NextChunkStart int          `json:"next_chunk_start"`         // where to resume paging, or -1
+	Edges          []RecallEdge `json:"edges,omitempty"`
 	InferredEdges  []RecallEdge `json:"inferred_edges,omitempty"`
 }
 
@@ -85,7 +86,7 @@ type RecallChunksOutput struct {
 	ParentNodeID   string            `json:"parent_node_id"`
 	ParentTitle    string            `json:"parent_title"`
 	TotalChunks    int               `json:"total_chunks"`
-	ReturnedRange  string            `json:"returned_range"`   // e.g. "chunk 3-5 of 15"
+	ReturnedRange  string            `json:"returned_range"` // e.g. "chunk 3-5 of 15"
 	Chunks         []ChunkOutputItem `json:"chunks"`
 	MoreAvailable  bool              `json:"more_available"`   // chunk_end < total_chunks
 	NextChunkStart int               `json:"next_chunk_start"` // chunk_end, or -1 if done
@@ -117,20 +118,20 @@ type LinkOutput struct {
 }
 
 type IngestInput struct {
-	CWD       string `json:"cwd,omitempty"`       // project root to detect + ingest files from
+	CWD       string `json:"cwd,omitempty"` // project root to detect + ingest files from
 	ProjectID string `json:"project_id,omitempty"`
-	Scope     string `json:"scope,omitempty"`     // "cwd" | "subtree"
+	Scope     string `json:"scope,omitempty"` // "cwd" | "subtree"
 }
 
 type IngestOutput struct {
-	JobID             string `json:"job_id"`
-	Status            string `json:"status"` // "running" | "done" | "error"
-	NodesIngested    int    `json:"nodes_ingested"`
-	EdgesCreated     int    `json:"edges_created"`
-	ChunksCreated    int    `json:"chunks_created"`
+	JobID               string `json:"job_id"`
+	Status              string `json:"status"` // "running" | "done" | "error"
+	NodesIngested       int    `json:"nodes_ingested"`
+	EdgesCreated        int    `json:"edges_created"`
+	ChunksCreated       int    `json:"chunks_created"`
 	ConventionsInferred int    `json:"conventions_inferred,omitempty"`
-	AutoLinked       int    `json:"auto_linked,omitempty"`
-	ProposalsQueued  int    `json:"proposals_queued,omitempty"`
+	AutoLinked          int    `json:"auto_linked,omitempty"`
+	ProposalsQueued     int    `json:"proposals_queued,omitempty"`
 }
 
 type ExtractAndRememberInput struct {
@@ -189,17 +190,17 @@ type OnboardCheckInput struct {
 }
 
 type OnboardCheckOutput struct {
-	HasNodes       bool              `json:"has_nodes"`
-	HasChunks      bool              `json:"has_chunks"`
-	HasEmbeddings  bool              `json:"has_embeddings"`
-	HasEdges       bool              `json:"has_edges"`
-	HasConventions bool              `json:"has_conventions"`
-	StaleCount     int               `json:"stale_count"`
-	NodeCount      int               `json:"node_count"`
-	EdgeCount      int               `json:"edge_count"`
-	ChunkCount     int               `json:"chunk_count"`
-	VecCount       int               `json:"vec_count"`
-	EdgeTypeCounts map[string]int    `json:"edge_type_counts,omitempty"`
+	HasNodes       bool           `json:"has_nodes"`
+	HasChunks      bool           `json:"has_chunks"`
+	HasEmbeddings  bool           `json:"has_embeddings"`
+	HasEdges       bool           `json:"has_edges"`
+	HasConventions bool           `json:"has_conventions"`
+	StaleCount     int            `json:"stale_count"`
+	NodeCount      int            `json:"node_count"`
+	EdgeCount      int            `json:"edge_count"`
+	ChunkCount     int            `json:"chunk_count"`
+	VecCount       int            `json:"vec_count"`
+	EdgeTypeCounts map[string]int `json:"edge_type_counts,omitempty"`
 }
 
 type QueryGraphInput struct {
@@ -216,8 +217,8 @@ type QueryGraphOutput struct {
 }
 
 type EdgeResult struct {
-	Direction  string  `json:"direction"`   // "outgoing" | "incoming"
-	NodeID     string  `json:"node_id"`     // the other node (to_id or from_id)
+	Direction  string  `json:"direction"` // "outgoing" | "incoming"
+	NodeID     string  `json:"node_id"`   // the other node (to_id or from_id)
 	NodeTitle  string  `json:"node_title"`
 	NodeType   string  `json:"node_type"`
 	EdgeType   string  `json:"edge_type"`
@@ -225,17 +226,17 @@ type EdgeResult struct {
 }
 
 type ProjectGraphInput struct {
-	ProjectID    string   `json:"project_id,omitempty"`
-	MaxEdges     int      `json:"max_edges,omitempty"`     // default 5000
-	EdgeTypes    []string `json:"edge_types,omitempty"`    // empty = all non-proposed types
+	ProjectID string   `json:"project_id,omitempty"`
+	MaxEdges  int      `json:"max_edges,omitempty"`  // default 5000
+	EdgeTypes []string `json:"edge_types,omitempty"` // empty = all non-proposed types
 }
 
 type ProjectGraphOutput struct {
-	ProjectID  string       `json:"project_id"`
-	TotalEdges int          `json:"total_edges"`
-	Returned   int          `json:"returned"`
-	Nodes      []GraphNode  `json:"nodes"`
-	Edges      []GraphEdge  `json:"edges"`
+	ProjectID  string      `json:"project_id"`
+	TotalEdges int         `json:"total_edges"`
+	Returned   int         `json:"returned"`
+	Nodes      []GraphNode `json:"nodes"`
+	Edges      []GraphEdge `json:"edges"`
 }
 
 type GraphNode struct {
@@ -259,8 +260,8 @@ type JobStatusInput struct {
 
 type JobStatusOutput struct {
 	ID              string `json:"id"`
-	Status          string `json:"status"` // "running" | "done" | "error"
-	Phase           string `json:"phase,omitempty"` // "walking" | "embedding" | "persisting" | "" (done/error)
+	Status          string `json:"status"`          // "running" | "done" | "error"
+	Phase           string `json:"phase,omitempty"` // "walking" | "syncing" | "waiting" | "chunking" | "embedding" | "persisting" | "linking" | "" (done/error)
 	Nodes           int    `json:"nodes_ingested,omitempty"`
 	Edges           int    `json:"edges_created,omitempty"`
 	Chunks          int    `json:"chunks_created,omitempty"`

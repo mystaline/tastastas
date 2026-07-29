@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/mystaline-dev/tastastas/internal/embed"
@@ -23,6 +24,7 @@ func ServeHTTP(
 	db store.Store,
 	embedder embed.EmbedderBackend,
 	addr, authToken string,
+	batchSize int,
 ) error {
 	jobs := newJobStore(db)
 
@@ -31,7 +33,7 @@ func ServeHTTP(
 			Name:    "tastastas",
 			Version: Version,
 		}, nil)
-		registerTools(srv, db, embedder)
+		registerTools(srv, db, embedder, batchSize)
 		return srv
 	}, nil)
 
@@ -44,7 +46,7 @@ func ServeHTTP(
 	mux.HandleFunc("GET /graph/{project}", HandleGraphView(db))
 
 	// REST ingest — POST /ingest auto-detects adapters, same pipeline as MCP ingest tool.
-	mux.HandleFunc("POST /ingest", handleRESTIngest(db, embedder, jobs))
+	mux.HandleFunc("POST /ingest", handleRESTIngest(db, embedder, jobs, batchSize))
 	mux.HandleFunc("GET /ingest/jobs/{id}", handleIngestJobStatus(jobs))
 
 	// Health check — exempt from auth
@@ -124,10 +126,11 @@ func HandleGraphView(db store.Store) http.HandlerFunc {
 			"imports",
 			"convention-member",
 			"auto-linked",
+			"proposed",
 			"references",
 			"contains",
 		}
-		maxEdges := 500
+		maxEdges := 2000
 		if m := r.URL.Query().Get("max_edges"); m != "" {
 			if v, err := strconv.Atoi(m); err == nil && v > 0 {
 				maxEdges = v
@@ -141,14 +144,14 @@ func HandleGraphView(db store.Store) http.HandlerFunc {
 
 		nodeMap := map[string]*struct {
 			id, title, ntype, group string
-			weight                  int
+			weight, size            int
 		}{}
-		addNode := func(id, title, ntype, group string) {
+		addNode := func(id, title, ntype, group string, size int) {
 			if _, ok := nodeMap[id]; !ok {
 				nodeMap[id] = &struct {
 					id, title, ntype, group string
-					weight                  int
-				}{id: id, title: title, ntype: ntype, group: group}
+					weight, size            int
+				}{id: id, title: title, ntype: ntype, group: group, size: size}
 			}
 			nodeMap[id].weight++
 		}
@@ -157,6 +160,7 @@ func HandleGraphView(db store.Store) http.HandlerFunc {
 			Title  string `json:"title"`
 			Type   string `json:"type"`
 			Group  string `json:"group"`
+			Size   int    `json:"size"`
 			Weight int    `json:"weight"`
 		}
 		type graphEdge struct {
@@ -165,34 +169,44 @@ func HandleGraphView(db store.Store) http.HandlerFunc {
 			EdgeType   string  `json:"edge_type"`
 			Confidence float64 `json:"confidence"`
 		}
+
 		nodes := []graphNode{}
-		edges := []graphEdge{}
+		structuralEdges := []graphEdge{}
+		proposedEdges := []graphEdge{}
 		for _, r := range results {
-			addNode(r.FromID, r.FromTitle, r.FromType, r.FromGroup)
-			addNode(r.ToID, r.ToTitle, r.ToType, r.ToGroup)
-			edges = append(edges, graphEdge{
+			addNode(r.FromID, r.FromTitle, r.FromType, r.FromGroup, r.FromSize)
+			addNode(r.ToID, r.ToTitle, r.ToType, r.ToGroup, r.ToSize)
+			edge := graphEdge{
 				Source: r.FromID, Target: r.ToID,
 				EdgeType: r.EdgeType, Confidence: r.Confidence,
-			})
+			}
+			if r.EdgeType == "proposed" {
+				proposedEdges = append(proposedEdges, edge)
+			} else {
+				structuralEdges = append(structuralEdges, edge)
+			}
 		}
 		for _, n := range nodeMap {
 			nodes = append(nodes, graphNode{
-				ID: n.id, Title: n.title, Type: n.ntype, Group: n.group, Weight: n.weight,
+				ID: n.id, Title: n.title, Type: n.ntype, Group: n.group,
+				Size: n.size, Weight: n.weight,
 			})
 		}
 
 		data := struct {
-			ProjectID  string      `json:"project_id"`
-			TotalEdges int         `json:"total_edges"`
-			Returned   int         `json:"returned"`
-			Nodes      []graphNode `json:"nodes"`
-			Edges      []graphEdge `json:"edges"`
+			ProjectID       string      `json:"project_id"`
+			TotalEdges      int         `json:"total_edges"`
+			Returned        int         `json:"returned"`
+			Nodes           []graphNode `json:"nodes"`
+			StructuralEdges []graphEdge `json:"structural_edges"`
+			ProposedEdges   []graphEdge `json:"proposed_edges"`
 		}{
-			ProjectID:  projectID,
-			TotalEdges: total,
-			Returned:   len(results),
-			Nodes:      nodes,
-			Edges:      edges,
+			ProjectID:       projectID,
+			TotalEdges:      total,
+			Returned:        len(results),
+			Nodes:           nodes,
+			StructuralEdges: structuralEdges,
+			ProposedEdges:   proposedEdges,
 		}
 
 		jsonBytes, err := json.Marshal(data)
@@ -216,7 +230,7 @@ func HandleGraphView(db store.Store) http.HandlerFunc {
 
 // handleRESTIngest handles POST /ingest — auto-detect adapters, same pipeline
 // as the MCP ingest tool. Async: returns { job_id, status } immediately.
-func handleRESTIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobStore) http.HandlerFunc {
+func handleRESTIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobStore, batchSize int) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Root      string `json:"root"`
@@ -253,24 +267,35 @@ func handleRESTIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobS
 					return
 				}
 			}
-			for _, e := range edges {
-				if err := db.UpsertEdge(ctx, e); err != nil {
-					jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert edge: %w", err))
-					return
-				}
+			if err := db.UpsertEdges(ctx, edges); err != nil {
+				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert edges: %w", err))
+				return
 			}
+			jobs.updatePhase(job.ID, "waiting")
+			ingestMu.Lock()
+			jobs.updatePhase(job.ID, "chunking")
+
+			embedOnce := sync.OnceFunc(func() { jobs.updatePhase(job.ID, "embedding") })
 			chunkCount, err := chunkAndEmbedNodes(
-				ctx, db, embedder, nodes,
-				func(embedded, total int) { jobs.updateChunksEmbedded(job.ID, embedded, total) },
+				ctx, db, embedder, nodes, batchSize,
+				func(embedded, total int) {
+					embedOnce()
+					jobs.updateChunksEmbedded(job.ID, embedded, total)
+				},
 				func() { jobs.updatePhase(job.ID, "persisting") },
 			)
 			if err != nil {
+				ingestMu.Unlock()
 				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("chunk/embed: %w", err))
 				return
 			}
 			if embedder != nil {
-				_ = onboard.EmbedNodes(ctx, db, nodes, embedder)
+				_ = onboard.EmbedNodes(ctx, db, nodes, embedder, batchSize)
 			}
+			ingestMu.Unlock()
+
+			jobs.updatePhase(job.ID, "linking")
+
 			convNodes := onboard.InferConventions(ctx, db, projectID, nodes)
 			for _, cn := range convNodes {
 				_ = db.UpsertNode(ctx, cn)
@@ -283,11 +308,9 @@ func handleRESTIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobS
 					return
 				}
 			}
-			for _, e := range hierEdges {
-				if err := db.UpsertEdge(ctx, e); err != nil {
-					jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert hierarchy edge: %w", err))
-					return
-				}
+			if err := db.UpsertEdges(ctx, hierEdges); err != nil {
+				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert hierarchy edges: %w", err))
+				return
 			}
 			nodes = append(nodes, hierNodes...)
 			auto, proposals := onboard.Tier2ScoreAndLink(ctx, db, projectID, nodes)

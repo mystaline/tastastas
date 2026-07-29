@@ -54,7 +54,7 @@ func TestDocwalkChunksAndEmbeds(t *testing.T) {
 		}
 	}
 
-	chunkCount, err := chunkAndEmbedNodes(ctx, db, sc, nodes, nil, nil)
+	chunkCount, err := chunkAndEmbedNodes(ctx, db, sc, nodes, 32, nil, nil)
 	if err != nil {
 		t.Fatalf("chunkAndEmbedNodes: %v", err)
 	}

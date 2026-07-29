@@ -21,13 +21,13 @@ import (
 	_ "modernc.org/sqlite/vec"
 	_ "turso.tech/database/tursogo"
 
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/mystaline-dev/tastastas/internal/embed"
-	_ "github.com/mystaline-dev/tastastas/internal/onboard"
 	mcpserver "github.com/mystaline-dev/tastastas/internal/mcp"
+	_ "github.com/mystaline-dev/tastastas/internal/onboard"
+	"github.com/mystaline-dev/tastastas/internal/store"
 	libsqlstore "github.com/mystaline-dev/tastastas/internal/store/libsql"
 	sqlitestore "github.com/mystaline-dev/tastastas/internal/store/sqlite"
-	"github.com/mystaline-dev/tastastas/internal/store"
-	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // newEmbedder picks an embedding backend based on --embed-backend:
@@ -37,35 +37,39 @@ import (
 //     Requires --openai-api-key or $TASTASTAS_OPENAI_KEY.
 //   - "ollama" (default): HTTP call to a local Ollama instance.
 //   - "none": explicit lexical-only mode, no embedder at all.
-func newEmbedder(backend string, sidecarWorkers int,
+func newEmbedder(backend string, sidecarWorkers, sidecarIntraThreads, batchSize int,
 	ollamaURL, ollamaModel string,
 	openaiKey, openaiModel, openaiBaseURL string,
 	embedDim int) embed.EmbedderBackend {
+	sc := embed.SidecarConfig{
+		IntraThreads: sidecarIntraThreads,
+		MaxBatchSize: batchSize,
+	}
 	switch backend {
 	case "none":
 		return nil
 	case "sidecar":
 		if sidecarWorkers != 1 {
-			p, err := embed.NewSidecarPool(sidecarWorkers)
+			p, err := embed.NewSidecarPoolWithConfig(sidecarWorkers, sc)
 			if err != nil {
 				log.Printf("embed: sidecar pool unavailable (%v), falling back to lexical-only", err)
 				return nil
 			}
 			return p
 		}
-		sc, err := embed.NewSidecar()
+		se, err := embed.NewSidecarWithConfig(sc)
 		if err != nil {
 			log.Printf("embed: sidecar unavailable (%v), falling back to lexical-only", err)
 			return nil
 		}
-		return sc
+		return se
 	case "openai":
 		if openaiKey == "" {
 			log.Fatal("embed: --openai-api-key or $TASTASTAS_OPENAI_KEY required for --embed-backend=openai")
 		}
-		return embed.NewOpenAI(openaiKey, openaiModel, openaiBaseURL, embedDim)
+		return embed.NewOpenAI(openaiKey, openaiModel, openaiBaseURL, embedDim, batchSize)
 	default:
-		return embed.New(embed.Config{OllamaURL: ollamaURL, Model: ollamaModel})
+		return embed.New(embed.Config{OllamaURL: ollamaURL, Model: ollamaModel, MaxBatchSize: batchSize})
 	}
 }
 
@@ -94,7 +98,8 @@ func ensureDBDir(path string) {
 }
 
 func isRemoteDSN(dsn string) bool {
-	return strings.HasPrefix(dsn, "libsql://") || strings.HasPrefix(dsn, "http://") || strings.HasPrefix(dsn, "https://")
+	return strings.HasPrefix(dsn, "libsql://") || strings.HasPrefix(dsn, "http://") ||
+		strings.HasPrefix(dsn, "https://")
 }
 
 func main() {
@@ -148,16 +153,58 @@ func main() {
 	}
 
 	serve := flag.String("serve", "", "run as HTTP server on given address (e.g. :8080)")
-	graphAddr := flag.String("graph-addr", "", "serve graph visualization page on this address (e.g. :9292) — works in both stdio and HTTP mode")
-	dbPath := flag.String("db", defaultDBPath(), "path to SQLite database file (default: $XDG_DATA_HOME/tastastas/memory.db — cwd-independent so all projects share one source of truth)")
-	embedDim := flag.Int("embed-dim", 0, "embedding vector dimension (0 = auto-detect: 384 for sidecar, 768 for ollama, 1536 for openai)")
-	embedBackend := flag.String("embed-backend", "sidecar", "embedder backend: sidecar (baked ONNX, zero deps, 384-dim), ollama (HTTP, 768-dim), openai (cloud API, 1536-dim), or none (lexical only)")
-	ollamaURL := flag.String("ollama-url", "http://localhost:11434", "Ollama base URL (used when --embed-backend=ollama)")
-	ollamaModel := flag.String("ollama-model", "nomic-embed-text", "Ollama embedding model (used when --embed-backend=ollama)")
-	sidecarWorkers := flag.Int("sidecar-workers", 0, "number of sidecar workers (0 = 4, only for --embed-backend=sidecar)")
+	graphAddr := flag.String(
+		"graph-addr",
+		"",
+		"serve graph visualization page on this address (e.g. :9292) — works in both stdio and HTTP mode",
+	)
+	dbPath := flag.String(
+		"db",
+		defaultDBPath(),
+		"path to SQLite database file (default: $XDG_DATA_HOME/tastastas/memory.db — cwd-independent so all projects share one source of truth)",
+	)
+	embedDim := flag.Int(
+		"embed-dim",
+		0,
+		"embedding vector dimension (0 = auto-detect: 384 for sidecar, 768 for ollama, 1536 for openai)",
+	)
+	embedBackend := flag.String(
+		"embed-backend",
+		"sidecar",
+		"embedder backend: sidecar (baked ONNX, zero deps, 384-dim), ollama (HTTP, 768-dim), openai (cloud API, 1536-dim), or none (lexical only)",
+	)
+	ollamaURL := flag.String(
+		"ollama-url",
+		"http://localhost:11434",
+		"Ollama base URL (used when --embed-backend=ollama)",
+	)
+	ollamaModel := flag.String(
+		"ollama-model",
+		"nomic-embed-text",
+		"Ollama embedding model (used when --embed-backend=ollama)",
+	)
+	sidecarWorkers := flag.Int(
+		"sidecar-workers",
+		0,
+		"number of sidecar workers (0 = 4, only for --embed-backend=sidecar)",
+	)
 	openaiKey := flag.String("openai-api-key", "", "OpenAI API key (prefer $TASTASTAS_OPENAI_KEY env var)")
-	openaiModel := flag.String("openai-model", "text-embedding-3-small", "OpenAI model ID (used when --embed-backend=openai)")
-	openaiBaseURL := flag.String("openai-base-url", "https://api.openai.com/v1", "OpenAI API base URL (used when --embed-backend=openai)")
+	openaiModel := flag.String(
+		"openai-model",
+		"text-embedding-3-small",
+		"OpenAI model ID (used when --embed-backend=openai)",
+	)
+	openaiBaseURL := flag.String(
+		"openai-base-url",
+		"https://api.openai.com/v1",
+		"OpenAI API base URL (used when --embed-backend=openai)",
+	)
+	sidecarIntraThreads := flag.Int(
+		"sidecar-intra-threads",
+		0,
+		"sidecar ONNX intra-op thread count (0 = ONNX default = all cores, 2 = ~200% CPU on 4-vCPU, only for --embed-backend=sidecar)",
+	)
+	batchSize := flag.Int("batch-size", 32, "max texts per embed batch (16 saves ~50% peak RAM, 32=throughput)")
 	authToken := flag.String("auth-token", "", "bearer token for HTTP server mode (empty = no auth)")
 	flag.Parse()
 
@@ -204,10 +251,13 @@ func main() {
 
 	// Check for interrupted-run marker from previous run.
 	if hasMarker, mErr := db.HasJobMarker(context.Background()); mErr == nil && hasMarker {
-		log.Println("WARNING: previous ingest/onboard was interrupted. Re-run to complete. Ingest is idempotent (upsert + content-hash skip), so re-running is safe.")
+		log.Println(
+			"WARNING: previous ingest/onboard was interrupted. Re-run to complete. Ingest is idempotent (upsert + content-hash skip), so re-running is safe.",
+		)
 	}
 
-	embedder := newEmbedder(*embedBackend, *sidecarWorkers, *ollamaURL, *ollamaModel,
+	embedder := newEmbedder(*embedBackend, *sidecarWorkers, *sidecarIntraThreads, *batchSize,
+		*ollamaURL, *ollamaModel,
 		*openaiKey, *openaiModel, *openaiBaseURL, *embedDim)
 	closeEmbedder := func() {
 		if closer, ok := embedder.(interface{ Close() error }); ok {
@@ -229,7 +279,7 @@ func main() {
 	if *serve != "" {
 		// HTTP server mode
 		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-		err := mcpserver.ServeHTTP(ctx, db, embedder, *serve, *authToken)
+		err := mcpserver.ServeHTTP(ctx, db, embedder, *serve, *authToken, *batchSize)
 		cancel()
 		db.Close() // close before exit: log.Fatalf below skips defers
 		closeEmbedder()
@@ -240,7 +290,7 @@ func main() {
 	}
 
 	// Stdio MCP server mode (default)
-	srv := mcpserver.NewServer(db, embedder)
+	srv := mcpserver.NewServer(db, embedder, *batchSize)
 	if err := srv.Run(context.Background(), &mcpsdk.StdioTransport{}); err != nil {
 		db.Close() // close before os.Exit
 		closeEmbedder()

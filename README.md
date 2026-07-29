@@ -232,6 +232,37 @@ Add this to your `.cursorrules`, `CLAUDE.md`, `AGENTS.md`, or other agent entryp
 tastastas is an MCP server connected to this project. If you see tastastas in your available MCP tools, always call the `init` tool as the first step of every session to understand available tools and best practices.
 ```
 
+## Deployment Guide
+
+Recommended configuration per hardware spec. Sidecar = baked ONNX (`--embed-backend sidecar`), zero external deps.
+
+### Sidecar backend (local ONNX)
+
+| Hardware | Users | Mode | `--sidecar-workers` | `--sidecar-intra-threads` | `--batch-size` | Notes |
+|----------|-------|------|--------------------:|--------------------------:|---------------:|-------|
+| 2 vCPU, 2GB RAM | 1-2 | stdio | 1 | 1 | 8 | Ingest serial. Recall parallel. |
+| 4 vCPU, 4GB RAM | 5-10 | `--serve` | 1 | 2 | 16 | Queue ingest (1 at a time). 30 user recall fine. |
+| 4 vCPU, 4GB RAM | 30 | `--serve` | 1 | 2 | 16 | Recall parallel, ingest serial per user. |
+| 8 vCPU, 16GB RAM | 10-30 | `--serve` | 2 | 4 | 32 | Balance throughput vs CPU. |
+| 16+ vCPU, 32GB RAM | 30+ | `--serve` | 4 | 0 (all) | 32 | Default — max throughput. Good CI/on-prem build server. |
+| Any + NVIDIA GPU | any | stdio/serve | 1 | N/A (GPU) | 32 | Sidecar uses CPU ONNX; GPU path needs CUDA EP build. |
+
+### Ollama backend (external process, 768-dim)
+
+| Hardware | Users | Mode | Ollama model | `--batch-size` | Notes |
+|----------|-------|------|--------------|---------------:|-------|
+| 4 vCPU, 8GB RAM | 5-10 | `--serve` | `nomic-embed-text` | 16 | Ollama + tastastas ~1.5GB base RAM. |
+| 8 vCPU, 16GB RAM | 10-30 | `--serve` | `nomic-embed-text` | 32 | Standard team setup. |
+| 16+ vCPU, 32GB RAM | 30+ | `--serve` | `bge-m3` | 32 | Higher quality (1024-dim). Requires more RAM. |
+
+### OpenAI backend (cloud API, 1536-dim)
+
+No hardware tuning needed — embedding runs on OpenAI servers. Set `--embed-backend openai --openai-api-key $TASTASTAS_OPENAI_KEY`. `--batch-size` up to 2048 (OpenAI limit). Best for resource-constrained hosts or when quality is priority.
+
+### Ingestion serialization
+
+In `--serve` mode with 1 sidecar worker, ingest jobs queue behind the embedder mutex. Recall (FTS5 + cosine search) is fully parallel and unaffected. Recommended for all on-prem deployments to prevent resource starvation.
+
 ## Flags
 
 | Flag | Default | What it does |
@@ -243,6 +274,8 @@ tastastas is an MCP server connected to this project. If you see tastastas in yo
 | `--ollama-url` | `http://localhost:11434` | Ollama URL (`embed-backend=ollama`) |
 | `--ollama-model` | `nomic-embed-text` | Ollama embedding model (`embed-backend=ollama`) |
 | `--sidecar-workers` | `0` = 4 | Sidecar worker count (`embed-backend=sidecar`) |
+| `--sidecar-intra-threads` | `0` = ONNX default | ONNX intra-op thread count per sidecar worker. `2` caps CPU ~200% on 4-vCPU; `0` = all cores (`embed-backend=sidecar`) |
+| `--batch-size` | `32` | Max texts per embed batch. `16` saves ~50% peak RAM for ONNX tensors, throughput drop ~5-10% |
 | `--openai-api-key` | *(env `$TASTASTAS_OPENAI_KEY`)* | OpenAI API key (prefer env var, not CLI flag) |
 | `--openai-model` | `text-embedding-3-small` | OpenAI model ID |
 | `--openai-base-url` | `https://api.openai.com/v1` | OpenAI-compatible base URL |

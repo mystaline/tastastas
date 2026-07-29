@@ -316,6 +316,54 @@ func (s *Store) UpsertEdge(ctx context.Context, e store.Edge) error {
 	return nil
 }
 
+func (s *Store) UpsertEdges(ctx context.Context, edges []store.Edge) error {
+	if len(edges) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("libsql: begin edge upsert tx: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	const batchSize = 100
+	for i := 0; i < len(edges); i += batchSize {
+		end := i + batchSize
+		if end > len(edges) {
+			end = len(edges)
+		}
+		batch := edges[i:end]
+
+		var valStrings []string
+		var args []any
+		for _, e := range batch {
+			if e.FromID == "" || e.ToID == "" || e.EdgeType == "" {
+				return errors.New("libsql: edge requires from_id, to_id, edge_type")
+			}
+			if e.Confidence == 0 {
+				e.Confidence = 1.0
+			}
+			valStrings = append(valStrings, "(?,?,?,?)")
+			args = append(args, e.FromID, e.ToID, e.EdgeType, e.Confidence)
+		}
+		_, err = tx.ExecContext(ctx,
+			fmt.Sprintf(`
+				INSERT INTO edges (from_id, to_id, edge_type, confidence)
+				VALUES %s
+				ON CONFLICT(from_id, to_id, edge_type) DO UPDATE SET confidence = excluded.confidence
+			`, strings.Join(valStrings, ",")),
+			args...,
+		)
+		if err != nil {
+			return fmt.Errorf("libsql: upsert edge batch %d-%d: %w", i, end, err)
+		}
+	}
+
+	return tx.Commit()
+}
+
 func (s *Store) DeleteNode(ctx context.Context, id string) error {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM nodes WHERE id = ?`, id)
 	if err != nil {
@@ -931,7 +979,7 @@ func (s *Store) ListEdgesByProject(
 	edgeTypes []string,
 	limit, offset int,
 ) ([]store.EdgeResult, int, error) {
-	q := `SELECT e.from_id, fn.title, fn.node_type, e.to_id, tn.title, tn.node_type, e.edge_type, e.confidence,
+	q := `SELECT e.from_id, fn.title, fn.node_type, LENGTH(fn.content), e.to_id, tn.title, tn.node_type, LENGTH(tn.content), e.edge_type, e.confidence,
 	       COUNT(*) OVER() AS total
 		FROM edges e
 		JOIN nodes fn ON fn.id = e.from_id
@@ -962,7 +1010,7 @@ func (s *Store) ListEdgesByProject(
 		var er store.EdgeResult
 		var fromTitle, fromType, toTitle, toType string
 		var totalRow int
-		if err := rows.Scan(&er.FromID, &fromTitle, &fromType, &er.ToID, &toTitle, &toType, &er.EdgeType, &er.Confidence, &totalRow); err != nil {
+		if err := rows.Scan(&er.FromID, &fromTitle, &fromType, &er.FromSize, &er.ToID, &toTitle, &toType, &er.ToSize, &er.EdgeType, &er.Confidence, &totalRow); err != nil {
 			return nil, 0, fmt.Errorf("libsql: scan edge result: %w", err)
 		}
 		total = totalRow

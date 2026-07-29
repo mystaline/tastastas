@@ -5,6 +5,7 @@ package onboard
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +27,7 @@ type Config struct {
 	Scope     string // "cwd" or "subtree"
 	Embedder  embed.EmbedderBackend
 	Store     store.Store // injected from caller, not opened internally
+	BatchSize int         // 0 = default 32
 }
 
 type Result struct {
@@ -98,15 +100,17 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 			return Result{}, fmt.Errorf("upsert node %s: %w", n.ID, err)
 		}
 	}
-	for _, e := range allEdges {
-		if err := db.UpsertEdge(ctx, e); err != nil {
-			return Result{}, fmt.Errorf("upsert edge %s->%s: %w", e.FromID, e.ToID, err)
-		}
+	if err := db.UpsertEdges(ctx, allEdges); err != nil {
+		return Result{}, fmt.Errorf("upsert edges: %w", err)
 	}
 
 	// Embedding
+	embedBatchSize := cfg.BatchSize
+	if embedBatchSize <= 0 {
+		embedBatchSize = 32
+	}
 	if cfg.Embedder != nil {
-		if err := EmbedNodes(ctx, db, allNodes, cfg.Embedder); err != nil {
+		if err := EmbedNodes(ctx, db, allNodes, cfg.Embedder, embedBatchSize); err != nil {
 			return Result{}, err
 		}
 	}
@@ -129,10 +133,8 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 			return Result{}, err
 		}
 	}
-	for _, e := range hierEdges {
-		if err := db.UpsertEdge(ctx, e); err != nil {
-			return Result{}, err
-		}
+	if err := db.UpsertEdges(ctx, hierEdges); err != nil {
+		return Result{}, err
 	}
 	allNodes = append(allNodes, hierNodes...)
 
@@ -309,8 +311,10 @@ func hasMD(root string) bool {
 }
 
 // EmbedNodes batch-embeds node content.
-func EmbedNodes(ctx context.Context, db store.Store, nodes []store.Node, emb embed.EmbedderBackend) error {
-	const batchSize = 32
+func EmbedNodes(ctx context.Context, db store.Store, nodes []store.Node, emb embed.EmbedderBackend, batchSize int) error {
+	if batchSize <= 0 {
+		batchSize = 32
+	}
 	for i := 0; i < len(nodes); i += batchSize {
 		end := i + batchSize
 		if end > len(nodes) {
@@ -368,6 +372,7 @@ func InferConventions(ctx context.Context, db store.Store, projectID string, nod
 
 	var conventions []store.Node
 	convID := 0
+	var convEdges []store.Edge
 
 	// 1. Cluster by name prefix
 	prefixes := map[string][]string{} // prefix -> member IDs
@@ -406,7 +411,7 @@ func InferConventions(ctx context.Context, db store.Store, projectID string, nod
 
 		conventions = append(conventions, n)
 		for _, m := range members {
-			db.UpsertEdge(ctx, store.Edge{
+			convEdges = append(convEdges, store.Edge{
 				FromID:     n.ID,
 				ToID:       m,
 				EdgeType:   "convention-member",
@@ -450,13 +455,17 @@ func InferConventions(ctx context.Context, db store.Store, projectID string, nod
 
 		conventions = append(conventions, n)
 		for _, m := range members {
-			db.UpsertEdge(ctx, store.Edge{
+			convEdges = append(convEdges, store.Edge{
 				FromID:     n.ID,
 				ToID:       m,
 				EdgeType:   "convention-member",
 				Confidence: 0.8,
 			})
 		}
+	}
+
+	if len(convEdges) > 0 {
+		db.UpsertEdges(ctx, convEdges)
 	}
 
 	return conventions
@@ -522,22 +531,36 @@ func Tier2ScoreAndLink(ctx context.Context, db store.Store, projectID string, ne
 		return 0, 0
 	}
 
-	// Score each pair (undirected, so only i<j)
+	tokens := make([][]string, len(newNodes))
+	pathSegs := make([][]string, len(newNodes))
+	for i, n := range newNodes {
+		if n.Embedding == nil || n.NodeType == "directory" {
+			continue
+		}
+		tokens[i] = tokenize(n.Title)
+		if n.SourcePath != "" {
+			pathSegs[i] = strings.Split(filepath.ToSlash(n.SourcePath), "/")
+		}
+	}
+
+	var edges []store.Edge
+
 	for i := 0; i < len(newNodes); i++ {
-		a := newNodes[i]
-		if a.Embedding == nil || a.NodeType == "directory" {
+		if tokens[i] == nil {
 			continue
 		}
 		for j := i + 1; j < len(newNodes); j++ {
-			b := newNodes[j]
-			if b.Embedding == nil || b.NodeType == "directory" {
+			if tokens[j] == nil {
 				continue
 			}
 
+			a := newNodes[i]
+			b := newNodes[j]
+
 			cos := cosineSimilarity(a.Embedding, b.Embedding)
 			tc := typeCompat(a.NodeType, b.NodeType)
-			pp := pathProximity(a.SourcePath, b.SourcePath)
-			io := identifierOverlap(a.Title, b.Title)
+			pp := pathProximitySegs(pathSegs[i], pathSegs[j])
+			io := identifierOverlapTokens(tokens[i], tokens[j])
 
 			score := 0.4*cos + 0.2*tc + 0.2*pp + 0.2*io
 			score += templateCollisionPenalty(a, b)
@@ -553,7 +576,7 @@ func Tier2ScoreAndLink(ctx context.Context, db store.Store, projectID string, ne
 				proposalsQueued++
 			}
 
-			db.UpsertEdge(ctx, store.Edge{
+			edges = append(edges, store.Edge{
 				FromID:     a.ID,
 				ToID:       b.ID,
 				EdgeType:   edgeType,
@@ -562,7 +585,62 @@ func Tier2ScoreAndLink(ctx context.Context, db store.Store, projectID string, ne
 		}
 	}
 
+	if len(edges) > 0 {
+		_ = db.UpsertEdges(ctx, edges)
+	}
+
 	return autoLinked, proposalsQueued
+}
+
+func identifierOverlapTokens(t1, t2 []string) float64 {
+	if len(t1) == 0 || len(t2) == 0 {
+		return 0
+	}
+
+	intersection := 0
+	for _, t := range t1 {
+		for _, u := range t2 {
+			if t == u {
+				intersection++
+				break
+			}
+		}
+	}
+
+	union := len(t1) + len(t2) - intersection
+	if union == 0 {
+		return 0
+	}
+	return float64(intersection) / float64(union)
+}
+
+func pathProximitySegs(segs1, segs2 []string) float64 {
+	if len(segs1) == 0 || len(segs2) == 0 {
+		return 0
+	}
+
+	shared := 0
+	max := len(segs1)
+	if len(segs2) < max {
+		max = len(segs2)
+	}
+
+	for i := 0; i < max; i++ {
+		if segs1[i] == segs2[i] {
+			shared++
+		} else {
+			break
+		}
+	}
+
+	if shared == 0 {
+		return 0
+	}
+	depth := len(segs1)
+	if len(segs2) > depth {
+		depth = len(segs2)
+	}
+	return float64(shared) / float64(depth)
 }
 
 func cosineSimilarity(a, b []float32) float64 {
@@ -578,19 +656,7 @@ func cosineSimilarity(a, b []float32) float64 {
 	if normA == 0 || normB == 0 {
 		return 0
 	}
-	return dot / (sqrtFloat64(normA) * sqrtFloat64(normB))
-}
-
-func sqrtFloat64(x float64) float64 {
-	// Newton's method for sqrt, no math import
-	if x <= 0 {
-		return 0
-	}
-	z := x / 2
-	for i := 0; i < 20; i++ {
-		z -= (z*z - x) / (2 * z)
-	}
-	return z
+	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
 }
 
 func typeCompat(t1, t2 string) float64 {
@@ -610,57 +676,14 @@ func pathProximity(p1, p2 string) float64 {
 	if p1 == "" || p2 == "" {
 		return 0
 	}
-	parts1 := strings.Split(filepath.ToSlash(p1), "/")
-	parts2 := strings.Split(filepath.ToSlash(p2), "/")
-
-	// Count shared prefix segments
-	shared := 0
-	max := len(parts1)
-	if len(parts2) < max {
-		max = len(parts2)
-	}
-
-	for i := 0; i < max; i++ {
-		if parts1[i] == parts2[i] {
-			shared++
-		} else {
-			break
-		}
-	}
-
-	if shared == 0 {
-		return 0
-	}
-	// Jaccard-like: shared / max(depth)
-	depth := len(parts1)
-	if len(parts2) > depth {
-		depth = len(parts2)
-	}
-	return float64(shared) / float64(depth)
+	return pathProximitySegs(
+		strings.Split(filepath.ToSlash(p1), "/"),
+		strings.Split(filepath.ToSlash(p2), "/"),
+	)
 }
 
 func identifierOverlap(t1, t2 string) float64 {
-	tokens1 := tokenize(t1)
-	tokens2 := tokenize(t2)
-	if len(tokens1) == 0 || len(tokens2) == 0 {
-		return 0
-	}
-
-	intersection := 0
-	for _, t := range tokens1 {
-		for _, u := range tokens2 {
-			if t == u {
-				intersection++
-				break
-			}
-		}
-	}
-
-	union := len(tokens1) + len(tokens2) - intersection
-	if union == 0 {
-		return 0
-	}
-	return float64(intersection) / float64(union)
+	return identifierOverlapTokens(tokenize(t1), tokenize(t2))
 }
 
 // tokenize splits an identifier into words on camelCase/PascalCase/snake_case
@@ -669,32 +692,33 @@ func tokenize(s string) []string {
 	s = strings.ReplaceAll(s, "_", " ")
 	s = strings.ReplaceAll(s, ".", " ")
 	var words []string
-	current := ""
+	var sb strings.Builder
 
 	for _, r := range s {
 		if r == ' ' {
-			if current != "" {
-				words = append(words, strings.ToLower(current))
-				current = ""
+			if sb.Len() > 0 {
+				words = append(words, strings.ToLower(sb.String()))
+				sb.Reset()
 			}
 			continue
 		}
 
-		if r >= 'A' && r <= 'Z' && current != "" {
-			// Upper after lower = new word
-			last := current[len(current)-1]
+		if r >= 'A' && r <= 'Z' && sb.Len() > 0 {
+			cur := sb.String()
+			last := cur[len(cur)-1]
 			if last >= 'a' && last <= 'z' {
-				words = append(words, strings.ToLower(current))
-				current = string(r)
+				words = append(words, strings.ToLower(cur))
+				sb.Reset()
+				sb.WriteRune(r)
 				continue
 			}
 		}
 
-		current += string(r)
+		sb.WriteRune(r)
 	}
 
-	if current != "" {
-		words = append(words, strings.ToLower(current))
+	if sb.Len() > 0 {
+		words = append(words, strings.ToLower(sb.String()))
 	}
 	return words
 }

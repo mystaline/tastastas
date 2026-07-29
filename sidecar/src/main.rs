@@ -4,8 +4,13 @@
 //   out: {"embeddings": [[...], [...]]}
 // Model + tokenizer are baked into the binary via include_bytes! so the
 // released binary has zero external file dependencies at runtime.
+//
+// CLI: --intra-threads N (default 0 = ONNX default = all cores)
+//      Passed by the Go parent process. Controls intra-op parallelism
+//      per inference call (1 thread = ~50% CPU on 4-vCPU; 2 = ~200%).
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
+use std::env;
 use std::io::{self, BufRead, Write};
 use tokenizers::{Tokenizer, TruncationParams};
 
@@ -16,6 +21,18 @@ const TOKENIZER_BYTES: &[u8] = include_bytes!("../assets/tokenizer.json");
 // 512 tokens. Longer input must be truncated before it ever reaches the
 // model or onnxruntime errors on the position-embedding Add/Gather.
 const MAX_SEQ_LEN: usize = 512;
+
+fn parse_intra_threads() -> Option<usize> {
+    let args: Vec<String> = env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--intra-threads" && i + 1 < args.len() {
+            return args[i + 1].parse::<usize>().ok();
+        }
+        i += 1;
+    }
+    None
+}
 
 #[derive(serde::Deserialize)]
 struct Request {
@@ -119,10 +136,15 @@ fn main() {
         .expect("set truncation");
 
     ort::init().commit();
-    let mut session = Session::builder()
+    let intra = parse_intra_threads();
+    let mut builder = Session::builder()
         .expect("session builder")
         .with_optimization_level(GraphOptimizationLevel::Level3)
-        .expect("opt level")
+        .expect("opt level");
+    if let Some(n) = intra {
+        builder = builder.with_intra_threads(n).expect("set intra threads");
+    }
+    let mut session = builder
         .commit_from_memory(MODEL_BYTES)
         .expect("load model");
 
