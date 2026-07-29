@@ -230,7 +230,14 @@ func main() {
 	if *embedDim <= 0 {
 		switch *embedBackend {
 		case "openai":
-			*embedDim = 1536
+			if *openaiKey == "" {
+				log.Fatal("embed: --openai-api-key or $TASTASTAS_OPENAI_KEY required for --embed-backend=openai")
+			}
+			probed, err := embed.ProbeOpenAIDim(*openaiKey, *openaiModel, *openaiBaseURL)
+			if err != nil {
+				log.Fatalf("embed: probe openai dim: %v", err)
+			}
+			*embedDim = probed
 		case "ollama":
 			*embedDim = 768
 		default:
