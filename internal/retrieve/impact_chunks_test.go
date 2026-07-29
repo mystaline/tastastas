@@ -77,7 +77,7 @@ func TestCheckImpactUnaffectedByChunks(t *testing.T) {
 
 	// Sanity: the chunks we attached are still there and untouched — impact
 	// marking must not have deleted or mutated them.
-	hits, err := st.SearchChunks(ctx, "test", fakeVec, 10)
+	hits, err := st.SearchChunks(ctx, "test", fakeVec, 10, "")
 	if err != nil {
 		t.Fatalf("SearchChunks: %v", err)
 	}

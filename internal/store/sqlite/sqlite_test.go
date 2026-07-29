@@ -141,7 +141,7 @@ func TestSearchVector(t *testing.T) {
 		}
 	}
 
-	results, err := s.SearchVector(ctx, "default", []float32{1, 0, 0, 0}, 2)
+	results, err := s.SearchVector(ctx, "default", []float32{1, 0, 0, 0}, 2, "")
 	if err != nil {
 		t.Fatalf("SearchVector: %v", err)
 	}

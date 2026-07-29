@@ -74,6 +74,7 @@ type ChunkOutputItem struct {
 type RecallOutput struct {
 	Results []RecallItem      `json:"results"`
 	Links   []ImplicitMCPLink `json:"links,omitempty"`
+	Warning string            `json:"warning,omitempty"`
 }
 
 type RecallChunksInput struct {

@@ -54,7 +54,7 @@ func TestDocwalkChunksAndEmbeds(t *testing.T) {
 		}
 	}
 
-	chunkCount, err := chunkAndEmbedNodes(ctx, db, sc, nodes, 32, nil, nil)
+	chunkCount, err := chunkAndEmbedNodes(ctx, db, sc, nodes, 32, "", nil, nil)
 	if err != nil {
 		t.Fatalf("chunkAndEmbedNodes: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestDocwalkChunksAndEmbeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("embed query: %v", err)
 	}
-	hits, err := db.SearchChunks(ctx, "docwalk-chunk-test", queryVec, 5)
+	hits, err := db.SearchChunks(ctx, "docwalk-chunk-test", queryVec, 5, "")
 	if err != nil {
 		t.Fatalf("SearchChunks: %v", err)
 	}

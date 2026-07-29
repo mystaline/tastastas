@@ -47,7 +47,7 @@ func ServeHTTP(
 	mux.HandleFunc("GET /graph/{project}", HandleGraphView(db))
 
 	// REST ingest — POST /ingest auto-detects adapters, same pipeline as MCP ingest tool.
-	mux.HandleFunc("POST /ingest", handleRESTIngest(db, embedder, jobs, batchSize))
+	mux.HandleFunc("POST /ingest", handleRESTIngest(db, embedder, jobs, batchSize, modelID))
 	mux.HandleFunc("GET /ingest/jobs/{id}", handleIngestJobStatus(jobs))
 
 	// Health check — exempt from auth
@@ -231,7 +231,7 @@ func HandleGraphView(db store.Store) http.HandlerFunc {
 
 // handleRESTIngest handles POST /ingest — auto-detect adapters, same pipeline
 // as the MCP ingest tool. Async: returns { job_id, status } immediately.
-func handleRESTIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobStore, batchSize int) http.HandlerFunc {
+func handleRESTIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobStore, batchSize int, modelID string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Root      string `json:"root"`
@@ -253,7 +253,6 @@ func handleRESTIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobS
 		}
 
 		job := jobs.create()
-		// same pipeline as MCP ingest tool (server.go:466-520)
 		safeGo(func() {
 			ctx := context.Background()
 			nodes, edges, _, filesWalked, filesSkipped, err := onboard.AutoDetectAdapters(ctx, db, root, projectID)
@@ -278,7 +277,7 @@ func handleRESTIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobS
 
 			embedOnce := sync.OnceFunc(func() { jobs.updatePhase(job.ID, "embedding") })
 			chunkCount, err := chunkAndEmbedNodes(
-				ctx, db, embedder, nodes, batchSize,
+				ctx, db, embedder, nodes, batchSize, "",
 				func(embedded, total int) {
 					embedOnce()
 					jobs.updateChunksEmbedded(job.ID, embedded, total)
@@ -291,7 +290,7 @@ func handleRESTIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobS
 				return
 			}
 			if embedder != nil {
-				_ = onboard.EmbedNodes(ctx, db, nodes, embedder, batchSize)
+				_ = onboard.EmbedNodes(ctx, db, nodes, embedder, batchSize, "")
 			}
 			ingestMu.Unlock()
 

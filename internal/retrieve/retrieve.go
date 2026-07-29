@@ -108,6 +108,7 @@ type RecallParams struct {
 	ProjectID string
 	Query     string
 	Embedding []float32 // optional; nil = lexical-only mode
+	ModelID   string   // filter vectors by model; "" = no filter (legacy)
 	Limit     int
 
 	// LinkThreshold overrides Config.CrossSourceThreshold when > 0.
@@ -206,7 +207,7 @@ func (r *Retriever) Recall(ctx context.Context, params RecallParams) (*RecallRes
 	// 2. Vector search (only if embedding provided)
 	var vecHits []store.ScoredNode
 	if len(params.Embedding) > 0 {
-		vh, err := r.store.SearchVector(ctx, params.ProjectID, params.Embedding, limit*2)
+		vh, err := r.store.SearchVector(ctx, params.ProjectID, params.Embedding, limit*2, params.ModelID)
 		if err == nil {
 			vecHits = vh
 		}
@@ -258,7 +259,7 @@ func (r *Retriever) Recall(ctx context.Context, params RecallParams) (*RecallRes
 	// 7. Chunk search (optional, only if embedding provided + IncludeChunks)
 	var chunkResults []store.ScoredChunk
 	if r.cfg.IncludeChunks && len(params.Embedding) > 0 {
-		chunks, err := r.store.SearchChunks(ctx, params.ProjectID, params.Embedding, r.cfg.MaxChunks)
+		chunks, err := r.store.SearchChunks(ctx, params.ProjectID, params.Embedding, r.cfg.MaxChunks, params.ModelID)
 		if err == nil {
 			chunkResults = chunks
 		}
