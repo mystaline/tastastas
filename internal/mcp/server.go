@@ -140,7 +140,8 @@ func chunkAndEmbedNodes(
 		}
 		vecs, err := embedder.EmbedBatch(ctx, texts)
 		if err != nil {
-			return 0, fmt.Errorf("embed batch %d-%d: %w", i, end, err)
+			log.Printf("chunkAndEmbedNodes: batch %d-%d failed (%v), skipping", i, end, err)
+			continue
 		}
 		for j := range batch {
 			allChunks[needEmbedIdx[i+j]].Embedding = vecs[j]

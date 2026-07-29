@@ -5,6 +5,7 @@ package onboard
 import (
 	"context"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -315,6 +316,7 @@ func EmbedNodes(ctx context.Context, db store.Store, nodes []store.Node, emb emb
 	if batchSize <= 0 {
 		batchSize = 32
 	}
+	var failed []string
 	for i := 0; i < len(nodes); i += batchSize {
 		end := i + batchSize
 		if end > len(nodes) {
@@ -322,7 +324,6 @@ func EmbedNodes(ctx context.Context, db store.Store, nodes []store.Node, emb emb
 		}
 		batch := nodes[i:end]
 
-		// Collect non-empty content for embedding
 		var texts []string
 		var idx []int
 		for j := range batch {
@@ -337,7 +338,14 @@ func EmbedNodes(ctx context.Context, db store.Store, nodes []store.Node, emb emb
 
 		vecs, err := emb.EmbedBatch(ctx, texts)
 		if err != nil {
-			return fmt.Errorf("embed batch %d-%d: %w", i, end, err)
+			log.Printf("EmbedNodes: batch %d-%d failed (%v), skipping %d nodes", i, end, err, len(texts))
+			for _, t := range texts {
+				if len(failed) > 10 {
+					break
+				}
+				failed = append(failed, truncateText(t, 60))
+			}
+			continue
 		}
 
 		for k, v := range vecs {
@@ -347,7 +355,24 @@ func EmbedNodes(ctx context.Context, db store.Store, nodes []store.Node, emb emb
 			}
 		}
 	}
+	if len(failed) > 0 {
+		msg := fmt.Sprintf("EmbedNodes: %d batch(es) failed", len(failed))
+		if len(failed) == 11 {
+			msg += fmt.Sprintf(", first %d: %v ...and more", 10, failed[:10])
+		} else {
+			msg += ": " + strings.Join(failed, ", ")
+		}
+		log.Print(msg)
+	}
 	return nil
+}
+
+func truncateText(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + ".."
 }
 
 func InferConventions(ctx context.Context, db store.Store, projectID string, nodes []store.Node) []store.Node {
