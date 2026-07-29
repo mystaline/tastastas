@@ -239,7 +239,11 @@ func main() {
 			}
 			*embedDim = probed
 		case "ollama":
-			*embedDim = 768
+			probed, err := embed.ProbeOllamaDim(*ollamaURL, *ollamaModel)
+			if err != nil {
+				log.Fatalf("embed: probe ollama dim: %v", err)
+			}
+			*embedDim = probed
 		default:
 			*embedDim = 384
 		}
