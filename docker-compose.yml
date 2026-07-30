@@ -11,13 +11,16 @@ services:
     #   - ./frontend/dist:/app/spa
     # environment:
     #   - TASTASTAS_SPA_DIR=/app/spa
+    # Embed backend override: set TASTASTAS_EMBED=openai to use OpenAI,
+    # TASTASTAS_EMBED=ollama for Ollama (needs separate ollama service).
+    # Default "none" = lexical-only (FTS5, no vector search).
     command:
       - "--serve"
       - ":8080"
       - "--db"
       - "/data/memory.db"
       - "--embed-backend"
-      - "sidecar"
+      - "${TASTASTAS_EMBED:-none}"
       - "--graph-addr"
       - ":9292"
     environment:
