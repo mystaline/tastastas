@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"time"
 	"syscall"
 
 	_ "github.com/tursodatabase/libsql-client-go/libsql"
@@ -25,6 +26,7 @@ import (
 	"github.com/mystaline-dev/tastastas/internal/embed"
 	mcpserver "github.com/mystaline-dev/tastastas/internal/mcp"
 	_ "github.com/mystaline-dev/tastastas/internal/onboard"
+	"github.com/mystaline-dev/tastastas/internal/consolidate"
 	"github.com/mystaline-dev/tastastas/internal/store"
 	libsqlstore "github.com/mystaline-dev/tastastas/internal/store/libsql"
 	sqlitestore "github.com/mystaline-dev/tastastas/internal/store/sqlite"
@@ -207,6 +209,11 @@ func main() {
 	batchSize := flag.Int("batch-size", 32, "max texts per embed batch (16 saves ~50% peak RAM, 32=throughput)")
 	authToken := flag.String("auth-token", "", "bearer token for HTTP server mode (empty = no auth)")
 	spaDir := flag.String("spa-dir", "", "path to built React SPA directory (empty = use embedded frontend) — also read from $TASTASTAS_SPA_DIR")
+	consolidateInterval := flag.String(
+		"consolidate-interval",
+		"",
+		"consolidation cron interval (e.g. '1h', '30m'). Empty = disabled",
+	)
 	flag.Parse()
 
 	if *spaDir == "" {
@@ -268,6 +275,15 @@ func main() {
 	}
 	if err != nil {
 		log.Fatalf("open store: %v", err)
+	}
+
+	if *consolidateInterval != "" {
+		dur, err := time.ParseDuration(*consolidateInterval)
+		if err != nil {
+			log.Fatalf("consolidate: invalid interval %q: %v", *consolidateInterval, err)
+		}
+		go consolidate.RunPeriodic(context.Background(), db, dur)
+		log.Printf("consolidate: cron started at %v interval", dur)
 	}
 
 	// Check for interrupted-run marker from previous run.
