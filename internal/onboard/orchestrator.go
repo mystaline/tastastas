@@ -4,23 +4,34 @@ package onboard
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/mystaline-dev/tastastas/internal/embed"
 	"github.com/mystaline-dev/tastastas/internal/ingest/codeast"
+	"github.com/mystaline-dev/tastastas/internal/ingest/codeast/treesitter"
 	"github.com/mystaline-dev/tastastas/internal/ingest/docwalk"
 	"github.com/mystaline-dev/tastastas/internal/ingest/gitrepo"
 	"github.com/mystaline-dev/tastastas/internal/ingest/markdownglob"
 	"github.com/mystaline-dev/tastastas/internal/ingest/obsidian"
 	"github.com/mystaline-dev/tastastas/internal/store"
 )
+
+// ModuleEntry describes a detected module root and its metadata.
+type ModuleEntry struct {
+	Root       string   // module root dir (where go.mod or package.json lives)
+	ModulePath string   // Go module path from go.mod, or empty for non-Go
+	Languages  []string // detected languages at this root
+}
 
 type Config struct {
 	CWD       string
@@ -109,7 +120,10 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	// Persist base nodes/edges
 	for _, n := range allNodes {
 		if err := db.UpsertNode(ctx, n); err != nil {
-			return Result{}, fmt.Errorf("upsert node %s: %w", n.ID, err)
+			if !errors.Is(err, store.ErrVectorSkipped) {
+				return Result{}, fmt.Errorf("upsert node %s: %w", n.ID, err)
+			}
+			log.Printf("onboard: %v (node metadata persisted, continuing)", err)
 		}
 	}
 	if err := db.UpsertEdges(ctx, allEdges); err != nil {
@@ -130,7 +144,7 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	// InferConventions
 	convNodes := InferConventions(ctx, db, cfg.ProjectID, allNodes)
 	for _, n := range convNodes {
-		if err := db.UpsertNode(ctx, n); err != nil {
+		if err := db.UpsertNode(ctx, n); err != nil && !errors.Is(err, store.ErrVectorSkipped) {
 			return Result{}, err
 		}
 	}
@@ -141,7 +155,7 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	// additive, derived from SourcePath only — see hierarchy.go.
 	hierNodes, hierEdges := BuildHierarchy(cfg.ProjectID, allNodes)
 	for _, n := range hierNodes {
-		if err := db.UpsertNode(ctx, n); err != nil {
+		if err := db.UpsertNode(ctx, n); err != nil && !errors.Is(err, store.ErrVectorSkipped) {
 			return Result{}, err
 		}
 	}
@@ -152,6 +166,12 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 
 	// Tier 2 inline linking
 	auto, queued := Tier2ScoreAndLink(ctx, db, cfg.ProjectID, allNodes)
+
+	// Cross-project linking (P2h) — link new project's code symbols to
+	// matching symbols in all other known projects.
+	if xpEdges, xpErr := CrossProjectLink(ctx, db, cfg.ProjectID, allNodes); xpErr == nil && len(xpEdges) > 0 {
+		_ = db.UpsertEdges(ctx, xpEdges)
+	}
 
 	return Result{
 		CWD:                 cfg.CWD,
@@ -179,60 +199,97 @@ func AutoDetectAdapters(ctx context.Context, db store.Store, root, projectID str
 	var wg sync.WaitGroup
 
 	type adapterResult struct {
-		name   string
-		nodes  []store.Node
-		edges  []store.Edge
-		walked int
-		err    error
+		name     string
+		nodes    []store.Node
+		edges    []store.Edge
+		rawCalls []treesitter.RawCall
+		walked   int
+		err      error
 	}
 	ch := make(chan adapterResult, 5)
 
-	startAdapter := func(name string, fn func() ([]store.Node, []store.Edge, int, error)) {
+	startAdapter := func(name string, fn func() ([]store.Node, []store.Edge, []treesitter.RawCall, int, error)) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			n, e, w, er := fn()
-			ch <- adapterResult{name: name, nodes: n, edges: e, walked: w, err: er}
+			n, e, rc, w, er := fn()
+			ch <- adapterResult{name: name, nodes: n, edges: e, rawCalls: rc, walked: w, err: er}
 		}()
 	}
 
 	// ---- detection + dispatch ----
 
-	if hasCodeast(root) {
-		langs := detectLanguages(root)
-		startAdapter("codeast", func() ([]store.Node, []store.Edge, int, error) {
-			ca := codeast.New(db, codeast.Config{Root: root, ProjectID: projectID, Languages: langs})
-			n, e, caErr := ca.Ingest(ctx)
-			return n, e, countFiles(root, langs), caErr
+	modules := detectModuleRoots(root)
+
+	var workspaceModules []string
+	var allLangs []string
+	for _, m := range modules {
+		if m.ModulePath != "" {
+			workspaceModules = append(workspaceModules, m.ModulePath)
+		}
+		for _, l := range m.Languages {
+			if !slices.Contains(allLangs, l) {
+				allLangs = append(allLangs, l)
+			}
+		}
+	}
+
+	// Go: one ingest per module root (go/packages needs its module's root)
+	for _, m := range modules {
+		if !slices.Contains(m.Languages, "go") {
+			continue
+		}
+		modRoot := m.Root
+		adapterName := "codeast-go-" + filepath.Base(modRoot)
+		startAdapter(adapterName, func() ([]store.Node, []store.Edge, []treesitter.RawCall, int, error) {
+			ca := codeast.New(db, codeast.Config{
+				Root: modRoot, ProjectID: projectID,
+				Languages:        []string{"go"},
+				WorkspaceModules: workspaceModules,
+			})
+			n, e, _, caErr := ca.IngestWithCalls(ctx)
+			return n, e, nil, countFiles(modRoot, []string{"go"}), caErr
+		})
+	}
+
+	// Non-Go: one ingest from root (tree-sitter walks files from common root)
+	var nonGoLangs []string
+	for _, l := range allLangs {
+		if l != "go" {
+			nonGoLangs = append(nonGoLangs, l)
+		}
+	}
+	if len(nonGoLangs) > 0 {
+		startAdapter("codeast", func() ([]store.Node, []store.Edge, []treesitter.RawCall, int, error) {
+			ca := codeast.New(db, codeast.Config{
+				Root: root, ProjectID: projectID,
+				Languages:        nonGoLangs,
+				WorkspaceModules: workspaceModules,
+			})
+			n, e, rc, caErr := ca.IngestWithCalls(ctx)
+			return n, e, rc, countFiles(root, nonGoLangs), caErr
 		})
 	}
 	if hasFile(root, "MEMORY.md") {
-		startAdapter("gitrepo", func() ([]store.Node, []store.Edge, int, error) {
+		startAdapter("gitrepo", func() ([]store.Node, []store.Edge, []treesitter.RawCall, int, error) {
 			n, gitErr := gitrepo.Ingest(gitrepo.Config{Root: root, ProjectID: projectID})
-			return n, nil, countMEMORYFiles(root), gitErr
+			return n, nil, nil, countMEMORYFiles(root), gitErr
 		})
 	}
 	if exists(filepath.Join(root, ".memoryrc.yaml")) {
-		startAdapter("docwalk", func() ([]store.Node, []store.Edge, int, error) {
+		startAdapter("docwalk", func() ([]store.Node, []store.Edge, []treesitter.RawCall, int, error) {
 			cfg, loadErr := docwalk.LoadConfig(filepath.Join(root, ".memoryrc.yaml"))
 			if loadErr != nil {
-				return nil, nil, 0, fmt.Errorf("docwalk load config: %w", loadErr)
+				return nil, nil, nil, 0, fmt.Errorf("docwalk load config: %w", loadErr)
 			}
-			// Don't override cfg.ProjectID — docwalk's .memoryrc.yaml is the
-			// source of truth. The caller's projectID (which may be "default"
-			// if unset) would overwrite a meaningful name like
-			// "example-vault" and create mismatched node IDs. Non-
-			// docwalk adapters (codeast, gitrepo, obsidian, markdown-glob)
-			// don't have their own config, so they still receive the caller's
-			// projectID below.
 			n, e, w, _, dwErr := docwalk.Ingest(root, cfg)
-			return n, e, w, dwErr
+			return n, e, nil, w, dwErr
 		})
 	}
 	if exists(filepath.Join(root, ".obsidian")) {
-		startAdapter("obsidian", func() ([]store.Node, []store.Edge, int, error) {
+		startAdapter("obsidian", func() ([]store.Node, []store.Edge, []treesitter.RawCall, int, error) {
 			n, e, obErr := obsidian.Ingest(obsidian.Config{Root: root, ProjectID: projectID})
-			return n, e, countFiles(root, nil), obErr
+			return n, e, nil, countFiles(root, nil), obErr
 		})
 	}
 	// markdown-glob is docwalk's untyped fallback: skip it when .memoryrc.yaml
@@ -242,13 +299,14 @@ func AutoDetectAdapters(ctx context.Context, db store.Store, root, projectID str
 	// finishes last wins the UpsertNode ON CONFLICT, silently discarding the
 	// configured type.
 	if hasMD(root) && !exists(filepath.Join(root, ".memoryrc.yaml")) {
-		startAdapter("markdown-glob", func() ([]store.Node, []store.Edge, int, error) {
+		startAdapter("markdown-glob", func() ([]store.Node, []store.Edge, []treesitter.RawCall, int, error) {
 			n, mdErr := markdownglob.Ingest(markdownglob.Config{Root: root, ProjectID: projectID})
-			return n, nil, countFiles(root, nil), mdErr
+			return n, nil, nil, countFiles(root, nil), mdErr
 		})
 	}
 
 	// ---- collect ----
+	var allRawCalls []treesitter.RawCall
 	go func() { wg.Wait(); close(ch) }()
 
 	for r := range ch {
@@ -256,13 +314,34 @@ func AutoDetectAdapters(ctx context.Context, db store.Store, root, projectID str
 		adapters = append(adapters, r.name)
 		filesWalked += r.walked
 		if r.err != nil {
+			if strings.HasPrefix(r.name, "codeast-go-") {
+				log.Printf("orchestrator: skipping failed adapter %s: %v — continuing", r.name, r.err)
+				mu.Unlock()
+				continue
+			}
 			err = r.err
 			mu.Unlock()
 			return // first adapter error fails fast
 		}
 		nodes = append(nodes, r.nodes...)
 		edges = append(edges, r.edges...)
+		allRawCalls = append(allRawCalls, r.rawCalls...)
 		mu.Unlock()
+	}
+	// Cross-file linker pass (P2d) — resolves raw_calls using global label index
+	if len(allRawCalls) > 0 && len(nodes) > 0 {
+		linkEdges := ResolveCrossFileCalls(nodes, allRawCalls, edges)
+		edges = append(edges, linkEdges...)
+	}
+
+	// Doc link extraction (P2g) — markdown links to existing nodes
+	nodeSet := make(map[string]bool)
+	for _, n := range nodes {
+		nodeSet[n.ID] = true
+	}
+	if len(nodeSet) > 0 && (hasMD(root) || exists(filepath.Join(root, ".memoryrc.yaml"))) {
+		docLinkEdges := docwalk.ExtractMarkdownLinks(root, projectID, nodeSet)
+		edges = append(edges, docLinkEdges...)
 	}
 	return
 }
@@ -274,6 +353,66 @@ func hasCodeast(root string) bool {
 		}
 	}
 	return false
+}
+
+// detectModuleRoots walks root up to depth 3 and finds all module config files.
+// Returns one ModuleEntry per detected root (go.mod, package.json, pyproject.toml, Cargo.toml).
+func detectModuleRoots(root string) []ModuleEntry {
+	var entries []ModuleEntry
+	seen := map[string]bool{}
+
+	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		if path != root {
+			rel, _ := filepath.Rel(root, path)
+			depth := len(strings.Split(filepath.ToSlash(rel), "/"))
+			if depth > 3 {
+				return filepath.SkipDir
+			}
+		}
+		if shouldSkipDir(d.Name()) {
+			return filepath.SkipDir
+		}
+		var langs []string
+		if exists(filepath.Join(path, "go.mod")) {
+			langs = append(langs, "go")
+		}
+		if exists(filepath.Join(path, "package.json")) {
+			langs = append(langs, "typescript")
+		}
+		if exists(filepath.Join(path, "pyproject.toml")) {
+			langs = append(langs, "python")
+		}
+		if exists(filepath.Join(path, "Cargo.toml")) {
+			langs = append(langs, "rust")
+		}
+		if len(langs) > 0 && !seen[path] {
+			seen[path] = true
+			modPath := ""
+			if goMod := filepath.Join(path, "go.mod"); exists(goMod) {
+				modPath = parseModulePath(goMod)
+			}
+			entries = append(entries, ModuleEntry{
+				Root:       path,
+				ModulePath: modPath,
+				Languages:  langs,
+			})
+		}
+		return nil
+	})
+	return entries
+}
+
+// parseModulePath extracts the module directive from a go.mod file.
+func parseModulePath(goModPath string) string {
+	data, _ := os.ReadFile(goModPath)
+	m := regexp.MustCompile(`^module\s+(\S+)`).FindSubmatch(data)
+	if m != nil {
+		return string(m[1])
+	}
+	return filepath.Base(filepath.Dir(goModPath))
 }
 
 func detectLanguages(root string) []string {
@@ -364,7 +503,10 @@ func EmbedNodes(ctx context.Context, db store.Store, nodes []store.Node, emb emb
 			batch[idx[k]].Embedding = v
 			batch[idx[k]].ModelID = modelID
 			if err := db.UpsertNode(ctx, batch[idx[k]]); err != nil {
-				return fmt.Errorf("upsert embed %s: %w", batch[idx[k]].ID, err)
+				if !errors.Is(err, store.ErrVectorSkipped) {
+					return fmt.Errorf("upsert embed %s: %w", batch[idx[k]].ID, err)
+				}
+				log.Printf("EmbedNodes: %v (node metadata persisted, continuing)", err)
 			}
 		}
 	}
@@ -450,10 +592,11 @@ func InferConventions(ctx context.Context, db store.Store, projectID string, nod
 		conventions = append(conventions, n)
 		for _, m := range members {
 			convEdges = append(convEdges, store.Edge{
-				FromID:     n.ID,
-				ToID:       m,
-				EdgeType:   "convention-member",
-				Confidence: 0.7,
+				FromID:         n.ID,
+				ToID:           m,
+				EdgeType:       "convention-member",
+				Confidence:     0.7,
+				ConfidenceTier: "INFERRED",
 			})
 		}
 	}
@@ -494,10 +637,11 @@ func InferConventions(ctx context.Context, db store.Store, projectID string, nod
 		conventions = append(conventions, n)
 		for _, m := range members {
 			convEdges = append(convEdges, store.Edge{
-				FromID:     n.ID,
-				ToID:       m,
-				EdgeType:   "convention-member",
-				Confidence: 0.8,
+				FromID:         n.ID,
+				ToID:           m,
+				EdgeType:       "convention-member",
+				Confidence:     0.8,
+				ConfidenceTier: "INFERRED",
 			})
 		}
 	}
@@ -614,11 +758,16 @@ func Tier2ScoreAndLink(ctx context.Context, db store.Store, projectID string, ne
 				proposalsQueued++
 			}
 
+			confidenceTier := "INFERRED"
+			if edgeType == "proposed" {
+				confidenceTier = "PROPOSED"
+			}
 			edges = append(edges, store.Edge{
-				FromID:     a.ID,
-				ToID:       b.ID,
-				EdgeType:   edgeType,
-				Confidence: score,
+				FromID:         a.ID,
+				ToID:           b.ID,
+				EdgeType:       edgeType,
+				Confidence:     score,
+				ConfidenceTier: confidenceTier,
 			})
 		}
 	}
