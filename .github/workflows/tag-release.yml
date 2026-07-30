@@ -1,0 +1,73 @@
+name: tag-release
+
+# Creates and pushes a v* tag, then triggers release.yml with the
+# resolved tag so builds run against the exact tag (no race on ref).
+#
+# Usage:
+#   gh workflow run tag-release.yml --field bump=patch
+#   gh workflow run tag-release.yml --field version=v1.2.3
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump (ignored when version is set)
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      version:
+        description: Explicit tag (e.g. v1.2.3). Overrides bump.
+        type: string
+        required: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "value=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            latest=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+            ver=${latest#v}
+            IFS=. read -r major minor patch <<< "$ver"
+            case "${{ inputs.bump }}" in
+              major) echo "value=v$((major + 1)).0.0"       >> "$GITHUB_OUTPUT" ;;
+              minor) echo "value=v$major.$((minor + 1)).0"   >> "$GITHUB_OUTPUT" ;;
+              patch) echo "value=v$major.$minor.$((patch + 1))" >> "$GITHUB_OUTPUT" ;;
+            esac
+          fi
+
+      - name: Validate tag format
+        run: |
+          tag="${{ steps.tag.outputs.value }}"
+          if ! echo "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "invalid tag: $tag (must be vMAJOR.MINOR.PATCH)"
+            exit 1
+          fi
+
+      - name: Create and push tag
+        run: |
+          tag="${{ steps.tag.outputs.value }}"
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "tag $tag already exists"
+            exit 1
+          fi
+          git tag "$tag"
+          git push origin "$tag"
+
+      - name: Trigger release workflow
+        run: |
+          gh workflow run release.yml --field tag="${{ steps.tag.outputs.value }}"
+        env:
+          GH_TOKEN: ${{ github.token }}
