@@ -1,28 +1,12 @@
-import { useRef, useState, useEffect, useCallback } from 'react'
+import { useRef, useState, useEffect, useCallback, useMemo } from 'react'
 import * as d3 from 'd3'
-import type { GraphNode, GraphEdge, GraphData } from '../types/graph'
-import { makeGroupHues, findRootId, nodeR, nodeColor } from '../utils/colors'
-import {
-  computeGroupNames,
-  computeAngleStep,
-  computeOrbitalParams,
-  computeOrbitalTarget,
-} from '../utils/layout'
-
-type SimNode = GraphNode & {
-  x: number
-  y: number
-  vx: number
-  vy: number
-  fx: number | null
-  fy: number | null
-}
-
-interface SimLink extends d3.SimulationLinkDatum<SimNode> {
-  edge_type: string
-  confidence: number
-  _key?: string
-}
+import type { GraphData, SimNode, SimLink, GraphNode, GraphEdge } from '../types/graph'
+import { nodeColor } from '../utils/colors'
+import { useD3Simulation } from './useD3Simulation'
+import type { GraphInteractionResult } from './useGraphInteraction'
+import { useGraphInteraction } from './useGraphInteraction'
+import type { ProposedBatchResult } from './useProposedBatch'
+import { useProposedBatch } from './useProposedBatch'
 
 export interface TooltipState {
   type: 'node' | 'edge'
@@ -44,6 +28,7 @@ export interface UseForceSimulationResult {
   svgRef: React.RefObject<SVGSVGElement | null>
   tooltipState: TooltipState | null
   stats: GraphStats
+  handleResize: (width: number, height: number) => void
   setSearchQuery: (q: string) => void
   setShowEdges: (show: boolean) => void
   setShowProposed: (show: boolean) => void
@@ -54,52 +39,55 @@ export interface UseForceSimulationResult {
   clearHover: () => void
 }
 
-function linkId(edge: SimLink): string {
-  const s = typeof edge.source === 'object' && edge.source ? (edge.source as SimNode).id : String(edge.source)
-  const t = typeof edge.target === 'object' && edge.target ? (edge.target as SimNode).id : String(edge.target)
-  return `${s}|${t}|${edge.edge_type}`
+export const SIM_DEFAULTS = {
+  showEdges: true,
+  showProposed: false,
+  edgeOpacity: 0.6,
+  hueOffset: 0,
+  density: 50,
 }
 
 function buildAdjacency(edges: GraphEdge[]): Map<string, GraphEdge[]> {
   const adj = new Map<string, GraphEdge[]>()
   for (const e of edges) {
-    const u = e.source
-    const v = e.target
-    if (!adj.has(u)) adj.set(u, [])
-    if (!adj.has(v)) adj.set(v, [])
-    adj.get(u)!.push(e)
-    adj.get(v)!.push(e)
+    if (!adj.has(e.source)) adj.set(e.source, [])
+    if (!adj.has(e.target)) adj.set(e.target, [])
+    adj.get(e.source)!.push(e)
+    adj.get(e.target)!.push(e)
   }
   return adj
 }
 
-const BATCH_SIZE = 500
-
 export function useForceSimulation(data: GraphData): UseForceSimulationResult {
   const svgRef = useRef<SVGSVGElement | null>(null)
-  const simRef = useRef<d3.Simulation<SimNode, SimLink> | null>(null)
-  const zoomRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null)
-  const gRef = useRef<d3.Selection<SVGGElement, unknown, null, undefined> | null>(null)
-  const linkSelectionRef = useRef<d3.Selection<SVGLineElement, SimLink, SVGGElement, unknown> | null>(null)
   const nodeSelectionRef = useRef<d3.Selection<SVGCircleElement, SimNode, SVGGElement, unknown> | null>(null)
+  const linkSelectionRef = useRef<d3.Selection<SVGLineElement, SimLink, SVGGElement, unknown> | null>(null)
   const proposedSelectionRef = useRef<d3.Selection<SVGLineElement, SimLink, SVGGElement, unknown> | null>(null)
-  const hoverRef = useRef<string | null>(null)
-  const pinnedRef = useRef<string | null>(null)
-  const searchRef = useRef('')
-  const showEdgesRef = useRef(true)
-  const showProposedRef = useRef(false)
-  const edgeOpacityRef = useRef(0.6)
-  const hueOffsetRef = useRef(0)
-  const densityRef = useRef(50)
-  const injectedRef = useRef<SimLink[]>([])
-  const proposedQueueRef = useRef<SimLink[]>([])
-  const simLinksRef = useRef<SimLink[]>([])
-  const nodesRef = useRef<SimNode[]>([])
-  const adjRef = useRef<Map<string, GraphEdge[]>>(new Map())
-  const rootIdRef = useRef<string | null>(null)
-  const groupHuesRef = useRef<Map<string, number>>(new Map())
-  const idleHandleRef = useRef<number | null>(null)
-  const initializedRef = useRef(false)
+  const gRef = useRef<d3.Selection<SVGGElement, unknown, null, undefined> | null>(null)
+  const linkLayerRef = useRef<d3.Selection<SVGGElement, unknown, null, undefined> | null>(null)
+  const showEdgesRef = useRef<boolean>(SIM_DEFAULTS.showEdges)
+  const showProposedRef = useRef<boolean>(SIM_DEFAULTS.showProposed)
+  const edgeOpacityRef = useRef<number>(SIM_DEFAULTS.edgeOpacity)
+  const hueOffsetRef = useRef<number>(SIM_DEFAULTS.hueOffset)
+  const densityRef = useRef<number>(SIM_DEFAULTS.density)
+
+  const adjacency = useMemo(
+    () => buildAdjacency([...data.structural_edges, ...data.proposed_edges]),
+    [data.structural_edges, data.proposed_edges],
+  )
+
+  const d3sim = useD3Simulation(data.nodes, data.structural_edges)
+  const interact = useGraphInteraction(adjacency, d3sim.nodesRef)
+  const batch = useProposedBatch(data.proposed_edges)
+
+  const interactRef = useRef<GraphInteractionResult>(interact)
+  interactRef.current = interact
+
+  const batchRef = useRef<ProposedBatchResult>(batch)
+  batchRef.current = batch
+
+  const d3simRef = useRef(d3sim)
+  d3simRef.current = d3sim
 
   const [tooltipState, setTooltipState] = useState<TooltipState | null>(null)
   const [stats, setStats] = useState<GraphStats>({
@@ -113,37 +101,67 @@ export function useForceSimulation(data: GraphData): UseForceSimulationResult {
     setTooltipState(prev => (prev ? { ...prev, visible: false } : null))
   }, [])
 
+  const applyOpacity = useCallback(() => {
+    const i = interactRef.current
+    const nodeSel = nodeSelectionRef.current
+    const linkSel = linkSelectionRef.current
+    if (!nodeSel || !linkSel) return
+
+    if (!i.isInteracting()) {
+      nodeSel.style('opacity', null).attr('stroke-width', 1.5).attr('stroke', 'none')
+      linkSel.style('opacity', null)
+      return
+    }
+
+    nodeSel
+      .style('opacity', (d: SimNode) => i.nodeOpacityRule(d.id))
+      .attr('stroke-width', (d: SimNode) => i.nodeStrokeRule(d.id).width)
+      .attr('stroke', (d: SimNode) => i.nodeStrokeRule(d.id).color)
+
+    linkSel.style('opacity', (l: SimLink) => {
+      const sid = typeof l.source === 'object' ? (l.source as SimNode).id : String(l.source)
+      const tid = typeof l.target === 'object' ? (l.target as SimNode).id : String(l.target)
+      return i.linkOpacityRule(sid, tid)
+    })
+  }, [])
+
   useEffect(() => {
-    if (initializedRef.current) return
-    initializedRef.current = true
+    if (data.nodes.length === 0) return
 
-    const rootId = findRootId(data.nodes)
-    rootIdRef.current = rootId
-    const groupHues = makeGroupHues(data.nodes)
-    groupHuesRef.current = groupHues
-    const adj = buildAdjacency([...data.structural_edges, ...data.proposed_edges])
-    adjRef.current = adj
+    const { simRef: { current: sim }, nodesRef, simLinksRef, rootId, groupHues } = d3simRef.current
+    const { handleNodeEnter, handleNodeLeave, handleNodeClick, clearAll, getPinnedId } = interactRef.current
+    if (!sim) return
 
-    const nodes = data.nodes.map(n => ({ ...n, x: 0, y: 0, vx: 0, vy: 0, fx: null, fy: null })) as unknown as SimNode[]
-    nodesRef.current = nodes
+    const showTooltipNode = (d: SimNode) => {
+      const t = d3.zoomTransform(svgRef.current!)
+      const connected = adjacency.get(d.id) || []
+      setTooltipState({
+        type: 'node',
+        data: d,
+        connectedEdges: connected,
+        x: t.applyX(d.x) + 14,
+        y: t.applyY(d.y) - 10,
+        visible: true,
+      })
+    }
 
-    const groupNames = computeGroupNames(data.nodes)
-    const angleStep = computeAngleStep(groupNames)
-    const { centerX, centerY, orbitalRadius } = computeOrbitalParams(window.innerWidth, window.innerHeight)
-    const groupCounters = new Map<string, number>()
-
-    let keySeq = 0
-    const tagKey = (e: SimLink) => { e._key = `${e.source}|${e.target}|${e.edge_type}|${keySeq++}`; return e }
-
-    const simLinks = data.structural_edges.map(e => ({ ...e, source: e.source, target: e.target })) as SimLink[]
-    simLinks.forEach(tagKey)
-    simLinksRef.current = simLinks
-
-    const proposedQueue = data.proposed_edges.map(e => ({ ...e, source: e.source, target: e.target })) as SimLink[]
-    proposedQueue.forEach(tagKey)
-    proposedQueueRef.current = proposedQueue
-
-    injectedRef.current = []
+    const showTooltipEdge = (l: SimLink) => {
+      const t = d3.zoomTransform(svgRef.current!)
+      const sx = (l.source as SimNode).x
+      const sy = (l.source as SimNode).y
+      const tx = (l.target as SimNode).x
+      const ty = (l.target as SimNode).y
+      const src = (l.source as SimNode).id
+      const tgt = (l.target as SimNode).id
+      setTooltipState({
+        type: 'edge',
+        data: { source: src, target: tgt, edge_type: l.edge_type, confidence: l.confidence },
+        connectedEdges: [],
+        x: t.applyX((sx + tx) / 2) + 14,
+        y: t.applyY((sy + ty) / 2) - 10,
+        visible: true,
+      })
+    }
 
     const svg = d3.select(svgRef.current!)
     svg.selectAll('*').remove()
@@ -158,132 +176,90 @@ export function useForceSimulation(data: GraphData): UseForceSimulationResult {
     const zoom = d3.zoom<SVGSVGElement, unknown>().scaleExtent([0.05, 8]).on('zoom', (e) => {
       g.attr('transform', e.transform as string)
     })
-    zoomRef.current = zoom
     svg.call(zoom)
 
     const linkLayer = g.append('g')
+    linkLayerRef.current = linkLayer
     const nodeLayer = g.append('g')
-
-    function nodeMatch(n: SimNode, q: string) {
-      return n.title.toLowerCase().includes(q) || n.id.toLowerCase().includes(q) || n.project_id.toLowerCase().includes(q) || n.type.toLowerCase().includes(q)
-    }
-
-    function updateOpacities(hovered: string | null, pinned: string | null, query: string) {
-      const activeId = hovered || pinned
-      const sNodes = nodeSelectionRef.current
-      const sLinks = linkSelectionRef.current
-      if (!sNodes || !sLinks) return
-
-      if (!activeId) {
-        if (query) {
-          sNodes.style('opacity', (n: SimNode) => nodeMatch(n, query) ? 1 : 0.08)
-          sLinks.style('opacity', (l: SimLink) => linkId(l).toLowerCase().includes(query) ? 0.5 : 0)
-        } else {
-          sNodes.style('opacity', null).attr('stroke-width', 1.5)
-          sLinks.style('opacity', null)
-        }
-        return
-      }
-
-      const neighbors = new Set<string>()
-      const adjList = adjRef.current.get(activeId) || []
-      for (const e of adjList) {
-        neighbors.add(e.source === activeId ? e.target : e.source)
-      }
-      neighbors.add(activeId)
-
-      sNodes
-        .style('opacity', (n: SimNode) => neighbors.has(n.id) ? 1 : 0.08)
-        .attr('stroke-width', (n: SimNode) => n.id === activeId ? 4 : 1.5)
-        .attr('stroke', (n: SimNode) => n.id === activeId ? '#fff' : 'none')
-
-      sLinks.style('opacity', (l: SimLink) => {
-        const sid = typeof l.source === 'object' ? (l.source as SimNode).id : String(l.source)
-        const tid = typeof l.target === 'object' ? (l.target as SimNode).id : String(l.target)
-        return sid === activeId || tid === activeId ? 0.7 : 0.04
-      })
-    }
-
-    function showTooltipNode(d: SimNode) {
-      const t = d3.zoomTransform(svg.node()!)
-      const connected = adjRef.current.get(d.id) || []
-      setTooltipState({
-        type: 'node',
-        data: d,
-        connectedEdges: connected,
-        x: t.applyX(d.x) + 14,
-        y: t.applyY(d.y) - 10,
-        visible: true,
-      })
-    }
-
-    function showTooltipEdge(l: SimLink) {
-      const t = d3.zoomTransform(svg.node()!)
-      const sx = typeof l.source === 'object' ? (l.source as SimNode).x : 0
-      const sy = typeof l.source === 'object' ? (l.source as SimNode).y : 0
-      const tx = typeof l.target === 'object' ? (l.target as SimNode).x : 0
-      const ty = typeof l.target === 'object' ? (l.target as SimNode).y : 0
-      const src = typeof l.source === 'object' ? (l.source as SimNode).id : String(l.source)
-      const tgt = typeof l.target === 'object' ? (l.target as SimNode).id : String(l.target)
-      setTooltipState({
-        type: 'edge',
-        data: { source: src, target: tgt, edge_type: l.edge_type, confidence: l.confidence },
-        connectedEdges: [],
-        x: t.applyX((sx + tx) / 2) + 14,
-        y: t.applyY((sy + ty) / 2) - 10,
-        visible: true,
-      })
-    }
 
     const linkSel = linkLayer
       .selectAll<SVGLineElement, SimLink>('.link')
-      .data(simLinks, (d: SimLink) => d._key!)
+      .data(simLinksRef.current, (d: SimLink) => d._key!)
       .join('line')
       .attr('class', 'link')
-      .attr('stroke', d => d.edge_type === 'contains' ? '#7ec8e3' : '#888')
-      .attr('stroke-width', d => d.edge_type === 'contains' ? 1.4 : 0.8)
-      .attr('opacity', d => d.edge_type === 'contains' ? Math.min(1, edgeOpacityRef.current * 1.4) : edgeOpacityRef.current)
-    linkSelectionRef.current = linkSel as unknown as typeof linkSelectionRef.current
+      .attr('stroke', '#aaa')
+      .attr('stroke-width', 1)
+      .attr('opacity', edgeOpacityRef.current)
+    linkSelectionRef.current = linkSel
 
     const nodeSel = nodeLayer
       .selectAll<SVGCircleElement, SimNode>('.node')
-      .data(nodes, (d: SimNode) => d.id)
+      .data(nodesRef.current, (d: SimNode) => d.id)
       .join('circle')
       .attr('class', 'node')
-      .attr('r', (d: SimNode) => nodeR(d, rootId))
-      .attr('fill', (d: SimNode) => nodeColor(d, rootId, groupHues, 0))
-    nodeSelectionRef.current = nodeSel as unknown as typeof nodeSelectionRef.current
+      .attr('r', d => d.id === rootId ? 18 : d.type === 'directory' ? 5
+        : Math.min(14, Math.max(3, Math.log10(d.size || 1) * 3 + 2)))
+      .attr('fill', d => nodeColor(d, rootId, groupHues, 0))
+    nodeSelectionRef.current = nodeSel
 
     const drag = d3.drag<SVGCircleElement, SimNode>()
-      .on('start', function (this: SVGCircleElement, event: d3.D3DragEvent<SVGCircleElement, SimNode, SimNode>, d: SimNode) {
+      .on('start', function (event, d) {
         if (!event.active) sim.alphaTarget(0.3).restart()
         d.fx = d.x
         d.fy = d.y
-        nodeSel.attr('stroke', '#fff').attr('stroke-width', 1.5)
       })
-      .on('drag', function (this: SVGCircleElement, event: d3.D3DragEvent<SVGCircleElement, SimNode, SimNode>, d: SimNode) {
+      .on('drag', function (event, d) {
         d.fx = event.x
         d.fy = event.y
       })
-      .on('end', function (this: SVGCircleElement, event: d3.D3DragEvent<SVGCircleElement, SimNode, SimNode>, d: SimNode) {
+      .on('end', function (event, d) {
         if (!event.active) sim.alphaTarget(0)
-        if (!pinnedRef.current) {
+        if (!getPinnedId()) {
           d.fx = null
           d.fy = null
-          nodeSel.attr('stroke', 'none').attr('stroke-width', 1.5)
         }
       })
     nodeSel.call(drag)
 
-    const sim = d3.forceSimulation(nodes)
-      .force('link', d3.forceLink<SimNode, SimLink>(simLinks).id(d => d.id).distance(90).strength(d => d.edge_type === 'contains' ? 0.3 : 0.08))
-      .force('charge', d3.forceManyBody<SimNode>().strength(-400).distanceMax(650))
-      .force('x', d3.forceX<SimNode>(d => computeOrbitalTarget(d, rootId, groupNames, angleStep, centerX, centerY, orbitalRadius, groupCounters).x).strength(d => d.id === rootId ? 0.6 : 0.04))
-      .force('y', d3.forceY<SimNode>(d => computeOrbitalTarget(d, rootId, groupNames, angleStep, centerX, centerY, orbitalRadius, groupCounters).y).strength(d => d.id === rootId ? 0.6 : 0.04))
-      .force('collide', d3.forceCollide<SimNode>(d => nodeR(d, rootId) + 10).strength(1))
-      .alphaDecay(0.015)
-      .alphaMin(0.01)
-    simRef.current = sim
+    nodeSel
+      .on('mouseenter', function (_event, d) {
+        handleNodeEnter(d.id)
+        applyOpacity()
+        showTooltipNode(d)
+      })
+      .on('mouseleave', function () {
+        handleNodeLeave()
+        applyOpacity()
+        if (!getPinnedId()) hideTooltip()
+      })
+      .on('click', function (event, d) {
+        event.stopPropagation()
+        handleNodeClick(d.id)
+        applyOpacity()
+        if (getPinnedId()) showTooltipNode(d)
+        else hideTooltip()
+      })
+
+    linkSel
+      .on('mouseenter', function (_event, d) {
+        showTooltipEdge(d)
+      })
+      .on('mouseleave', function () {
+        if (!getPinnedId()) hideTooltip()
+      })
+
+    svg.on('click', (event) => {
+      if (event.target === svg.node()) {
+        clearAll()
+        applyOpacity()
+        hideTooltip()
+      }
+    })
+
+    const nodeIndex = new Map<string, SimNode>()
+    for (const n of nodesRef.current) {
+      nodeIndex.set(n.id, n)
+    }
 
     sim.on('tick', () => {
       linkSel
@@ -292,311 +268,118 @@ export function useForceSimulation(data: GraphData): UseForceSimulationResult {
         .attr('x2', d => (d.target as SimNode).x)
         .attr('y2', d => (d.target as SimNode).y)
       nodeSel.attr('cx', d => d.x).attr('cy', d => d.y)
-
-      const pSel = proposedSelectionRef.current
-      if (pSel) {
-        pSel
-          .attr('x1', d => {
-            const sid = typeof d.source === 'string' ? d.source : (d.source as SimNode).id
-            const n = nodesRef.current.find(n => n.id === sid)
-            return n ? n.x : 0
-          })
-          .attr('y1', d => {
-            const sid = typeof d.source === 'string' ? d.source : (d.source as SimNode).id
-            const n = nodesRef.current.find(n => n.id === sid)
-            return n ? n.y : 0
-          })
-          .attr('x2', d => {
-            const tid = typeof d.target === 'string' ? d.target : (d.target as SimNode).id
-            const n = nodesRef.current.find(n => n.id === tid)
-            return n ? n.x : 0
-          })
-          .attr('y2', d => {
-            const tid = typeof d.target === 'string' ? d.target : (d.target as SimNode).id
-            const n = nodesRef.current.find(n => n.id === tid)
-            return n ? n.y : 0
-          })
-      }
+      proposedSelectionRef.current &&
+        batchRef.current.updatePositions(proposedSelectionRef.current, nodeIndex)
     })
 
-    nodeSel
-      .on('mouseenter', function (_event: MouseEvent, d: SimNode) {
-        if (searchRef.current && !nodeMatch(d, searchRef.current)) return
-        hoverRef.current = d.id
-        updateOpacities(d.id, pinnedRef.current, searchRef.current)
-        showTooltipNode(d)
-      })
-      .on('mouseleave', function () {
-        if (pinnedRef.current && pinnedRef.current === hoverRef.current) return
-        hoverRef.current = null
-        updateOpacities(hoverRef.current, pinnedRef.current, searchRef.current)
-        hideTooltip()
-      })
+    const afterInject = () => {
+      const pSel = linkLayer
+        .selectAll<SVGLineElement, SimLink>('.proposed-link')
+        .data(batchRef.current.injectedEdgesRef.current, (d: SimLink) => d._key!)
+        .join('line')
+        .attr('class', 'proposed-link')
+        .attr('stroke', '#e8a33d')
+        .attr('stroke-width', 0.3)
+        .attr('opacity', showProposedRef.current && showEdgesRef.current ? edgeOpacityRef.current * 0.15 : 0)
+      proposedSelectionRef.current = pSel
+      batchRef.current.updatePositions(pSel, nodeIndex)
 
-    linkSel
-      .on('mouseenter', function (_event: MouseEvent, d: SimLink) {
-        showTooltipEdge(d)
+      setStats({
+        nodes: data.nodes.length,
+        structuralEdges: data.structural_edges.length,
+        proposedLoaded: batchRef.current.injectedEdgesRef.current.length,
+        proposedTotal: data.proposed_edges.length,
       })
-      .on('mouseleave', function () {
-        if (!pinnedRef.current) hideTooltip()
-      })
-
-    svg.on('click', (event: MouseEvent) => {
-      if (event.target === svg.node()) {
-        pinnedRef.current = null
-        hoverRef.current = null
-        updateOpacities(null, null, searchRef.current)
-        hideTooltip()
-      }
-    })
-
-    nodeSel.on('click', function (event: MouseEvent, d: SimNode) {
-      event.stopPropagation()
-      pinnedRef.current = pinnedRef.current === d.id ? null : d.id
-      hoverRef.current = pinnedRef.current
-      updateOpacities(hoverRef.current, pinnedRef.current, searchRef.current)
-      if (pinnedRef.current) showTooltipNode(d)
-      else hideTooltip()
-    })
-
-    const proposedNodeIndex = new Map(nodes.map(n => [n.id, n]))
-    function drawProposedTick() {
-      const pSel = proposedSelectionRef.current
-      if (!pSel) return
-      pSel
-        .attr('x1', d => {
-          const sid = typeof d.source === 'string' ? d.source : (d.source as SimNode).id
-          const n = proposedNodeIndex.get(sid)
-          return n ? n.x : 0
-        })
-        .attr('y1', d => {
-          const sid = typeof d.source === 'string' ? d.source : (d.source as SimNode).id
-          const n = proposedNodeIndex.get(sid)
-          return n ? n.y : 0
-        })
-        .attr('x2', d => {
-          const tid = typeof d.target === 'string' ? d.target : (d.target as SimNode).id
-          const n = proposedNodeIndex.get(tid)
-          return n ? n.x : 0
-        })
-        .attr('y2', d => {
-          const tid = typeof d.target === 'string' ? d.target : (d.target as SimNode).id
-          const n = proposedNodeIndex.get(tid)
-          return n ? n.y : 0
-        })
     }
 
-    function idleBatch(deadline: IdleDeadline | null) {
-      let processed = 0
-      const q = proposedQueueRef.current
-      while (q.length > 0 && processed < BATCH_SIZE && (deadline ? deadline.timeRemaining() > 1 : true)) {
-        injectedRef.current.push(q.shift()!)
-        processed++
-      }
-      if (processed > 0) {
-        const pSel = linkLayer
-          .selectAll<SVGLineElement, SimLink>('.proposed-link')
-          .data(injectedRef.current, (d: SimLink) => d._key!)
-          .join('line')
-          .attr('class', 'proposed-link')
-          .attr('stroke', '#e8a33d')
-          .attr('stroke-width', 0.3)
-          .style('display', (showProposedRef.current ? null : 'none') as any)
-          .attr('opacity', edgeOpacityRef.current * 0.15)
-        proposedSelectionRef.current = pSel as unknown as typeof proposedSelectionRef.current
-        drawProposedTick()
-
-        setStats({
-          nodes: data.nodes.length,
-          structuralEdges: data.structural_edges.length,
-          proposedLoaded: injectedRef.current.length,
-          proposedTotal: injectedRef.current.length + q.length,
-        })
-      }
-      if (q.length > 0) scheduleIdle()
-    }
-
-    function scheduleIdle() {
-      if (typeof (window as any).requestIdleCallback !== 'undefined') {
-        idleHandleRef.current = (window as any).requestIdleCallback(idleBatch, { timeout: 1000 }) as number
-      } else {
-        idleHandleRef.current = window.setTimeout(() => idleBatch(null), 100) as unknown as number
-      }
-    }
-
-    const timeoutId = window.setTimeout(scheduleIdle, 600)
+    batchRef.current.scheduleBatch(linkLayerRef, afterInject)
 
     return () => {
       sim.stop()
       svg.on('.', null)
       svg.selectAll('*').remove()
-      if (idleHandleRef.current !== null) {
-        if (typeof (window as any).requestIdleCallback !== 'undefined') {
-          ;(window as any).cancelIdleCallback(idleHandleRef.current)
-        } else {
-          window.clearTimeout(idleHandleRef.current)
-        }
-      }
-      window.clearTimeout(timeoutId)
-      initializedRef.current = false
+      gRef.current = null
+      linkSelectionRef.current = null
+      nodeSelectionRef.current = null
+      proposedSelectionRef.current = null
+      linkLayerRef.current = null
     }
-  }, [data])
+  }, [data.nodes, data.structural_edges, data.proposed_edges, adjacency, applyOpacity, hideTooltip])
 
   const setSearchQuery = useCallback((q: string) => {
-    searchRef.current = q.toLowerCase()
-    const nodeSel = nodeSelectionRef.current
-    const linkSel = linkSelectionRef.current
-    if (!nodeSel || !linkSel) return
-    const h = hoverRef.current
-    const p = pinnedRef.current
-    const activeId = h || p
+    interactRef.current.setSearchQuery(q)
+    applyOpacity()
+  }, [applyOpacity])
 
-    if (!activeId && !q) {
-      nodeSel.style('opacity', null).attr('stroke-width', 1.5).attr('stroke', 'none')
-      linkSel.style('opacity', null)
-      return
-    }
-
-    if (activeId) {
-      const neighbors = new Set<string>()
-      const adjList = adjRef.current.get(activeId) || []
-      for (const e of adjList) {
-        neighbors.add(e.source === activeId ? e.target : e.source)
-      }
-      neighbors.add(activeId)
-      nodeSel
-        .style('opacity', (n: SimNode) => neighbors.has(n.id) ? 1 : 0.08)
-        .attr('stroke-width', (n: SimNode) => n.id === activeId ? 4 : 1.5)
-        .attr('stroke', (n: SimNode) => n.id === activeId ? '#fff' : 'none')
-      linkSel.style('opacity', (l: SimLink) => {
-        const sid = typeof l.source === 'object' ? (l.source as SimNode).id : String(l.source)
-        const tid = typeof l.target === 'object' ? (l.target as SimNode).id : String(l.target)
-        return sid === activeId || tid === activeId ? 0.7 : 0.04
-      })
-    } else {
-      nodeSel.style('opacity', (n: SimNode) => n.title.toLowerCase().includes(q) || n.id.toLowerCase().includes(q) || n.project_id.toLowerCase().includes(q) || n.type.toLowerCase().includes(q) ? 1 : 0.08)
-      linkSel.style('opacity', (l: SimLink) => linkId(l).toLowerCase().includes(q) ? 0.5 : 0)
-    }
-  }, [])
-
-  const setShowEdgesFn = useCallback((show: boolean) => {
+  const setShowEdges = useCallback((show: boolean) => {
     showEdgesRef.current = show
-    if (show) {
-      linkSelectionRef.current?.style('display', null as any)
-    } else {
-      linkSelectionRef.current?.style('display', 'none')
-    }
-    if (!show) {
-      proposedSelectionRef.current?.style('display', 'none')
-    } else if (showProposedRef.current) {
-      proposedSelectionRef.current?.style('display', null as any)
+    const ls = linkSelectionRef.current
+    if (show) { ls?.style('display', null as unknown as string) }
+    else { ls?.style('display', 'none') }
+    const ps = proposedSelectionRef.current
+    if (ps) {
+      ps.attr('opacity', show && showProposedRef.current ? edgeOpacityRef.current * 0.15 : 0)
     }
   }, [])
 
-  const setEdgeOpacityFn = useCallback((v: number) => {
+  const setShowProposed = useCallback((show: boolean) => {
+    showProposedRef.current = show
+    const ps = proposedSelectionRef.current
+    if (ps) {
+      ps.attr('opacity', show && showEdgesRef.current ? edgeOpacityRef.current * 0.15 : 0)
+    }
+  }, [])
+
+  const setEdgeOpacity = useCallback((v: number) => {
     edgeOpacityRef.current = v
-    linkSelectionRef.current?.attr('opacity', (d: SimLink) => d.edge_type === 'contains' ? Math.min(1, v * 1.4) : v)
-    proposedSelectionRef.current?.attr('opacity', v * 0.15)
+    linkSelectionRef.current?.attr('opacity', v)
+    const ps = proposedSelectionRef.current
+    if (ps) ps.attr('opacity', showProposedRef.current && showEdgesRef.current ? v * 0.15 : 0)
   }, [])
 
-  const setHueOffsetFn = useCallback((v: number) => {
+  const setHueOffset = useCallback((v: number) => {
     hueOffsetRef.current = v
     const nodeSel = nodeSelectionRef.current
     if (!nodeSel) return
-    const rootId = rootIdRef.current
-    const hues = groupHuesRef.current
-    nodeSel.attr('fill', (d: SimNode) => nodeColor(d, rootId, hues, v))
+    const { rootId, groupHues } = d3simRef.current
+    nodeSel.attr('fill', (d: SimNode) => nodeColor(d, rootId, groupHues, v))
   }, [])
 
-  const setDensityFn = useCallback((v: number) => {
+  const setDensity = useCallback((v: number) => {
     densityRef.current = v
-    const sim = simRef.current
-    if (!sim) return
     const strength = -50 - (v / 100) * 950
-    sim.force('charge', d3.forceManyBody<SimNode>().strength(strength).distanceMax(650))
-    sim.alpha(0.3).restart()
-  }, [])
-
-  const setShowProposedFn = useCallback((show: boolean) => {
-    showProposedRef.current = show
-    if (!showEdgesRef.current) {
-      proposedSelectionRef.current?.style('display', 'none')
-    } else if (show) {
-      proposedSelectionRef.current?.style('display', null as any)
-    } else {
-      proposedSelectionRef.current?.style('display', 'none')
-    }
+    d3simRef.current.setChargeStrength(strength)
   }, [])
 
   const setPinnedNodeId = useCallback((id: string | null) => {
-    pinnedRef.current = id
-    const nodeSel = nodeSelectionRef.current
-    const linkSel = linkSelectionRef.current
-    if (!nodeSel || !linkSel) return
-    const h = id
-    const activeId = h
-
-    if (!activeId) {
-      nodeSel.style('opacity', null).attr('stroke-width', 1.5).attr('stroke', 'none')
-      linkSel.style('opacity', null)
-      hideTooltip()
-      return
+    if (id) {
+      interactRef.current.pinNode(id)
+    } else {
+      interactRef.current.clearAll()
     }
-
-    const neighbors = new Set<string>()
-    const adjList = adjRef.current.get(activeId) || []
-    for (const e of adjList) {
-      neighbors.add(e.source === activeId ? e.target : e.source)
-    }
-    neighbors.add(activeId)
-    nodeSel
-      .style('opacity', (n: SimNode) => neighbors.has(n.id) ? 1 : 0.08)
-      .attr('stroke-width', (n: SimNode) => n.id === activeId ? 4 : 1.5)
-      .attr('stroke', (n: SimNode) => n.id === activeId ? '#fff' : 'none')
-    linkSel.style('opacity', (l: SimLink) => {
-      const sid = typeof l.source === 'object' ? (l.source as SimNode).id : String(l.source)
-      const tid = typeof l.target === 'object' ? (l.target as SimNode).id : String(l.target)
-      return sid === activeId || tid === activeId ? 0.7 : 0.04
-    })
-
-    const node = nodesRef.current.find(n => n.id === id)
-    if (node) {
-      const t = d3.zoomTransform(svgRef.current!)
-      const connected = adjRef.current.get(id) || []
-      setTooltipState({
-        type: 'node',
-        data: node,
-        connectedEdges: connected,
-        x: t.applyX(node.x) + 14,
-        y: t.applyY(node.y) - 10,
-        visible: true,
-      })
-    }
-  }, [])
+    applyOpacity()
+  }, [applyOpacity])
 
   const clearHover = useCallback(() => {
-    hoverRef.current = null
-    if (!pinnedRef.current) {
-      const nodeSel = nodeSelectionRef.current
-      const linkSel = linkSelectionRef.current
-      if (nodeSel && linkSel) {
-        nodeSel.style('opacity', null).attr('stroke-width', 1.5).attr('stroke', 'none')
-        linkSel.style('opacity', null)
-      }
-      hideTooltip()
-    }
+    interactRef.current.clearHover()
+    applyOpacity()
+  }, [applyOpacity])
+
+  const handleResize = useCallback((width: number, height: number) => {
+    d3simRef.current.handleResize(width, height)
   }, [])
 
   return {
     svgRef,
     tooltipState,
     stats,
+    handleResize,
     setSearchQuery,
-    setShowEdges: setShowEdgesFn,
-    setShowProposed: setShowProposedFn,
-    setEdgeOpacity: setEdgeOpacityFn,
-    setHueOffset: setHueOffsetFn,
-    setDensity: setDensityFn,
+    setShowEdges,
+    setShowProposed,
+    setEdgeOpacity,
+    setHueOffset,
+    setDensity,
     setPinnedNodeId,
     clearHover,
   }

@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Tastastas Graph</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        body { margin: 0; background: #0f1a30; color: #e0e0e0; font-family: sans-serif; overflow: hidden; }
+        .controls { position: absolute; top: 10px; right: 10px; display: flex; flex-direction: column; gap: 5px; z-index: 10; }
+        .node { transition: opacity 0.3s; cursor: pointer; }
+        .link { transition: opacity 0.3s; pointer-events: none; }
+        input[type=search] { background: #16213e; color: #fff; border: 1px solid #0f3460; border-radius: 4px; padding: 4px; }
+        #stats { position: absolute; bottom: 10px; left: 10px; font-size: 11px; color: #7a8; z-index: 10; }
+    </style>
+</head>
+<body>
+    <div class="controls">
+        <input type="search" id="search" placeholder="Search nodes...">
+        <label><input type="checkbox" id="chkEdges" checked> Edges</label>
+        <label><input type="checkbox" id="chkProposed"> Weak links (proposed)</label>
+    </div>
+    <div id="stats"></div>
+    <svg id="graph"></svg>
+    <script type="module">
+        const DATA = __DATA__;
+        const nodes = DATA.nodes || [];
+        const structuralEdges = DATA.structural_edges || [];
+        const proposedQueue = (DATA.proposed_edges || []).slice(); // buffer, not in DOM yet
+
+        // IMPORTANT: compute a stable join key *before* d3.forceLink runs.
+        // forceLink mutates edge.source/edge.target from string ids into
+        // node object references the moment the force is initialized, so
+        // any key function built from `d.source`/`d.target` after that
+        // point collapses to "[object Object]|[object Object]|type" for
+        // every edge of the same type — causing D3 to treat re-joins as
+        // brand new data (remove+recreate = flicker, wrong opacity).
+        let _keySeq = 0;
+        function tagKey(e) { e._key = `${e.source}|${e.target}|${e.edge_type}|${_keySeq++}`; return e; }
+        structuralEdges.forEach(tagKey);
+        proposedQueue.forEach(tagKey);
+
+        const svg = d3.select("#graph");
+        const width = window.innerWidth, height = window.innerHeight;
+        svg.attr("width", width).attr("height", height);
+        const g = svg.append("g");
+        const statsEl = document.getElementById("stats");
+
+        // Zoom + pan, with LOD (labels hidden until zoomed in — reserved for future label layer)
+        let currentZoomK = 1;
+        const zoom = d3.zoom().scaleExtent([0.05, 8]).on("zoom", (e) => {
+            currentZoomK = e.transform.k;
+            g.attr("transform", e.transform);
+        });
+        svg.call(zoom);
+
+        // Color & Size Logic
+        const typeLightness = { 'api-spec': 70, 'erd': 60, 'prd': 55, 'prd-detail': 55, 'architecture-decision': 65, 'visual-design': 50, 'design-doc': 50, 'foundation-doc': 45, 'test-case': 40, 'code:function': 35, 'code:type': 35, 'code:method': 35, 'convention': 30, 'generic-doc': 25, 'template': 25, 'obsidian-note': 25, 'directory': 20 };
+        const groupHues = new Map(); nodes.forEach((n, i) => { if (!groupHues.has(n.group)) groupHues.set(n.group, (i * 137.5) % 360); });
+
+        // Root = the single shortest directory id (top-level project dir),
+        // not every subdirectory that happens to end in '/'.
+        const dirNodes = nodes.filter(n => n.type === 'directory' && n.id.endsWith('/'));
+        const rootId = dirNodes.length
+            ? dirNodes.reduce((a, b) => a.id.length <= b.id.length ? a : b).id
+            : null;
+        function isRoot(d) { return d.id === rootId; }
+        function nodeR(d) {
+            if (isRoot(d)) return 18;
+            if (d.type === 'directory') return 5;
+            return Math.min(14, Math.max(3, Math.log10(d.size || 1) * 3 + 2));
+        }
+        function nodeColor(d) {
+            if (isRoot(d)) return `hsl(45, 90%, 55%)`;
+            const hue = groupHues.get(d.group) || 220;
+            const lit = typeLightness[d.type] !== undefined ? typeLightness[d.type] : 35;
+            return `hsl(${hue}, 75%, ${lit}%)`;
+        }
+
+        // Orbital layout target
+        const groupNames = [...new Set(nodes.map(n => n.group))].filter(gr => gr !== 'dir');
+        const angleStep = (2 * Math.PI) / Math.max(groupNames.length, 1);
+        const centerX = width / 2, centerY = height / 2;
+        const orbitalRadius = Math.min(width, height) * 0.3;
+        // Spread nodes within a group along a small arc + radius jitter so
+        // the cluster fans out into a wedge instead of collapsing onto one
+        // exact point (which forces charge/collide to fight for space).
+        const groupCounters = new Map();
+        function radialTarget(d) {
+            if (isRoot(d)) return { x: centerX, y: centerY };
+            const idx = groupNames.indexOf(d.group);
+            const baseAngle = idx >= 0 ? idx * angleStep : 0;
+            const n = groupCounters.get(d.group) || 0;
+            groupCounters.set(d.group, n + 1);
+            const jitterAngle = baseAngle + ((n % 40) - 20) * (angleStep / 80);
+            const jitterRadius = orbitalRadius + (Math.floor(n / 40) * 40);
+            return {
+                x: centerX + Math.cos(jitterAngle) * jitterRadius,
+                y: centerY + Math.sin(jitterAngle) * jitterRadius
+            };
+        }
+
+        // Simulation — starts with nodes + structural edges only.
+        const sim = d3.forceSimulation(nodes)
+            .force("link", d3.forceLink(structuralEdges).id(d => d.id).distance(50).strength(d => d.edge_type === 'contains' ? 0.5 : 0.1))
+            .force("charge", d3.forceManyBody().strength(-260).distanceMax(400))
+            .force("x", d3.forceX(d => radialTarget(d).x).strength(d => isRoot(d) ? 0.6 : 0.06))
+            .force("y", d3.forceY(d => radialTarget(d).y).strength(d => isRoot(d) ? 0.6 : 0.06))
+            .force("collide", d3.forceCollide(d => nodeR(d) + 6).strength(1))
+            .alphaDecay(0.015)
+            .alphaMin(0.01);
+
+        const linkLayer = g.append("g");
+        const nodeLayer = g.append("g");
+
+        let link = linkLayer.selectAll(".link").data(structuralEdges, d => d._key)
+            .join("line").attr("class", "link")
+            .attr("stroke", d => d.edge_type === 'contains' ? "#7ec8e3" : "#888")
+            .attr("stroke-width", d => d.edge_type === 'contains' ? 1.4 : 0.8)
+            .attr("opacity", d => d.edge_type === 'contains' ? 0.8 : 0.6);
+
+        let node = nodeLayer.selectAll(".node").data(nodes, d => d.id)
+            .join("circle").attr("class", "node")
+            .attr("r", nodeR).attr("fill", nodeColor);
+
+        sim.on("tick", () => {
+            link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
+                .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
+            node.attr("cx", d => d.x).attr("cy", d => d.y);
+            if (injectedProposed.length) drawProposedTick();
+        });
+
+        // --- Progressive edge loading (virtualization) ---
+        // Proposed edges are NOT added to forceLink — they are cheap
+        // "weak hint" lines drawn on top of node positions the structural
+        // simulation already settled on. They never perturb the layout
+        // (no sim.restart(), no fx/fy freeze dance) and stay hidden by
+        // default so a 28k-edge project doesn't paint a solid hairball.
+        // Toggling "Weak links" reveals whatever has been loaded so far.
+        const proposedNodeIndex = new Map(nodes.map(n => [n.id, n]));
+        const BATCH_SIZE = 500;
+        let injectedProposed = [];
+        let proposedLink = linkLayer.selectAll(".proposed-link"); // empty selection
+
+        function drawProposedTick() {
+            proposedLink
+                .attr("x1", d => (proposedNodeIndex.get(d.source) || {}).x || 0)
+                .attr("y1", d => (proposedNodeIndex.get(d.source) || {}).y || 0)
+                .attr("x2", d => (proposedNodeIndex.get(d.target) || {}).x || 0)
+                .attr("y2", d => (proposedNodeIndex.get(d.target) || {}).y || 0);
+        }
+
+        function idleBatch(deadline) {
+            let processed = 0;
+            while (proposedQueue.length > 0 && processed < BATCH_SIZE &&
+                   (deadline ? deadline.timeRemaining() > 1 : true)) {
+                injectedProposed.push(proposedQueue.shift());
+                processed++;
+            }
+            if (processed > 0) {
+                proposedLink = linkLayer.selectAll(".proposed-link")
+                    .data(injectedProposed, d => d._key)
+                    .join("line").attr("class", "proposed-link")
+                    .attr("stroke", "#e8a33d")
+                    .attr("stroke-width", 0.3)
+                    .style("display", document.getElementById("chkProposed").checked ? null : "none")
+                    .attr("opacity", 0.08);
+                drawProposedTick();
+
+                statsEl.textContent = `nodes: ${nodes.length} | structural: ${structuralEdges.length} | proposed: ${injectedProposed.length}/${injectedProposed.length + proposedQueue.length}`;
+            }
+            if (proposedQueue.length > 0) {
+                scheduleIdle();
+            }
+        }
+
+        function scheduleIdle() {
+            if (window.requestIdleCallback) {
+                requestIdleCallback(idleBatch, { timeout: 1000 });
+            } else {
+                setTimeout(() => idleBatch(null), 100);
+            }
+        }
+
+        statsEl.textContent = `nodes: ${nodes.length} | structural: ${structuralEdges.length} | proposed: 0/${proposedQueue.length}`;
+
+        // Kick off progressive loading once the initial layout has had a
+        // moment to stabilize (avoids competing with the first paint).
+        setTimeout(scheduleIdle, 600);
+
+        document.getElementById("chkProposed").addEventListener("change", (e) => {
+            proposedLink.style("display", e.target.checked ? null : "none");
+        });
+
+        // --- Filtering ---
+        document.getElementById("search").addEventListener("input", (e) => {
+            const q = e.target.value.toLowerCase();
+            node.style("opacity", n => (!q || n.title.toLowerCase().includes(q) || n.id.toLowerCase().includes(q)) ? 1 : 0.1);
+            link.style("opacity", l => {
+                if (!q) return l.edge_type === 'contains' ? 0.5 : 0.15;
+                const sTitle = (l.source.title || l.source).toString().toLowerCase();
+                const tTitle = (l.target.title || l.target).toString().toLowerCase();
+                return (sTitle.includes(q) || tTitle.includes(q)) ? 0.6 : 0;
+            });
+        });
+        document.getElementById("chkEdges").addEventListener("change", (e) => {
+            link.style("display", e.target.checked ? null : "none");
+            if (e.target.checked && document.getElementById("chkProposed").checked) {
+                proposedLink.style("display", null);
+            } else {
+                proposedLink.style("display", "none");
+            }
+        });
+    </script>
+</body>
+</html>
