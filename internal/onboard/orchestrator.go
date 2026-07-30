@@ -26,6 +26,7 @@ type Config struct {
 	CWD       string
 	ProjectID string
 	Scope     string // "cwd" or "subtree"
+	ModelID   string // current embedding model ID
 	Embedder  embed.EmbedderBackend
 	Store     store.Store // injected from caller, not opened internally
 	BatchSize int         // 0 = default 32
@@ -68,26 +69,36 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 
 	db := cfg.Store
 
-	// Graceful check: if project already has nodes AND chunks, skip
-	// re-ingestion. Gating on NodeCount alone let a project that had nodes
-	// but never got chunked (crash mid-run, embedder down that one time)
-	// stay permanently unchunked — every future onboard call would hit
-	// this fast-path and never retry chunk+embed.
-	stats, err := db.Stats(ctx, cfg.ProjectID)
-	if err == nil && stats.NodeCount > 0 && stats.ChunkCount > 0 {
-		elapsed := time.Since(start).Milliseconds()
-		detected := []string{}
-		if stats.ConventionCnt > 0 {
-			detected = append(detected, "already-onboarded")
+	// Per-model AlreadyOnboarded check. If modelID is set, check config
+	// status for that specific model. Otherwise fall back to project-level
+	// check (nodes + chunks exist).
+	if cfg.ModelID != "" {
+		status, _ := db.GetEmbedModelStatus(ctx, cfg.ProjectID, cfg.ModelID)
+		if status == "clean" {
+			elapsed := time.Since(start).Milliseconds()
+			return Result{
+				CWD:              cfg.CWD,
+				ProjectID:        cfg.ProjectID,
+				AlreadyOnboarded: true,
+				DurationMs:       elapsed,
+			}, nil
 		}
-
-		return Result{
-			CWD:              cfg.CWD,
-			ProjectID:        cfg.ProjectID,
-			AlreadyOnboarded: true,
-			DetectedAdapters: detected,
-			DurationMs:       elapsed,
-		}, nil
+	} else {
+		stats, err := db.Stats(ctx, cfg.ProjectID)
+		if err == nil && stats.NodeCount > 0 && stats.ChunkCount > 0 {
+			elapsed := time.Since(start).Milliseconds()
+			detected := []string{}
+			if stats.ConventionCnt > 0 {
+				detected = append(detected, "already-onboarded")
+			}
+			return Result{
+				CWD:              cfg.CWD,
+				ProjectID:        cfg.ProjectID,
+				AlreadyOnboarded: true,
+				DetectedAdapters: detected,
+				DurationMs:       elapsed,
+			}, nil
+		}
 	}
 
 	allNodes, allEdges, detectedAdapters, filesWalked, filesSkipped, err := AutoDetectAdapters(ctx, db, cfg.CWD, cfg.ProjectID)
@@ -111,7 +122,7 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 		embedBatchSize = 32
 	}
 	if cfg.Embedder != nil {
-		if err := EmbedNodes(ctx, db, allNodes, cfg.Embedder, embedBatchSize); err != nil {
+		if err := EmbedNodes(ctx, db, allNodes, cfg.Embedder, embedBatchSize, cfg.ModelID); err != nil {
 			return Result{}, err
 		}
 	}
@@ -311,8 +322,9 @@ func hasMD(root string) bool {
 	return found
 }
 
-// EmbedNodes batch-embeds node content.
-func EmbedNodes(ctx context.Context, db store.Store, nodes []store.Node, emb embed.EmbedderBackend, batchSize int) error {
+// EmbedNodes batch-embeds node content. Sets ModelID on each node for
+// composite vec0 PK before upserting.
+func EmbedNodes(ctx context.Context, db store.Store, nodes []store.Node, emb embed.EmbedderBackend, batchSize int, modelID string) error {
 	if batchSize <= 0 {
 		batchSize = 32
 	}
@@ -350,6 +362,7 @@ func EmbedNodes(ctx context.Context, db store.Store, nodes []store.Node, emb emb
 
 		for k, v := range vecs {
 			batch[idx[k]].Embedding = v
+			batch[idx[k]].ModelID = modelID
 			if err := db.UpsertNode(ctx, batch[idx[k]]); err != nil {
 				return fmt.Errorf("upsert embed %s: %w", batch[idx[k]].ID, err)
 			}

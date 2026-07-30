@@ -56,6 +56,7 @@ func chunkAndEmbedNodes(
 	embedder embed.EmbedderBackend,
 	nodes []store.Node,
 	batchSize int,
+	modelID string,
 	progress func(embedded, total int),
 	onPersisting func(),
 ) (int, error) {
@@ -84,7 +85,7 @@ func chunkAndEmbedNodes(
 			}
 		}
 		// Content changed (or first time) — delete stale chunks, re-chunk.
-		_ = db.DeleteChunksByParent(ctx, n.ID)
+		_ = db.DeleteChunksByParent(ctx, n.ID, modelID)
 		chunkable = append(chunkable, n)
 	}
 	if len(chunkable) > 0 {
@@ -153,6 +154,12 @@ func chunkAndEmbedNodes(
 	if onPersisting != nil {
 		onPersisting()
 	}
+	// Set modelID on all chunks for composite vec0 PK before persisting.
+	for i := range allChunks {
+		if allChunks[i].ModelID == "" {
+			allChunks[i].ModelID = modelID
+		}
+	}
 	if err := db.UpsertChunks(ctx, allChunks); err != nil {
 		return 0, err
 	}
@@ -184,43 +191,27 @@ func NewServer(db store.Store, embedder embed.EmbedderBackend, batchSize int, mo
 	return srv
 }
 
-// checkEmbedModel returns an error if the project already has a stored
-// embed model that differs from the current modelID.
-func checkEmbedModel(ctx context.Context, db store.Store, projectID, modelID string) error {
+// modelWarning returns a warning string if the model's data is dirty or
+// missing. Returns "" if everything is fine. Never blocks tool execution.
+func modelWarning(ctx context.Context, db store.Store, projectID, modelID string) string {
 	if modelID == "" {
-		return nil // lexical-only mode
+		return ""
 	}
-	// If project has no nodes, allow regardless of config row
-	// (handles: forget all nodes → re-onboard with different model)
 	stats, err := db.Stats(ctx, projectID)
-	if err == nil && stats.NodeCount == 0 {
-		return nil
+	if err != nil || stats.NodeCount == 0 {
+		return ""
 	}
-	stored, err := db.GetEmbedModelID(ctx, projectID)
-	if err != nil || stored == "" {
-		return nil // no prior data
+	status, err := db.GetEmbedModelStatus(ctx, projectID, modelID)
+	if err != nil {
+		return ""
 	}
-	if stored != modelID {
-		return fmt.Errorf(
-			"embed model mismatch: stored=%q current=%q — re-ingest with 'onboard' or 'ingest' to migrate",
-			stored, modelID,
-		)
+	if status == "dirty" {
+		return fmt.Sprintf("data for model %q may be incomplete (previous ingest crashed). Run 'onboard' again.", modelID)
 	}
-	return nil
-}
-
-// checkEmbedClean blocks recall if stored data is dirty (incomplete from crash).
-// Bypasses if project has no nodes (stale dirty from crash-before-first-node).
-func checkEmbedClean(ctx context.Context, db store.Store, projectID string) error {
-	status, err := db.GetEmbedModelStatus(ctx, projectID)
-	if err != nil || status == "" || status == "clean" {
-		return nil
+	if status == "" {
+		return fmt.Sprintf("no data found for model %q. Run 'onboard' or 'ingest' first.", modelID)
 	}
-	stats, _ := db.Stats(ctx, projectID)
-	if stats.NodeCount == 0 {
-		return nil // no data = dirty irrelevant
-	}
-	return fmt.Errorf("previous ingest was interrupted — data may be incomplete. Run 'onboard' to complete")
+	return ""
 }
 
 func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBackend, batchSize int, modelID string) {
@@ -265,23 +256,31 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			}
 		}
 
-		if err := checkEmbedModel(ctx, db, projectID, modelID); err != nil {
-			return errorResult(err), OnboardOutput{}, nil
-		}
-
 		job := jobs.create()
 		safeGo(func() {
 			bctx := context.Background()
+
+			// Per-model AlreadyOnboarded check before goroutine.
+			if modelID != "" {
+				status, _ := db.GetEmbedModelStatus(ctx, projectID, modelID)
+				if status == "clean" {
+					jobs.finish(job.ID, 0, 0, 0, nil)
+					return
+				}
+			}
+
 			if modelID != "" {
 				_ = db.SetEmbedModelDirty(bctx, projectID, modelID)
 			}
-			defer jobs.finish(job.ID, 0, 0, 0, func() error {
+
+			runErr := func() error {
 				result, err := onboard.Run(
 					context.Background(),
 					onboard.Config{
 						CWD:       cwd,
 						ProjectID: projectID,
 						Scope:     args.Scope,
+						ModelID:   modelID,
 						Embedder:  embedder,
 						Store:     db,
 					},
@@ -289,25 +288,19 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 				if err != nil {
 					return err
 				}
-			if result.AlreadyOnboarded {
-				if modelID != "" {
-					_ = db.SetEmbedModelClean(bctx, projectID)
+				if result.AlreadyOnboarded {
+					return nil
 				}
-				return nil
-			}
-				// Report walk counts and transition phase to "embedding" — same as ingest path.
 				jobs.updateCounts(job.ID, result.FilesWalked, result.FilesSkipped)
 
-				// Wait for embedder if another ingest is running.
 				jobs.updatePhase(job.ID, "waiting")
 				ingestMu.Lock()
 				jobs.updatePhase(job.ID, "chunking")
 
 				embedOnce := sync.OnceFunc(func() { jobs.updatePhase(job.ID, "embedding") })
 
-				// Chunk + embed for RAG-level recall.
 				chunkCount, err := chunkAndEmbedNodes(
-					context.Background(), db, embedder, result.AllNodes, batchSize,
+					context.Background(), db, embedder, result.AllNodes, batchSize, modelID,
 					func(embedded, total int) {
 						embedOnce()
 						jobs.updateChunksEmbedded(job.ID, embedded, total)
@@ -319,11 +312,17 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 					return fmt.Errorf("chunk/embed: %w", err)
 				}
 				_ = chunkCount
-				if modelID != "" {
-					_ = db.SetEmbedModelClean(bctx, projectID)
-				}
 				return nil
-			}())
+			}()
+
+			if runErr != nil {
+				jobs.finish(job.ID, 0, 0, 0, runErr)
+			} else {
+				if modelID != "" {
+					_ = db.SetEmbedModelClean(bctx, projectID, modelID)
+				}
+				jobs.finish(job.ID, 0, 0, 0, nil)
+			}
 		})
 		// Report walk counts and transition phase to "embedding" — same as ingest path.
 
@@ -406,9 +405,6 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 				importance = 0.5
 			}
 
-			if err := checkEmbedModel(ctx, db, projectID, modelID); err != nil {
-				return errorResult(err), RememberOutput{}, nil
-			}
 			if modelID != "" {
 				_ = db.InitEmbedConfig(ctx, projectID, modelID)
 			}
@@ -416,6 +412,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			n := store.Node{
 				ID: id, NodeType: nodeType, Title: args.Title, Content: args.Content,
 				ProjectID: projectID, Importance: importance, SourceAdapter: "mcp",
+				ModelID: modelID,
 			}
 
 			if err := db.UpsertNode(ctx, n); err != nil {
@@ -424,7 +421,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 
 			if _, err := chunkAndEmbedNodes(
 				ctx, db, embedder, []store.Node{n},
-				batchSize, nil, nil,
+				batchSize, modelID, nil, nil,
 			); err != nil {
 				return errorResult(err), RememberOutput{}, nil
 			}
@@ -471,16 +468,12 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 				limit = 10
 			}
 
-			if err := checkEmbedModel(ctx, db, projectID, modelID); err != nil {
-				return errorResult(err), RecallOutput{}, nil
-			}
-			if err := checkEmbedClean(ctx, db, projectID); err != nil {
-				return errorResult(err), RecallOutput{}, nil
-			}
+			warn := modelWarning(ctx, db, projectID, modelID)
 
 			params := retrieve.RecallParams{
 				ProjectID:     projectID,
 				Query:         args.Query,
+				ModelID:       modelID,
 				Limit:         limit,
 				LinkThreshold: args.LinkThreshold,
 			}
@@ -528,7 +521,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 					ImplicitMCPLink{FromChunkID: l.FromChunkID, ToChunkID: l.ToChunkID, Cosine: l.Cosine},
 				)
 			}
-			recallOut := RecallOutput{Results: items, Links: links}
+			recallOut := RecallOutput{Results: items, Links: links, Warning: warn}
 
 			toolResult := &mcp.CallToolResult{
 				Content: []mcp.Content{
@@ -693,19 +686,25 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			}
 		}
 
-		if err := checkEmbedModel(ctx, db, projectID, modelID); err != nil {
-			return errorResult(err), IngestOutput{}, nil
-		}
-
 		job := jobs.create()
 		safeGo(func() {
 			bctx := context.Background()
+
+			// Per-model AlreadyOnboarded check before goroutine.
+			if modelID != "" {
+				status, _ := db.GetEmbedModelStatus(ctx, projectID, modelID)
+				if status == "clean" {
+					jobs.finish(job.ID, 0, 0, 0, nil)
+					return
+				}
+			}
+
 			ingestDone := false
 			if modelID != "" {
 				_ = db.SetEmbedModelDirty(bctx, projectID, modelID)
 				defer func() {
 					if ingestDone {
-						_ = db.SetEmbedModelClean(bctx, projectID)
+						_ = db.SetEmbedModelClean(bctx, projectID, modelID)
 					}
 				}()
 			}
@@ -737,7 +736,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 
 			embedOnce := sync.OnceFunc(func() { jobs.updatePhase(job.ID, "embedding") })
 			chunkCount, err := chunkAndEmbedNodes(
-				context.Background(), db, embedder, nodes, batchSize,
+				context.Background(), db, embedder, nodes, batchSize, modelID,
 				func(embedded, total int) {
 					embedOnce()
 					jobs.updateChunksEmbedded(job.ID, embedded, total)
@@ -749,7 +748,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("chunk/embed: %w", err))
 				return
 			}
-			if err := onboard.EmbedNodes(context.Background(), db, nodes, embedder, batchSize); err != nil {
+			if err := onboard.EmbedNodes(context.Background(), db, nodes, embedder, batchSize, modelID); err != nil {
 				ingestMu.Unlock()
 				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("embed nodes: %w", err))
 				return
@@ -834,10 +833,6 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			projectID = "default"
 		}
 
-		if err := checkEmbedModel(ctx, db, projectID, modelID); err != nil {
-			return errorResult(err), ExtractAndRememberOutput{}, nil
-		}
-
 		job := jobs.create()
 		safeGo(func() {
 			defer jobs.finish(job.ID, 0, 0, 0, func() error {
@@ -859,7 +854,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 						return fmt.Errorf("embed: %w", err)
 					}
 
-					candidates, err := db.SearchVector(context.Background(), projectID, vec, 5)
+					candidates, err := db.SearchVector(context.Background(), projectID, vec, 5, modelID)
 					if err != nil {
 						log.Printf("extract_and_remember: search: %v", err)
 						continue
@@ -878,6 +873,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 						ID: id, ProjectID: projectID, NodeType: f.Kind,
 						Title: f.Title, Content: f.Content, Importance: f.Importance,
 						SourceAdapter: "extract_and_remember", Embedding: vec,
+						ModelID: modelID,
 					}
 
 					if err := db.UpsertNode(context.Background(), node); err != nil {
@@ -886,7 +882,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 					storedNodes = append(storedNodes, node)
 				}
 
-				chunkAndEmbedNodes(context.Background(), db, embedder, storedNodes, batchSize, nil, nil)
+				chunkAndEmbedNodes(context.Background(), db, embedder, storedNodes, batchSize, modelID, nil, nil)
 				return nil
 			}())
 		})
@@ -1089,6 +1085,49 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 		}
 
 		return toolResult, output, nil
+	})
+
+	// Tool 15: clear_project — synchronous, requires confirm
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "clear_project",
+		Description: "Delete all data for a project, or only vectors for a specific model. Requires confirm: true to prevent accidental deletion.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args ClearProjectInput) (*mcp.CallToolResult, ClearProjectOutput, error) {
+		if !args.Confirm {
+			return errorResult(fmt.Errorf("clear_project requires confirm: true")), ClearProjectOutput{}, nil
+		}
+		if args.ProjectID == "" {
+			return errorResult(fmt.Errorf("project_id is required")), ClearProjectOutput{}, nil
+		}
+
+		result, err := db.ClearProject(ctx, args.ProjectID, args.ModelID)
+		if err != nil {
+			return errorResult(err), ClearProjectOutput{}, nil
+		}
+
+		out := ClearProjectOutput{
+			Status:        "cleared",
+			DeletedNodes:  result.Nodes,
+			DeletedEdges:  result.Edges,
+			DeletedChunks: result.Chunks,
+			DeletedVecs:   result.Vectors,
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
+		}, out, nil
+	})
+
+	// Tool 16: list_projects — synchronous, read-only
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "list_projects", Description: "List all projects with basic stats (node count, edge count). Read-only.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct{}) (*mcp.CallToolResult, ListProjectsOutput, error) {
+		projects, err := db.ListProjects(ctx)
+		if err != nil {
+			return errorResult(err), ListProjectsOutput{}, nil
+		}
+		out := ListProjectsOutput{Projects: projects}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
+		}, out, nil
 	})
 }
 

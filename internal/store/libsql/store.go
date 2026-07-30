@@ -441,6 +441,7 @@ func (s *Store) SearchVector(
 	projectID string,
 	embedding []float32,
 	limit int,
+	modelID string,
 ) ([]store.ScoredNode, error) {
 	if len(embedding) != s.dim {
 		return nil, fmt.Errorf("libsql: query embedding has dim %d, store configured for dim %d", len(embedding), s.dim)
@@ -621,7 +622,7 @@ func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 	return tx.Commit()
 }
 
-func (s *Store) DeleteChunksByParent(ctx context.Context, parentNodeID string) error {
+func (s *Store) DeleteChunksByParent(ctx context.Context, parentNodeID string, modelID string) error {
 	_, err := s.db.ExecContext(
 		ctx,
 		`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE parent_node_id = ?)`,
@@ -645,6 +646,7 @@ func (s *Store) SearchChunks(
 	projectID string,
 	embedding []float32,
 	limit int,
+	modelID string,
 ) ([]store.ScoredChunk, error) {
 	if len(embedding) != s.dim {
 		return nil, fmt.Errorf("libsql: query embedding has dim %d, store configured for dim %d", len(embedding), s.dim)
@@ -864,7 +866,7 @@ func (s *Store) GetEmbedModelID(ctx context.Context, projectID string) (string, 
 	return "", nil
 }
 
-func (s *Store) GetEmbedModelStatus(ctx context.Context, projectID string) (string, error) {
+func (s *Store) GetEmbedModelStatus(ctx context.Context, projectID, modelID string) (string, error) {
 	return "", nil
 }
 
@@ -876,8 +878,12 @@ func (s *Store) SetEmbedModelDirty(ctx context.Context, projectID, modelID strin
 	return nil
 }
 
-func (s *Store) SetEmbedModelClean(ctx context.Context, projectID string) error {
+func (s *Store) SetEmbedModelClean(ctx context.Context, projectID, modelID string) error {
 	return nil
+}
+
+func (s *Store) ListEmbedModels(ctx context.Context, projectID string) ([]store.ModelInfo, error) {
+	return nil, nil
 }
 
 func (s *Store) EdgeTypeCounts(ctx context.Context, projectID string) (map[string]int, error) {
@@ -1145,4 +1151,97 @@ func (s *Store) ResolveUnresolved(ctx context.Context, projectID, nodeID, nodeTi
 	}
 
 	return len(refs), nil
+}
+
+func (s *Store) ClearProject(ctx context.Context, projectID, modelID string) (store.ClearProjectResult, error) {
+	if projectID == "" {
+		return store.ClearProjectResult{}, errors.New("libsql: project_id must not be empty")
+	}
+	if modelID != "" {
+		return store.ClearProjectResult{}, fmt.Errorf("libsql: model filtering not supported by this backend")
+	}
+
+	var nodes, edges int
+	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM nodes WHERE project_id = ?`, projectID).Scan(&nodes)
+	_ = s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM edges WHERE from_id IN (SELECT id FROM nodes WHERE project_id = ?) OR to_id IN (SELECT id FROM nodes WHERE project_id = ?)`,
+		projectID, projectID).Scan(&edges)
+
+	var hasNV, hasCV int
+	_ = s.db.QueryRowContext(ctx, `SELECT 1 FROM pragma_table_list WHERE name = 'node_vectors' AND type = 'table'`).Scan(&hasNV)
+	_ = s.db.QueryRowContext(ctx, `SELECT 1 FROM pragma_table_list WHERE name = 'chunk_vectors' AND type = 'table'`).Scan(&hasCV)
+
+	if hasCV != 0 {
+		_, _ = s.db.ExecContext(ctx,
+			`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT c.id FROM chunks c JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`,
+			projectID)
+	}
+	if hasNV != 0 {
+		_, _ = s.db.ExecContext(ctx,
+			`DELETE FROM node_vectors WHERE node_id IN (SELECT id FROM nodes WHERE project_id = ?)`,
+			projectID)
+	}
+	_, _ = s.db.ExecContext(ctx,
+		`DELETE FROM edge_proposals WHERE from_id IN (SELECT id FROM nodes WHERE project_id = ?) OR to_id IN (SELECT id FROM nodes WHERE project_id = ?)`,
+		projectID, projectID)
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM unresolved_references WHERE project_id = ?`, projectID)
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM nodes WHERE project_id = ?`, projectID)
+
+	return store.ClearProjectResult{Nodes: nodes, Edges: edges}, nil
+}
+
+func (s *Store) ListProjects(ctx context.Context) ([]store.ProjectInfo, error) {
+	nodeRows, err := s.db.QueryContext(ctx, `SELECT project_id, COUNT(*) FROM nodes GROUP BY project_id`)
+	if err != nil {
+		return nil, fmt.Errorf("libsql: list projects node count: %w", err)
+	}
+	defer nodeRows.Close()
+
+	nodeMap := map[string]int{}
+	for nodeRows.Next() {
+		var pid string
+		var count int
+		if err := nodeRows.Scan(&pid, &count); err != nil {
+			return nil, fmt.Errorf("libsql: scan project node count: %w", err)
+		}
+		nodeMap[pid] = count
+	}
+	if err := nodeRows.Err(); err != nil {
+		return nil, err
+	}
+
+	edgeRows, err := s.db.QueryContext(ctx,
+		`SELECT n.project_id, COUNT(*) FROM edges e JOIN nodes n ON n.id = e.from_id GROUP BY n.project_id`)
+	if err != nil {
+		return nil, fmt.Errorf("libsql: list projects edge count: %w", err)
+	}
+	defer edgeRows.Close()
+
+	edgeMap := map[string]int{}
+	for edgeRows.Next() {
+		var pid string
+		var count int
+		if err := edgeRows.Scan(&pid, &count); err != nil {
+			return nil, fmt.Errorf("libsql: scan project edge count: %w", err)
+		}
+		edgeMap[pid] = count
+	}
+	if err := edgeRows.Err(); err != nil {
+		return nil, err
+	}
+
+	out := make([]store.ProjectInfo, 0, len(nodeMap))
+	for pid, nc := range nodeMap {
+		out = append(out, store.ProjectInfo{
+			ProjectID: pid,
+			NodeCount: nc,
+			EdgeCount: edgeMap[pid],
+		})
+	}
+	for pid := range edgeMap {
+		if _, ok := nodeMap[pid]; !ok {
+			log.Printf("libsql: orphan edges found for project %q (nodes missing)", pid)
+		}
+	}
+	return out, nil
 }

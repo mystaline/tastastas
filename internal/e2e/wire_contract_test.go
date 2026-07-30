@@ -25,14 +25,16 @@ import (
 // one, this test breaks with a clear diff showing exactly what changed.
 var expectedWireShapes = map[string][]string{
 	"remember":             {"id", "status"},
-	"recall":               {"links", "results"},
+	"recall":               {"links", "results", "warning"},
 	"forget":               {"status"},
 	"link":                 {"status"},
 	"check_impact":         {"stale_nodes"},
-		"onboard_check":       {"chunk_count", "edge_count", "edge_type_counts", "has_chunks", "has_conventions", "has_edges", "has_embeddings", "has_nodes", "node_count", "stale_count", "vec_count"},
+	"onboard_check":       {"chunk_count", "edge_count", "edge_type_counts", "has_chunks", "has_conventions", "has_edges", "has_embeddings", "has_nodes", "node_count", "stale_count", "vec_count"},
 	"extract_and_remember": {"facts"},
 	"ingest":               {"auto_linked", "chunks_created", "conventions_inferred", "edges_created", "job_id", "nodes_ingested", "proposals_queued", "status"},
 	"query_graph":          {"edges", "node_id", "title"},
+	"clear_project":        {"deleted_chunks", "deleted_edges", "deleted_nodes", "deleted_vectors", "status"},
+	"list_projects":        {"projects"},
 }
 
 // jsonFields extracts the sorted set of json struct tag names from a type.
@@ -84,6 +86,8 @@ func TestOutputWireContract(t *testing.T) {
 		"extract_and_remember": reflect.TypeOf(mcpserver.ExtractAndRememberOutput{}),
 		"ingest":               reflect.TypeOf(mcpserver.IngestOutput{}),
 		"query_graph":          reflect.TypeOf(mcpserver.QueryGraphOutput{}),
+		"clear_project":        reflect.TypeOf(mcpserver.ClearProjectOutput{}),
+		"list_projects":        reflect.TypeOf(mcpserver.ListProjectsOutput{}),
 	}
 
 	for tool, expected := range expectedWireShapes {

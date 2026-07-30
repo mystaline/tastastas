@@ -2,7 +2,7 @@
 // function cmd/tastastas invokes with --serve) on a real listening socket
 // and talks to it with a real net/http client + the SDK's real
 // StreamableClientTransport — no in-process handler calls. Covers the
-// three HTTP surfaces: /health, /ingest/{adapter} + /ingest/webhook REST
+// three HTTP surfaces: /health, /ingest (async, returns job_id), /ingest/jobs/{id}
 // endpoints, and /mcp (MCP-over-HTTP) with the same tool sequence as the
 // stdio E2E test.
 package e2e
@@ -58,7 +58,7 @@ func startHTTPServerWithEmbedder(t *testing.T, embedder embed.EmbedderBackend, d
 		port := 20000 + rand.Intn(20000)
 		addr = fmt.Sprintf("127.0.0.1:%d", port)
 		errCh := make(chan error, 1)
-		go func() { errCh <- mcpserver.ServeHTTP(ctx, db, embedder, addr, "", 32, "") }()
+		go func() { errCh <- mcpserver.ServeHTTP(ctx, db, embedder, addr, "", 32, "", "") }()
 
 		// Poll /health with backoff; a bind failure surfaces almost
 		// immediately on errCh, a success means /health starts responding
@@ -123,20 +123,20 @@ func TestE2EHTTPIngestChunksAndEmbeds(t *testing.T) {
 		"root":       root,
 		"project_id": "e2e-ingest-chunks",
 	})
-	resp, err := http.Post(base+"/ingest/docwalk", "application/json", bytes.NewReader(body))
+	resp, err := http.Post(base+"/ingest", "application/json", bytes.NewReader(body))
 	if err != nil {
-		t.Fatalf("POST /ingest/docwalk: %v", err)
+		t.Fatalf("POST /ingest: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted {
 		b, _ := io.ReadAll(resp.Body)
-		t.Fatalf("POST /ingest/docwalk: status %d: %s", resp.StatusCode, b)
+		t.Fatalf("POST /ingest: status %d: %s", resp.StatusCode, b)
 	}
 	var accepted struct {
 		JobID string `json:"job_id"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&accepted); err != nil {
-		t.Fatalf("decode /ingest/docwalk accepted response: %v", err)
+		t.Fatalf("decode /ingest accepted response: %v", err)
 	}
 
 	// Ingest runs async now (internal/mcp/jobs.go) — poll job status instead
@@ -200,29 +200,29 @@ func TestE2EHTTPHealthAndIngest(t *testing.T) {
 		t.Fatalf("/health: expected status=ok, got %+v", health)
 	}
 
-	// POST /ingest/webhook — real wire shape check on the REST ingest path.
-	webhookBody, _ := json.Marshal(map[string]any{
-		"path":       "e2e-http/doc.md",
-		"content":    "HTTP E2E webhook ingest content.",
+	// POST /ingest — REST ingest shape check.
+	// Use testdata directory root so ingest walks our existing test fixtures.
+	ingestBody, _ := json.Marshal(map[string]string{
+		"root":       "testdata",
 		"project_id": "e2e-http",
 	})
-	resp2, err := http.Post(base+"/ingest/webhook", "application/json", bytes.NewReader(webhookBody))
+	resp2, err := http.Post(base+"/ingest", "application/json", bytes.NewReader(ingestBody))
 	if err != nil {
-		t.Fatalf("POST /ingest/webhook: %v", err)
+		t.Fatalf("POST /ingest: %v", err)
 	}
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp2.Body)
-		t.Fatalf("POST /ingest/webhook: status %d: %s", resp2.StatusCode, b)
+		t.Fatalf("POST /ingest: status %d: %s", resp2.StatusCode, b)
 	}
-	var webhookOut struct {
-		Ingested int `json:"ingested"`
+	var ingestOut struct {
+		JobID string `json:"job_id"`
 	}
-	if err := json.NewDecoder(resp2.Body).Decode(&webhookOut); err != nil {
-		t.Fatalf("decode /ingest/webhook: %v", err)
+	if err := json.NewDecoder(resp2.Body).Decode(&ingestOut); err != nil {
+		t.Fatalf("decode /ingest accepted: %v", err)
 	}
-	if webhookOut.Ingested != 1 {
-		t.Fatalf("/ingest/webhook: expected ingested=1, got %+v", webhookOut)
+	if ingestOut.JobID == "" {
+		t.Fatalf("/ingest: expected job_id, got %+v", ingestOut)
 	}
 }
 

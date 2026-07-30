@@ -1,5 +1,5 @@
 # Build & dev
-.PHONY: all sidecar tastastas build run install test clean
+.PHONY: all sidecar tastastas build run install test clean frontend-build
 
 version := $(shell git describe --tags --dirty=-dirty 2>/dev/null || echo "dev")
 ldflags := -X github.com/mystaline-dev/tastastas/internal/mcp.Version=$(version)
@@ -10,6 +10,9 @@ EMBED_BIN  := internal/embed/bin/linux_amd64/tastastas-embed
 
 all: sidecar tastastas
 
+frontend-build:
+	cd frontend && npm ci && npm run build
+
 sidecar: $(EMBED_BIN)
 
 $(EMBED_BIN): $(SIDECAR_SRC)
@@ -17,14 +20,16 @@ $(EMBED_BIN): $(SIDECAR_SRC)
 	cp $(SIDECAR_BIN) $@
 
 tastastas: $(EMBED_BIN)
+	cp -r frontend/dist/. internal/mcp/frontenddist/ 2>/dev/null; \
 	go build -ldflags="$(ldflags)" -o tastastas ./cmd/tastastas
 
-build: tastastas
+build: frontend-build tastastas
 
 run: build
 	./tastastas --serve :8080 --db ~/.local/share/tastastas/memory.db --graph-addr :9292
 
-install: $(EMBED_BIN)
+install: frontend-build
+	cp -r frontend/dist/. internal/mcp/frontenddist/
 	go install -ldflags="$(ldflags)" ./cmd/tastastas
 
 test:

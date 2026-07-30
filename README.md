@@ -4,94 +4,19 @@
 
 Store facts, search by relevance × recency × importance, get "this might be stale" alerts when connected docs change.
 
-Data sources: doc repos (PRDs, ERDs, APIs, spec docs), codebases (Go symbols, call graphs), git history, conversation facts, and custom notes — all stored in one graph DB with zero external services.
+Data sources: doc repos (PRDs, ERDs, APIs, spec docs), codebases (Go, TypeScript, JavaScript, Python, Rust — full AST + imports), git history, conversation facts, and custom notes — all stored in one graph DB with zero external services.
 
 ## Quick Start
 
-Three deployment paths:
-
-### Option A: Docker Compose (on-prem / team server)
-
-**Prerequisites:** Docker + Docker Compose v2
-
-```bash
-docker compose up -d
-```
-
-> ⚠️ **First run**: `docker compose up` pulls Ollama image (~3.2GB) then downloads `nomic-embed-text` model (~270MB). Total ~3.5GB download. This happens once — subsequent starts are instant.
-
-Verify:
-
-```bash
-curl http://localhost:8080/health
-# → {"status":"ok","version":"0.1.0"}
-```
-
-MCP client config: see [MCP Configuration](#mcp-configuration) → HTTP.
-
-Graph visualization: `http://localhost:9292/graph/{project_id}`
-
-Data persisted in Docker volume `tastastas-data`. Auth optional via `TASTASTAS_AUTH_TOKEN` in `.env`.
-
-### Option B: Single binary + baked sidecar (zero deps, air-gapped)
-
-**Prerequisites:** Go 1.26+, Rust (cargo), curl, ~1GB disk, **clone repo** (no release binaries yet)
-
-```bash
-# Build sidecar (one-time: downloads model, builds, and embeds into binary)
-./scripts/build-sidecar.sh
-
-# Stdio mode (default)
-./tastastas
-
-# HTTP mode
-./tastastas --serve :8080
-```
-
-`--embed-backend sidecar` is default when binary present. Falls back to lexical-only gracefully.
-
-> ℹ️ Sidecar ONNX model is baked into the binary by `build-sidecar.sh`. After build, no external deps needed — zero runtime installation, Ollama not required.
-
-MCP client config: stdio mode → see [MCP Configuration](#mcp-configuration) → Stdio. HTTP mode (`--serve`) → same as Option A, see → HTTP.
-
-### Option C: Single binary + external Ollama (personal, LLM extraction)
-
-**Prerequisites:** Go 1.26+, Ollama running + `ollama pull nomic-embed-text`
-
-> ⚠️ **Ollama + model must be running** before starting tastastas. Verify with `ollama list`. Change `--ollama-model` and `--embed-dim` for different models — check dimension via `curl -X POST http://localhost:11434/api/embeddings -d '{"model":"your-model","prompt":"test"}' | jq '.embedding | length'`.
-
-```bash
-go build -o tastastas ./cmd/tastastas
-
-# Stdio
-./tastastas --embed-backend ollama --ollama-url http://localhost:11434 --db ~/.local/share/tastastas/memory.db
-
-# HTTP
-./tastastas --embed-backend ollama --ollama-url http://localhost:11434 --serve :8080 --db ~/.local/share/tastastas/memory.db
-```
-
-`--ollama-url` defaults to `http://localhost:11434` — only needed if Ollama runs elsewhere (remote host, different port, Docker).
-
-MCP client config: stdio mode → see [MCP Configuration](#mcp-configuration) → Stdio + Ollama. HTTP mode (`--serve`) → same as Option A, see → HTTP.
-
-### Option D: Single binary + OpenAI API (cloud, zero infra)
-
-**Cost:** ~$0.50/month for 30 users.
-
-```bash
-export TASTASTAS_OPENAI_KEY=sk-...
-./tastastas --serve :8080 --embed-backend openai
-```
-
-MCP client config: stdio mode → see [MCP Configuration](#mcp-configuration) → Stdio + OpenAI. HTTP mode (`--serve`) → same as Option A, see → HTTP.
+See [DEPLOYMENT.md](./DEPLOYMENT.md) for delivery options (binary, Docker, build from source).
 
 ## MCP Configuration
 
-Config depends on how you started tastastas (Option A/B/C/D above). Pick the matching block.
+Pick the block matching your setup. See [DEPLOYMENT.md](./DEPLOYMENT.md#quick-run-cheatsheet) for run commands.
 
 Only Claude Code and Kilo Code shown below — other agents just adjust to that agent's own MCP config format/file.
 
-**HTTP (Option A — Docker Compose):**
+**HTTP (Docker Compose):**
 
 Claude Code:
 ```json
@@ -114,7 +39,7 @@ Kilo Code:
 }
 ```
 
-**Stdio (Option B — sidecar):**
+**Stdio (sidecar):**
 
 Claude Code:
 ```json
@@ -145,7 +70,7 @@ Kilo Code:
 }
 ```
 
-**Stdio + Ollama (Option C):**
+**Stdio + Ollama:**
 
 Claude Code:
 ```json
@@ -178,7 +103,7 @@ Kilo Code:
 }
 ```
 
-**Stdio + OpenAI (Option D):**
+**Stdio + OpenAI:**
 
 ```bash
 # Prefer env var (not in process list)
@@ -232,55 +157,9 @@ Add this to your `.cursorrules`, `CLAUDE.md`, `AGENTS.md`, or other agent entryp
 tastastas is an MCP server connected to this project. If you see tastastas in your available MCP tools, always call the `init` tool as the first step of every session to understand available tools and best practices.
 ```
 
-## Deployment Guide
+## Hardware
 
-Recommended configuration per hardware spec. Sidecar = baked ONNX (`--embed-backend sidecar`), zero external deps.
-
-### Sidecar backend (local ONNX)
-
-| Hardware | Users | Mode | `--sidecar-workers` | `--sidecar-intra-threads` | `--batch-size` | Notes |
-|----------|-------|------|--------------------:|--------------------------:|---------------:|-------|
-| 2 vCPU, 2GB RAM | 1-2 | stdio | 1 | 1 | 8 | Ingest serial. Recall parallel. |
-| 4 vCPU, 4GB RAM | 5-10 | `--serve` | 1 | 2 | 16 | Queue ingest (1 at a time). 30 user recall fine. |
-| 4 vCPU, 4GB RAM | 30 | `--serve` | 1 | 2 | 16 | Recall parallel, ingest serial per user. |
-| 8 vCPU, 16GB RAM | 10-30 | `--serve` | 2 | 4 | 32 | Balance throughput vs CPU. |
-| 16+ vCPU, 32GB RAM | 30+ | `--serve` | 4 | 0 (all) | 32 | Default — max throughput. Good CI/on-prem build server. |
-| Any + NVIDIA GPU | any | stdio/serve | 1 | N/A (GPU) | 32 | Sidecar uses CPU ONNX; GPU path needs CUDA EP build. |
-
-### Ollama backend (external process, 768-dim)
-
-| Hardware | Users | Mode | Ollama model | `--batch-size` | Notes |
-|----------|-------|------|--------------|---------------:|-------|
-| 4 vCPU, 8GB RAM | 5-10 | `--serve` | `nomic-embed-text` | 16 | Ollama + tastastas ~1.5GB base RAM. |
-| 8 vCPU, 16GB RAM | 10-30 | `--serve` | `nomic-embed-text` | 32 | Standard team setup. |
-| 16+ vCPU, 32GB RAM | 30+ | `--serve` | `bge-m3` | 32 | Higher quality (1024-dim). Requires more RAM. |
-
-### OpenAI backend (cloud API, 1536-dim)
-
-No hardware tuning needed — embedding runs on OpenAI servers. Set `--embed-backend openai --openai-api-key $TASTASTAS_OPENAI_KEY`. `--batch-size` up to 2048 (OpenAI limit). Best for resource-constrained hosts or when quality is priority.
-
-### Ingestion serialization
-
-In `--serve` mode with 1 sidecar worker, ingest jobs queue behind the embedder mutex. Recall (FTS5 + cosine search) is fully parallel and unaffected. Recommended for all on-prem deployments to prevent resource starvation.
-
-## Flags
-
-| Flag | Default | What it does |
-|------|---------|-------------|
-| `--serve` | *(unset)* | HTTP address (`:8080`). Unset = stdio MCP mode. |
-| `--db` | `~/.local/share/tastastas/memory.db` | SQLite DB path (honors `$TASTASTAS_DB`, `$XDG_DATA_HOME`) |
-| `--embed-dim` | `0` = auto-detect | Vector dimension: 384 for sidecar, 768 for ollama, 1536 for openai, 0 = pick from backend |
-| `--embed-backend` | `sidecar` | `sidecar` (baked ONNX, zero deps), `ollama` (local, 768-dim), `openai` (cloud API, 1536-dim), or `none` (lexical only) |
-| `--ollama-url` | `http://localhost:11434` | Ollama URL (`embed-backend=ollama`) |
-| `--ollama-model` | `nomic-embed-text` | Ollama embedding model (`embed-backend=ollama`) |
-| `--sidecar-workers` | `0` = 4 | Sidecar worker count (`embed-backend=sidecar`) |
-| `--sidecar-intra-threads` | `0` = ONNX default | ONNX intra-op thread count per sidecar worker. `2` caps CPU ~200% on 4-vCPU; `0` = all cores (`embed-backend=sidecar`) |
-| `--batch-size` | `32` | Max texts per embed batch. `16` saves ~50% peak RAM for ONNX tensors, throughput drop ~5-10% |
-| `--openai-api-key` | *(env `$TASTASTAS_OPENAI_KEY`)* | OpenAI API key (prefer env var, not CLI flag) |
-| `--openai-model` | `text-embedding-3-small` | OpenAI model ID |
-| `--openai-base-url` | `https://api.openai.com/v1` | OpenAI-compatible base URL |
-| `--graph-addr` | *(unset)* | Graph visualization page on this address (`:9292`). Works alongside stdio MCP mode — no `--serve` needed. |
-| `--auth-token` | *(unset)* | Bearer token for HTTP server mode (empty = no auth) |
+See [DEPLOYMENT.md](./DEPLOYMENT.md#hardware--tuning) for hardware requirements and sidecar tuning.
 
 ## How it works
 
@@ -296,6 +175,18 @@ Source → [AutoDetectAdapters] → n → [EmbedNodes] → n → [InferConventio
 4. **BuildHierarchy** generates synthetic `directory` nodes connected by `contains` edges — every file becomes reachable from the repo root. Single-child pass-through folders collapse.
 5. **Tier2ScoreAndLink** pairs every two nodes: `0.4·cos + 0.2·typeCompat + 0.2·pathProximity + 0.2·identifierOverlap - templateCollisionPenalty`. Above 0.80 = `auto-linked`. Above 0.55 = `proposed` (review queue). Below = skipped.
 6. **Graph view** at `GET /graph/{project_id}` renders structural edges + auto-linked edges as a force-directed D3 visualization. Proposed edges hidden — use `query_graph` to inspect.
+
+### Model identity & isolation
+
+Embedding models produce different vector spaces. tastastas stores vectors with composite primary keys (`{model_id}:{node_id}`) so multiple models coexist per project without conflict:
+
+- Switching models adds new vectors — recall only searches vectors matching the current model, not all models
+- Per-model dirty/clean status tracks crash residue without affecting other models
+- Recall filters by the current session's model_id automatically
+- Models can be listed via `init` tool per project
+- Re-ingest after crash is idempotent (content-hash skip)
+
+Embeds use API probes to auto-detect dimension — no `--embed-dim` flag needed for most setups.
 
 ### Architecture notes
 
@@ -372,7 +263,7 @@ Idempotent: unchanged files skip re-chunk + re-embed (content-hash skip).
 ### `GET /graph/{project}` — Graph visualization
 
 ```
-?max_edges=500  (default 500, cap for large projects)
+?max_edges=2000  (default 2000)
 
 Accept: application/json
 → 200  {"project_id":"my-project","total_edges":36000,"returned":500,
@@ -392,7 +283,7 @@ See [Tools (MCP)](#tools-mcp) section below. Request/response follows the [MCP S
 Three adapters. Point one at a folder:
 
 - **`docwalk`** — structured doc trees (PRD/APISpec/ERD) via `.memoryrc.yaml` glob→type mapping. Auto cross-links same-feature docs.
-- **`gitrepo`** — walks a tree for `MEMORY.md`-style files.
+- **`gitrepo`** — walks a tree for files matching a glob pattern (default: `MEMORY.md`, configurable).
 - **`obsidian`** — vault frontmatter + `[[wikilinks]]` become typed nodes/edges.
 
 ```bash
@@ -443,7 +334,7 @@ Ingest is idempotent — unchanged files keep their existing chunks and embeddin
 | Language | Role | What it does |
 |----------|------|-------------|
 | **Go** | Core application | MCP server, ingest pipeline, graph database, retrieval, chunking, SQLite store. All production code in `internal/`. |
-| **Rust** | Embedding sidecar | `tastastas-embed` — bge-small-en-v1.5 ONNX model baked into binary via `include_bytes!`. JSON-RPC over stdin/stdout. Communicates with Go process as subprocess. |
+| **Rust** | Embedding sidecar | `tastastas-embed` — bge-small-en-v1.5 ONNX model compiled into standalone binary. Embedded into Go binary via `//go:embed`. JSON-RPC over stdin/stdout. |
 | **Python** | Data science / calibration | `prototype/scoring.py` — extraction prompt calibration, dedup threshold derivation, embedding quality benchmarks. Not in production binary. |
 
 ### Expansion Paths
@@ -522,7 +413,7 @@ Not competing. [Graphify](https://github.com/Graphify-Labs/graphify) (96.5k ★,
 | **Consumer** | AI agent querying a structured knowledge graph | AI agent reading a static graph.json + report |
 | **Storage** | Persistent SQLite DB — add/update/delete facts anytime | Static `graphify-out/` files, committed to git |
 | **Retrieval** | Hybrid: FTS5 + vector (vec0) + graph + recency + importance + RRF | Pure graph traversal — no embeddings, no vectors |
-| **Code analysis** | Go AST only (codeast adapter) | 40+ languages via tree-sitter AST |
+| **Code analysis** | Go (full) + TS/JS/Python/Rust (tree-sitter) | 40+ languages via tree-sitter AST |
 | **Non-code content** | Docs, PRDs, ERDs, specs, conventions, code, git history, conversation facts, custom notes | Docs, PDFs, images, video/audio, office files |
 | **Recency / Staleness** | Built-in: `2^(-age / halfLife)` decay + stale propagation on change | Snapshot at build time. `--update` / `watch` / git hooks for differential re-sync. No query-time decay or propagation |
 | **Live updates** | CRUD at any time — `remember`, `link`, `forget`, `ingest` all work while server is running | Rebuild the graph. Auto-rebuild on git commit via hook |

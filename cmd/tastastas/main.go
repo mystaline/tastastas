@@ -206,7 +206,17 @@ func main() {
 	)
 	batchSize := flag.Int("batch-size", 32, "max texts per embed batch (16 saves ~50% peak RAM, 32=throughput)")
 	authToken := flag.String("auth-token", "", "bearer token for HTTP server mode (empty = no auth)")
+	spaDir := flag.String("spa-dir", "", "path to built React SPA directory (empty = use embedded frontend) — also read from $TASTASTAS_SPA_DIR")
 	flag.Parse()
+
+	if *spaDir == "" {
+		*spaDir = os.Getenv("TASTASTAS_SPA_DIR")
+	}
+	if *spaDir != "" {
+		if info, err := os.Stat(*spaDir); err != nil || !info.IsDir() {
+			log.Printf("warning: --spa-dir %s not found — SPA graph page unavailable (legacy ?v=legacy still works)", *spaDir)
+		}
+	}
 
 	if *openaiKey == "" {
 		*openaiKey = os.Getenv("TASTASTAS_OPENAI_KEY")
@@ -290,7 +300,9 @@ func main() {
 	if *graphAddr != "" {
 		go func() {
 			mux := http.NewServeMux()
-			mux.HandleFunc("GET /graph/{project}", mcpserver.HandleGraphView(db))
+			mux.HandleFunc("GET /graph/{project}", mcpserver.HandleGraphData(db))
+			mux.HandleFunc("GET /api/graph/{project}", mcpserver.HandleGraphData(db)) // SPA fetches from /api/graph/, no reverse proxy to strip prefix
+			mux.HandleFunc("GET /graph/{project}/", mcpserver.HandleGraphSPA(*spaDir))
 			log.Printf("graph server listening on %s", *graphAddr)
 			if err := http.ListenAndServe(*graphAddr, mux); err != nil {
 				log.Printf("graph server: %v", err)
@@ -301,7 +313,7 @@ func main() {
 	if *serve != "" {
 		// HTTP server mode
 		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-		err := mcpserver.ServeHTTP(ctx, db, embedder, *serve, *authToken, *batchSize, modelID)
+		err := mcpserver.ServeHTTP(ctx, db, embedder, *serve, *authToken, *batchSize, modelID, *spaDir)
 		cancel()
 		db.Close() // close before exit: log.Fatalf below skips defers
 		closeEmbedder()

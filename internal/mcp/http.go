@@ -1,15 +1,19 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/mystaline-dev/tastastas/internal/embed"
@@ -26,6 +30,7 @@ func ServeHTTP(
 	addr, authToken string,
 	batchSize int,
 	modelID string,
+	spaDir string,
 ) error {
 	jobs := newJobStore(db)
 
@@ -43,11 +48,14 @@ func ServeHTTP(
 	// MCP endpoint — all MCP tools available via Streamable HTTP
 	mux.Handle("/mcp", mcpHandler)
 
-	// Graph visualization — GET /graph/{project}
-	mux.HandleFunc("GET /graph/{project}", HandleGraphView(db))
+	// Graph data — both /graph and /api/graph serve same JSON.
+	// SPA fetches from /api/graph/{project}, no reverse proxy in front to strip the prefix.
+	mux.HandleFunc("GET /graph/{project}", HandleGraphData(db))
+	mux.HandleFunc("GET /api/graph/{project}", HandleGraphData(db))
+	mux.HandleFunc("GET /graph/{project}/", HandleGraphSPA(spaDir))
 
 	// REST ingest — POST /ingest auto-detects adapters, same pipeline as MCP ingest tool.
-	mux.HandleFunc("POST /ingest", handleRESTIngest(db, embedder, jobs, batchSize))
+	mux.HandleFunc("POST /ingest", handleRESTIngest(db, embedder, jobs, batchSize, modelID))
 	mux.HandleFunc("GET /ingest/jobs/{id}", handleIngestJobStatus(jobs))
 
 	// Health check — exempt from auth
@@ -111,7 +119,7 @@ func bearerMatches(r *http.Request, token string) bool {
 	return ok == len(token) && len(token) > 0
 }
 
-func HandleGraphView(db store.Store) http.HandlerFunc {
+func HandleGraphData(db store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		projectID := r.PathValue("project")
 		if projectID == "" {
@@ -157,12 +165,13 @@ func HandleGraphView(db store.Store) http.HandlerFunc {
 			nodeMap[id].weight++
 		}
 		type graphNode struct {
-			ID     string `json:"id"`
-			Title  string `json:"title"`
-			Type   string `json:"type"`
-			Group  string `json:"group"`
-			Size   int    `json:"size"`
-			Weight int    `json:"weight"`
+			ID        string `json:"id"`
+			Title     string `json:"title"`
+			Type      string `json:"type"`
+			Group     string `json:"group"`
+			Size      int    `json:"size"`
+			Weight    int    `json:"weight"`
+			ProjectID string `json:"project_id"`
 		}
 		type graphEdge struct {
 			Source     string  `json:"source"`
@@ -191,6 +200,7 @@ func HandleGraphView(db store.Store) http.HandlerFunc {
 			nodes = append(nodes, graphNode{
 				ID: n.id, Title: n.title, Type: n.ntype, Group: n.group,
 				Size: n.size, Weight: n.weight,
+				ProjectID: projectID,
 			})
 		}
 
@@ -223,15 +233,90 @@ func HandleGraphView(db store.Store) http.HandlerFunc {
 			return
 		}
 
-		page := strings.Replace(graphPageSource, "__DATA__", string(jsonBytes), 1)
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(page))
+		if r.URL.Query().Get("v") == "legacy" {
+			page := strings.Replace(graphPageSource, "__DATA__", string(jsonBytes), 1)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write([]byte(page))
+			return
+		}
+
+		// Redirect to SPA entry point
+		redirectURL := "/graph/" + projectID + "/"
+		if r.URL.RawQuery != "" {
+			redirectURL += "?" + r.URL.RawQuery
+		}
+		http.Redirect(w, r, redirectURL, http.StatusFound)
+	}
+}
+
+func HandleGraphSPA(spaDir string) http.HandlerFunc {
+	readFile := func(path string) ([]byte, error) {
+		if spaDir != "" {
+			return os.ReadFile(filepath.Join(spaDir, path))
+		}
+		return frontendDist.ReadFile("frontenddist/" + path)
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		projectID := r.PathValue("project")
+		if projectID == "" {
+			projectID = "default"
+		}
+		prefix := "/graph/" + projectID + "/"
+		subpath := strings.TrimPrefix(r.URL.Path, prefix)
+
+		// SPA built with vite base: /graph/ — assets at /graph/assets/...
+		if projectID == "assets" {
+			if strings.Contains(subpath, "..") {
+				http.NotFound(w, r)
+				return
+			}
+			data, err := readFile("assets/" + subpath)
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			http.ServeContent(w, r, subpath, time.Time{}, bytes.NewReader(data))
+			return
+		}
+
+		if subpath == "" || subpath == "/" {
+			w.Header().Set("Cache-Control", "no-cache")
+			data, err := readFile("index.html")
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			http.ServeContent(w, r, "index.html", time.Time{}, bytes.NewReader(data))
+			return
+		}
+
+		if strings.HasPrefix(subpath, "assets/") && !strings.Contains(subpath, "..") {
+			data, err := readFile(subpath)
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			http.ServeContent(w, r, subpath, time.Time{}, bytes.NewReader(data))
+			return
+		}
+
+		// SPA fallback — serve index.html for client-side routing
+		w.Header().Set("Cache-Control", "no-cache")
+		data, err := readFile("index.html")
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		http.ServeContent(w, r, "index.html", time.Time{}, bytes.NewReader(data))
 	}
 }
 
 // handleRESTIngest handles POST /ingest — auto-detect adapters, same pipeline
 // as the MCP ingest tool. Async: returns { job_id, status } immediately.
-func handleRESTIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobStore, batchSize int) http.HandlerFunc {
+func handleRESTIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobStore, batchSize int, modelID string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Root      string `json:"root"`
@@ -253,7 +338,6 @@ func handleRESTIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobS
 		}
 
 		job := jobs.create()
-		// same pipeline as MCP ingest tool (server.go:466-520)
 		safeGo(func() {
 			ctx := context.Background()
 			nodes, edges, _, filesWalked, filesSkipped, err := onboard.AutoDetectAdapters(ctx, db, root, projectID)
@@ -278,7 +362,7 @@ func handleRESTIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobS
 
 			embedOnce := sync.OnceFunc(func() { jobs.updatePhase(job.ID, "embedding") })
 			chunkCount, err := chunkAndEmbedNodes(
-				ctx, db, embedder, nodes, batchSize,
+				ctx, db, embedder, nodes, batchSize, "",
 				func(embedded, total int) {
 					embedOnce()
 					jobs.updateChunksEmbedded(job.ID, embedded, total)
@@ -291,7 +375,7 @@ func handleRESTIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobS
 				return
 			}
 			if embedder != nil {
-				_ = onboard.EmbedNodes(ctx, db, nodes, embedder, batchSize)
+				_ = onboard.EmbedNodes(ctx, db, nodes, embedder, batchSize, "")
 			}
 			ingestMu.Unlock()
 
