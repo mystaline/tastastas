@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -348,8 +349,12 @@ func handleRESTIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobS
 			jobs.updateCounts(job.ID, filesWalked, filesSkipped)
 			for _, n := range nodes {
 				if err := db.UpsertNode(ctx, n); err != nil {
-					jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert node: %w", err))
-					return
+					if !errors.Is(err, store.ErrVectorSkipped) {
+						jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert node: %w", err))
+						return
+					}
+					log.Printf("ingest job %s: %v (node metadata persisted)", job.ID, err)
+					jobs.addWarning(job.ID, err.Error())
 				}
 			}
 			if err := db.UpsertEdges(ctx, edges); err != nil {
@@ -369,10 +374,14 @@ func handleRESTIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobS
 				},
 				func() { jobs.updatePhase(job.ID, "persisting") },
 			)
-			if err != nil {
+			if err != nil && !errors.Is(err, store.ErrVectorSkipped) {
 				ingestMu.Unlock()
 				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("chunk/embed: %w", err))
 				return
+			}
+			if err != nil {
+				log.Printf("ingest job %s: %v (chunks persisted)", job.ID, err)
+				jobs.addWarning(job.ID, err.Error())
 			}
 			if embedder != nil {
 				_ = onboard.EmbedNodes(ctx, db, nodes, embedder, batchSize, "")
@@ -389,8 +398,11 @@ func handleRESTIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobS
 			hierNodes, hierEdges := onboard.BuildHierarchy(projectID, nodes)
 			for _, n := range hierNodes {
 				if err := db.UpsertNode(ctx, n); err != nil {
-					jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert hierarchy node: %w", err))
-					return
+					if !errors.Is(err, store.ErrVectorSkipped) {
+						jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert hierarchy node: %w", err))
+						return
+					}
+					jobs.addWarning(job.ID, err.Error())
 				}
 			}
 			if err := db.UpsertEdges(ctx, hierEdges); err != nil {

@@ -33,6 +33,7 @@ type ingestJob struct {
 	FilesWalked     int                `json:"files_walked,omitempty"`
 	FilesSkipped    int                `json:"files_skipped,omitempty"`
 	Error           string             `json:"error,omitempty"`
+	Warnings        []string           `json:"warnings,omitempty"` // non-fatal issues (e.g. corrupt embeddings skipped) — job still completed
 	StartedAt       time.Time          `json:"started_at"`
 	EndedAt         time.Time          `json:"ended_at,omitempty"`
 	cancel          context.CancelFunc // for job cancellation
@@ -86,6 +87,21 @@ func (js *jobStore) get(id string) (ingestJob, bool) {
 		return ingestJob{}, false
 	}
 	return *j, true // copy: caller must not see mutations after unlock
+}
+
+// addWarning appends a non-fatal warning to a running job — used when a
+// vector write is skipped (corrupt embedding) but the job itself continues,
+// so a caller polling job status still sees it happened instead of it only
+// being visible in the server's own stdout log.
+func (js *jobStore) addWarning(id, msg string) {
+	js.mu.Lock()
+	defer js.mu.Unlock()
+
+	j, ok := js.jobs[id]
+	if !ok {
+		return
+	}
+	j.Warnings = append(j.Warnings, msg)
 }
 
 // finish marks the job done/error and updates final counts.

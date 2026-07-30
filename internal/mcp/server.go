@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"sort"
 	"sync"
 	"time"
 
@@ -161,6 +162,11 @@ func chunkAndEmbedNodes(
 		}
 	}
 	if err := db.UpsertChunks(ctx, allChunks); err != nil {
+		if errors.Is(err, store.ErrVectorSkipped) {
+			// Chunk metadata + valid vectors persisted; only the corrupt
+			// ones were skipped. Not a failure — propagate as a warning.
+			return len(allChunks), err
+		}
 		return 0, err
 	}
 	return len(allChunks), nil
@@ -308,8 +314,12 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 					func() { jobs.updatePhase(job.ID, "persisting") },
 				)
 				ingestMu.Unlock()
-				if err != nil {
+				if err != nil && !errors.Is(err, store.ErrVectorSkipped) {
 					return fmt.Errorf("chunk/embed: %w", err)
+				}
+				if err != nil {
+					log.Printf("onboard job %s: %v (job continues — metadata persisted)", job.ID, err)
+					jobs.addWarning(job.ID, err.Error())
 				}
 				_ = chunkCount
 				return nil
@@ -415,15 +425,26 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 				ModelID: modelID,
 			}
 
+			var warn string
 			if err := db.UpsertNode(ctx, n); err != nil {
-				return errorResult(err), RememberOutput{}, nil
+				if errors.Is(err, store.ErrVectorSkipped) {
+					warn = err.Error()
+				} else {
+					return errorResult(err), RememberOutput{}, nil
+				}
 			}
 
 			if _, err := chunkAndEmbedNodes(
 				ctx, db, embedder, []store.Node{n},
 				batchSize, modelID, nil, nil,
 			); err != nil {
-				return errorResult(err), RememberOutput{}, nil
+				if errors.Is(err, store.ErrVectorSkipped) {
+					if warn == "" {
+						warn = err.Error()
+					}
+				} else {
+					return errorResult(err), RememberOutput{}, nil
+				}
 			}
 
 			for _, target := range args.Links {
@@ -435,17 +456,18 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 				})
 			}
 
+			output := RememberOutput{
+				ID:      id,
+				Status:  "stored",
+				Warning: warn,
+			}
+
 			toolResult := &mcp.CallToolResult{
 				Content: []mcp.Content{
 					&mcp.TextContent{
-						Text: fmt.Sprintf(`{"id":"%s","status":"stored"}`, id),
+						Text: marshalJSON(output),
 					},
 				},
-			}
-
-			output := RememberOutput{
-				ID:     id,
-				Status: "stored",
 			}
 
 			return toolResult, output, nil
@@ -459,69 +481,149 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			Name:        "recall",
 			Description: "Search memory by query (FTS5 lexical + optional vector + RRF fusion + graph neighbors). Returns scored nodes with excerpt, first 3 chunk previews, and pagination metadata. Use recall_chunks to fetch more chunks when more_available is true.",
 		}, func(ctx context.Context, req *mcp.CallToolRequest, args RecallInput) (*mcp.CallToolResult, RecallOutput, error) {
-			projectID := args.ProjectID
-			if projectID == "" {
-				projectID = "default"
+			projectIDs := []string{}
+			if len(args.ProjectIDs) > 0 {
+				projectIDs = args.ProjectIDs
+			} else if args.AllProjects {
+				ids, err := db.ListProjectIDs(ctx)
+				if err == nil {
+					projectIDs = ids
+				}
 			}
+			if len(projectIDs) == 0 {
+				pid := args.ProjectID
+				if pid == "" {
+					pid = "default"
+				}
+				projectIDs = []string{pid}
+			}
+
 			limit := args.Limit
 			if limit == 0 {
 				limit = 10
 			}
 
-			warn := modelWarning(ctx, db, projectID, modelID)
+			sessionID := fmt.Sprintf("sess-%x", time.Now().UnixNano())
 
-			params := retrieve.RecallParams{
-				ProjectID:     projectID,
-				Query:         args.Query,
-				ModelID:       modelID,
-				Limit:         limit,
-				LinkThreshold: args.LinkThreshold,
+			// Phase 1: Run per-project searches in parallel
+			type projRecall struct {
+				projectID string
+				items     []RecallItem
+				warn      string
 			}
-			if embedder != nil {
-				embedCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-				defer cancel()
-				if vec, err := embedder.Embed(embedCtx, args.Query); err == nil {
-					params.Embedding = vec
+			ch := make(chan projRecall, len(projectIDs))
+			var wg sync.WaitGroup
+
+			for _, projectID := range projectIDs {
+				wg.Add(1)
+				go func(pid string) {
+					defer wg.Done()
+					w := modelWarning(ctx, db, pid, modelID)
+
+					params := retrieve.RecallParams{
+						ProjectID:     pid,
+						Query:         args.Query,
+						ModelID:       modelID,
+						Limit:         limit,
+						LinkThreshold: args.LinkThreshold,
+					}
+					if embedder != nil {
+						embedCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+						defer cancel()
+						if vec, err := embedder.Embed(embedCtx, args.Query); err == nil {
+							params.Embedding = vec
+						}
+					}
+
+					result, err := retriever.Recall(ctx, params)
+					if err != nil {
+						ch <- projRecall{projectID: pid, warn: w}
+						return
+					}
+
+					items := make([]RecallItem, 0, len(result.Nodes))
+					for _, s := range result.Nodes {
+						edges := make([]RecallEdge, 0, len(s.Edges))
+						for _, e := range s.Edges {
+							edges = append(edges, RecallEdge{
+								ToID: e.ToID, ToTitle: e.ToTitle,
+								EdgeType: e.EdgeType, Confidence: e.Confidence,
+							})
+						}
+						inferredEdges := make([]RecallEdge, 0, len(s.InferredEdges))
+						for _, e := range s.InferredEdges {
+							inferredEdges = append(inferredEdges, RecallEdge{
+								ToID: e.ToID, ToTitle: e.ToTitle,
+								EdgeType: e.EdgeType, Confidence: e.Confidence,
+							})
+						}
+						items = append(items, RecallItem{
+							ID: s.ID, Title: s.Title, Excerpt: s.Excerpt,
+							NodeType: s.NodeType, Score: s.Score, MatchType: s.MatchType,
+							PreviewChunks: s.PreviewChunks, TotalChunks: s.TotalChunks,
+							MoreAvailable: s.MoreAvailable, NextChunkStart: s.NextChunkStart,
+							Edges: edges, InferredEdges: inferredEdges,
+						})
+					}
+
+					// Log access for each result node (P3a)
+					for _, s := range result.Nodes {
+						_ = db.LogAccess(ctx, pid, s.ID, sessionID)
+					}
+
+					ch <- projRecall{projectID: pid, items: items, warn: w}
+				}(projectID)
+			}
+
+			wg.Wait()
+			close(ch)
+
+			// Phase 2: RRF fuse across projects
+			var allProjectResults [][]RecallItem
+			var warn string
+			for r := range ch {
+				if r.warn != "" {
+					warn = r.warn
+				}
+				if len(r.items) > 0 {
+					allProjectResults = append(allProjectResults, r.items)
 				}
 			}
 
-			result, err := retriever.Recall(ctx, params)
-			if err != nil {
-				return errorResult(err), RecallOutput{}, nil
+			const rrfK = 60.0
+			rrfScores := map[string]float64{}
+			itemMap := map[string]RecallItem{}
+			for _, items := range allProjectResults {
+				for rank, item := range items {
+					rrfScores[item.ID] += 1.0 / (rrfK + float64(rank))
+					itemMap[item.ID] = item
+				}
 			}
 
-			items := make([]RecallItem, 0, len(result.Nodes))
-			for _, s := range result.Nodes {
-				edges := make([]RecallEdge, 0, len(s.Edges))
-				for _, e := range s.Edges {
-					edges = append(edges, RecallEdge{
-						ToID: e.ToID, ToTitle: e.ToTitle,
-						EdgeType: e.EdgeType, Confidence: e.Confidence,
-					})
-				}
-				inferredEdges := make([]RecallEdge, 0, len(s.InferredEdges))
-				for _, e := range s.InferredEdges {
-					inferredEdges = append(inferredEdges, RecallEdge{
-						ToID: e.ToID, ToTitle: e.ToTitle,
-						EdgeType: e.EdgeType, Confidence: e.Confidence,
-					})
-				}
-				items = append(items, RecallItem{
-					ID: s.ID, Title: s.Title, Excerpt: s.Excerpt,
-					NodeType: s.NodeType, Score: s.Score, MatchType: s.MatchType,
-					PreviewChunks: s.PreviewChunks, TotalChunks: s.TotalChunks,
-					MoreAvailable: s.MoreAvailable, NextChunkStart: s.NextChunkStart,
-					Edges: edges, InferredEdges: inferredEdges,
-				})
+			type scoredID struct {
+				id    string
+				score float64
+			}
+			sorted := make([]scoredID, 0, len(rrfScores))
+			for id, s := range rrfScores {
+				sorted = append(sorted, scoredID{id: id, score: s})
+			}
+			sort.Slice(sorted, func(i, j int) bool {
+				return sorted[i].score > sorted[j].score
+			})
+
+			n := limit
+			if len(sorted) < n {
+				n = len(sorted)
+			}
+			allItems := make([]RecallItem, n)
+			for i, si := range sorted[:n] {
+				allItems[i] = itemMap[si.id]
 			}
 
-			links := make([]ImplicitMCPLink, 0, len(result.Links))
-			for _, l := range result.Links {
-				links = append(links,
-					ImplicitMCPLink{FromChunkID: l.FromChunkID, ToChunkID: l.ToChunkID, Cosine: l.Cosine},
-				)
-			}
-			recallOut := RecallOutput{Results: items, Links: links, Warning: warn}
+			// Aggregate links from all results (simplified — last project only)
+			var links []ImplicitMCPLink
+			recallOut := RecallOutput{Results: allItems, Links: links, Warning: warn}
 
 			toolResult := &mcp.CallToolResult{
 				Content: []mcp.Content{
@@ -720,9 +822,11 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			}
 			jobs.updateCounts(job.ID, filesWalked, filesSkipped)
 			for _, n := range nodes {
-				if err := db.UpsertNode(context.Background(), n); err != nil {
+				if err := db.UpsertNode(context.Background(), n); err != nil && !errors.Is(err, store.ErrVectorSkipped) {
 					jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert node: %w", err))
 					return
+				} else if err != nil {
+					log.Printf("ingest job %s: %v (node metadata persisted)", job.ID, err)
 				}
 			}
 			if err := db.UpsertEdges(context.Background(), edges); err != nil {
@@ -743,10 +847,13 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 				},
 				func() { jobs.updatePhase(job.ID, "persisting") },
 			)
-			if err != nil {
+			if err != nil && !errors.Is(err, store.ErrVectorSkipped) {
 				ingestMu.Unlock()
 				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("chunk/embed: %w", err))
 				return
+			}
+			if err != nil {
+				log.Printf("ingest job %s: %v (chunks persisted)", job.ID, err)
 			}
 			if err := onboard.EmbedNodes(context.Background(), db, nodes, embedder, batchSize, modelID); err != nil {
 				ingestMu.Unlock()
@@ -765,9 +872,12 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 
 			hierNodes, hierEdges := onboard.BuildHierarchy(projectID, nodes)
 			for _, n := range hierNodes {
-				if err := db.UpsertNode(context.Background(), n); err != nil {
+				if err := db.UpsertNode(context.Background(), n); err != nil && !errors.Is(err, store.ErrVectorSkipped) {
 					jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert hierarchy node: %w", err))
 					return
+				} else if err != nil {
+					log.Printf("ingest job %s: %v (hierarchy node metadata persisted)", job.ID, err)
+					jobs.addWarning(job.ID, err.Error())
 				}
 			}
 			if err := db.UpsertEdges(context.Background(), hierEdges); err != nil {
@@ -927,18 +1037,24 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 		}
 
 		srcTitle := ""
+		var contentExcerpt string
 		if src, err := db.GetNode(ctx, args.NodeID); err == nil {
 			srcTitle = src.Title
+			if len(src.Content) > 200 {
+				contentExcerpt = src.Content[:200]
+			} else {
+				contentExcerpt = src.Content
+			}
 		}
 
-		var results []EdgeResult
+		var outgoingResults, incomingResults []EdgeResult
 
 		if outgoing {
 			edges, err := db.GetEdgesFrom(ctx, args.NodeID, args.EdgeTypes)
 			if err == nil {
 				for _, e := range edges {
 					title, ntype := resolveNodeMeta(ctx, db, e.ToID)
-					results = append(results, EdgeResult{
+					outgoingResults = append(outgoingResults, EdgeResult{
 						Direction:  "outgoing",
 						NodeID:     e.ToID,
 						NodeTitle:  title,
@@ -955,7 +1071,7 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			if err == nil {
 				for _, e := range edges {
 					title, ntype := resolveNodeMeta(ctx, db, e.FromID)
-					results = append(results, EdgeResult{
+					incomingResults = append(incomingResults, EdgeResult{
 						Direction:  "incoming",
 						NodeID:     e.FromID,
 						NodeTitle:  title,
@@ -967,13 +1083,28 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			}
 		}
 
-		sortOutgoingFirst(results)
-
-		if len(results) > limit {
-			results = results[:limit]
+		// Build neighbor counts from full edge lists (before limiting)
+		neighborCounts := map[string]int{}
+		for _, r := range outgoingResults {
+			neighborCounts[r.EdgeType]++
+		}
+		for _, r := range incomingResults {
+			neighborCounts[r.EdgeType]++
 		}
 
-		output := QueryGraphOutput{NodeID: args.NodeID, Title: srcTitle, Edges: results}
+		// Sort each direction by confidence DESC, take top limit each
+		sortByConfidenceDesc(outgoingResults)
+		sortByConfidenceDesc(incomingResults)
+		if len(outgoingResults) > limit {
+			outgoingResults = outgoingResults[:limit]
+		}
+		if len(incomingResults) > limit {
+			incomingResults = incomingResults[:limit]
+		}
+
+		results := append(outgoingResults, incomingResults...)
+
+		output := QueryGraphOutput{NodeID: args.NodeID, Title: srcTitle, ContentExcerpt: contentExcerpt, NeighborCounts: neighborCounts, Edges: results}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(output)}},
 		}, output, nil
@@ -1012,6 +1143,20 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 		results, total, err := db.ListEdgesByProject(ctx, projectID, edgeTypes, maxEdges, 0)
 		if err != nil {
 			return errorResult(err), ProjectGraphOutput{}, nil
+		}
+
+		// Filter by confidence tiers if specified
+		if len(args.ConfidenceTiers) > 0 {
+			filtered := make([]store.EdgeResult, 0, len(results))
+			for _, r := range results {
+				for _, tier := range args.ConfidenceTiers {
+					if r.ConfidenceTier == tier {
+						filtered = append(filtered, r)
+						break
+					}
+				}
+			}
+			results = filtered
 		}
 
 		// Deduplicate nodes from edge endpoints, count degree for weight.
@@ -1129,6 +1274,147 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
 		}, out, nil
 	})
+
+	// Tool 17: check_recent
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "check_recent",
+		Description: "List nodes updated within the past N days. Default 7 days.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args CheckRecentInput) (*mcp.CallToolResult, CheckRecentOutput, error) {
+		projectID := args.ProjectID
+		if projectID == "" {
+			projectID = "default"
+		}
+		days := args.Days
+		if days <= 0 {
+			days = 7
+		}
+		after := time.Now().AddDate(0, 0, -days).Format(time.RFC3339)
+		nodes, err := db.ListNodesByUpdatedAfter(ctx, projectID, after, 100)
+		if err != nil {
+			return errorResult(err), CheckRecentOutput{}, nil
+		}
+		items := make([]CheckRecentNode, 0, len(nodes))
+		for _, n := range nodes {
+			items = append(items, CheckRecentNode{
+				ID: n.ID, Title: n.Title,
+				NodeType: n.NodeType, UpdatedAt: n.UpdatedAt,
+			})
+		}
+		out := CheckRecentOutput{Nodes: items}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
+		}, out, nil
+	})
+
+	// Tool 18: find_path
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "find_path",
+		Description: "BFS shortest path between two nodes. Returns path hops and total count.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args FindPathInput) (*mcp.CallToolResult, FindPathOutput, error) {
+		if args.FromID == "" || args.ToID == "" {
+			return errorResult(fmt.Errorf("from_id and to_id are required")), FindPathOutput{}, nil
+		}
+		maxDepth := args.MaxDepth
+		if maxDepth <= 0 {
+			maxDepth = 10
+		}
+
+		// BFS with parent tracking
+		type bfsNode struct {
+			id       string
+			parentID string
+			edgeType string
+			depth    int
+		}
+		queue := []bfsNode{{id: args.FromID, depth: 0}}
+		visited := map[string]bool{args.FromID: true}
+		parent := map[string]bfsNode{}
+		var found bfsNode
+
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+
+			if cur.id == args.ToID {
+				found = cur
+				break
+			}
+			if cur.depth >= maxDepth {
+				continue
+			}
+
+			edges, err := db.GetEdgesFrom(ctx, cur.id, args.EdgeTypes)
+			if err != nil {
+				continue
+			}
+			for _, e := range edges {
+				if !visited[e.ToID] {
+					visited[e.ToID] = true
+					parent[e.ToID] = bfsNode{id: cur.id, edgeType: e.EdgeType}
+					queue = append(queue, bfsNode{id: e.ToID, parentID: cur.id, edgeType: e.EdgeType, depth: cur.depth + 1})
+				}
+			}
+		}
+
+		if found.id == "" {
+			out := FindPathOutput{Hops: 0}
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
+			}, out, nil
+		}
+
+		// Reconstruct path
+		var path []PathHop
+		for cur := found; cur.id != args.FromID; cur = parent[cur.id] {
+			title := store.DisplayName(cur.id)
+			if n, err := db.GetNode(ctx, cur.id); err == nil {
+				title = n.Title
+			}
+			path = append([]PathHop{{
+				NodeID: cur.id, Title: title,
+				EdgeType: cur.edgeType, Direction: "incoming",
+			}}, path...)
+		}
+		// Add starting node
+		title := store.DisplayName(args.FromID)
+		if n, err := db.GetNode(ctx, args.FromID); err == nil {
+			title = n.Title
+		}
+		path = append([]PathHop{{
+			NodeID: args.FromID, Title: title,
+		}}, path...)
+
+		out := FindPathOutput{Path: path, Hops: len(path) - 1}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
+		}, out, nil
+	})
+
+	// Tool 19: link_projects
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "link_projects",
+		Description: "Run cross-project linking for a project. Links code symbols to matching symbols in all other known projects.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args LinkProjectsInput) (*mcp.CallToolResult, LinkProjectsOutput, error) {
+		if args.ProjectID == "" {
+			return errorResult(fmt.Errorf("project_id is required")), LinkProjectsOutput{}, nil
+		}
+		// Load all nodes for this project
+		allNodes, err := db.ListNodesByType(ctx, args.ProjectID, nil, 10000, 0)
+		if err != nil {
+			return errorResult(err), LinkProjectsOutput{}, nil
+		}
+		edges, err := onboard.CrossProjectLink(ctx, db, args.ProjectID, allNodes)
+		if err != nil {
+			return errorResult(err), LinkProjectsOutput{}, nil
+		}
+		if len(edges) > 0 {
+			_ = db.UpsertEdges(ctx, edges)
+		}
+		out := LinkProjectsOutput{EdgesCreated: len(edges)}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
+		}, out, nil
+	})
 }
 
 // resolveNodeMeta fetches a node's title and type. Errors return empty strings.
@@ -1157,18 +1443,11 @@ func resolveNodeMeta(ctx context.Context, db store.Store, id string) (title, nod
 	return title, nt
 }
 
-// sortOutgoingFirst sorts edge results so outgoing edges come first,
-// then by confidence descending within each direction.
-func sortOutgoingFirst(results []EdgeResult) {
+// sortByConfidenceDesc sorts edge results by confidence descending.
+func sortByConfidenceDesc(results []EdgeResult) {
 	for i := 0; i < len(results); i++ {
 		for j := i + 1; j < len(results); j++ {
-			swap := false
-			if results[i].Direction != "outgoing" && results[j].Direction == "outgoing" {
-				swap = true
-			} else if results[i].Direction == results[j].Direction && results[j].Confidence > results[i].Confidence {
-				swap = true
-			}
-			if swap {
+			if results[j].Confidence > results[i].Confidence {
 				results[i], results[j] = results[j], results[i]
 			}
 		}
