@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ func ServeHTTP(
 	addr, authToken string,
 	batchSize int,
 	modelID string,
+	spaDir string,
 ) error {
 	jobs := newJobStore(db)
 
@@ -44,7 +46,8 @@ func ServeHTTP(
 	mux.Handle("/mcp", mcpHandler)
 
 	// Graph visualization — GET /graph/{project}
-	mux.HandleFunc("GET /graph/{project}", HandleGraphView(db))
+	mux.HandleFunc("GET /graph/{project}", HandleGraphData(db))
+	mux.HandleFunc("GET /graph/{project}/", HandleGraphSPA(spaDir))
 
 	// REST ingest — POST /ingest auto-detects adapters, same pipeline as MCP ingest tool.
 	mux.HandleFunc("POST /ingest", handleRESTIngest(db, embedder, jobs, batchSize, modelID))
@@ -111,7 +114,7 @@ func bearerMatches(r *http.Request, token string) bool {
 	return ok == len(token) && len(token) > 0
 }
 
-func HandleGraphView(db store.Store) http.HandlerFunc {
+func HandleGraphData(db store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		projectID := r.PathValue("project")
 		if projectID == "" {
@@ -225,9 +228,42 @@ func HandleGraphView(db store.Store) http.HandlerFunc {
 			return
 		}
 
-		page := strings.Replace(graphPageSource, "__DATA__", string(jsonBytes), 1)
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(page))
+		if r.URL.Query().Get("v") == "legacy" {
+			page := strings.Replace(graphPageSource, "__DATA__", string(jsonBytes), 1)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write([]byte(page))
+			return
+		}
+
+		// Redirect to SPA entry point
+		redirectURL := "/graph/" + projectID + "/"
+		if r.URL.RawQuery != "" {
+			redirectURL += "?" + r.URL.RawQuery
+		}
+		http.Redirect(w, r, redirectURL, http.StatusFound)
+	}
+}
+
+func HandleGraphSPA(spaDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		projectID := r.PathValue("project")
+		if projectID == "" {
+			projectID = "default"
+		}
+		prefix := "/graph/" + projectID + "/"
+		subpath := strings.TrimPrefix(r.URL.Path, prefix)
+
+		if subpath == "" || subpath == "/" {
+			w.Header().Set("Cache-Control", "no-cache")
+			http.ServeFile(w, r, filepath.Join(spaDir, "index.html"))
+			return
+		}
+		if strings.HasPrefix(subpath, "assets/") && !strings.Contains(subpath, "..") {
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			http.ServeFile(w, r, filepath.Join(spaDir, subpath))
+			return
+		}
+		http.NotFound(w, r)
 	}
 }
 
