@@ -24,6 +24,9 @@ function GraphView({ data }: { data: GraphData }) {
     setSearchQuery,
     setShowEdges,
     setShowProposed,
+    setEdgeOpacity,
+    setHueOffset,
+    setDensity,
     setPinnedNodeId,
   } = useForceSimulation(data)
 
@@ -34,6 +37,9 @@ function GraphView({ data }: { data: GraphData }) {
         onSearch={setSearchQuery}
         onEdgesToggle={setShowEdges}
         onProposedToggle={setShowProposed}
+        onEdgeOpacity={setEdgeOpacity}
+        onHueOffset={setHueOffset}
+        onDensity={setDensity}
       />
       <Tooltip state={tooltipState} onPin={setPinnedNodeId} />
       <Stats stats={stats} />

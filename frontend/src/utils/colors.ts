@@ -47,9 +47,10 @@ export function nodeColor(
   d: GraphNode,
   rootId: string | null,
   groupHues: Map<string, number>,
+  hueOffset: number = 0,
 ): string {
   if (isRoot(d, rootId)) return 'hsl(45, 90%, 55%)'
-  const hue = groupHues.get(d.group) ?? 220
+  const hue = ((groupHues.get(d.group) ?? 220) + hueOffset) % 360
   const lit = typeLightness[d.type] !== undefined ? typeLightness[d.type] : 48
   return `hsl(${hue}, 75%, ${lit}%)`
 }

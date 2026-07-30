@@ -301,7 +301,7 @@ func main() {
 		go func() {
 			mux := http.NewServeMux()
 			mux.HandleFunc("GET /graph/{project}", mcpserver.HandleGraphData(db))
-			mux.HandleFunc("GET /api/graph/{project}", mcpserver.HandleGraphData(db)) // SPA uses /api prefix, keep for nginx-less setups
+			mux.HandleFunc("GET /api/graph/{project}", mcpserver.HandleGraphData(db)) // SPA fetches from /api/graph/, no reverse proxy to strip prefix
 			mux.HandleFunc("GET /graph/{project}/", mcpserver.HandleGraphSPA(*spaDir))
 			log.Printf("graph server listening on %s", *graphAddr)
 			if err := http.ListenAndServe(*graphAddr, mux); err != nil {

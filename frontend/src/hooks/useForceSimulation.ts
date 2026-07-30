@@ -47,6 +47,9 @@ export interface UseForceSimulationResult {
   setSearchQuery: (q: string) => void
   setShowEdges: (show: boolean) => void
   setShowProposed: (show: boolean) => void
+  setEdgeOpacity: (v: number) => void
+  setHueOffset: (v: number) => void
+  setDensity: (v: number) => void
   setPinnedNodeId: (id: string | null) => void
   clearHover: () => void
 }
@@ -85,6 +88,9 @@ export function useForceSimulation(data: GraphData): UseForceSimulationResult {
   const searchRef = useRef('')
   const showEdgesRef = useRef(true)
   const showProposedRef = useRef(false)
+  const edgeOpacityRef = useRef(0.6)
+  const hueOffsetRef = useRef(0)
+  const densityRef = useRef(50)
   const injectedRef = useRef<SimLink[]>([])
   const proposedQueueRef = useRef<SimLink[]>([])
   const simLinksRef = useRef<SimLink[]>([])
@@ -158,6 +164,10 @@ export function useForceSimulation(data: GraphData): UseForceSimulationResult {
     const linkLayer = g.append('g')
     const nodeLayer = g.append('g')
 
+    function nodeMatch(n: SimNode, q: string) {
+      return n.title.toLowerCase().includes(q) || n.id.toLowerCase().includes(q) || n.project_id.toLowerCase().includes(q) || n.type.toLowerCase().includes(q)
+    }
+
     function updateOpacities(hovered: string | null, pinned: string | null, query: string) {
       const activeId = hovered || pinned
       const sNodes = nodeSelectionRef.current
@@ -166,7 +176,7 @@ export function useForceSimulation(data: GraphData): UseForceSimulationResult {
 
       if (!activeId) {
         if (query) {
-          sNodes.style('opacity', (n: SimNode) => (n.title || n.id).toLowerCase().includes(query) ? 1 : 0.08)
+          sNodes.style('opacity', (n: SimNode) => nodeMatch(n, query) ? 1 : 0.08)
           sLinks.style('opacity', (l: SimLink) => linkId(l).toLowerCase().includes(query) ? 0.5 : 0)
         } else {
           sNodes.style('opacity', null).attr('stroke-width', 1.5)
@@ -232,7 +242,7 @@ export function useForceSimulation(data: GraphData): UseForceSimulationResult {
       .attr('class', 'link')
       .attr('stroke', d => d.edge_type === 'contains' ? '#7ec8e3' : '#888')
       .attr('stroke-width', d => d.edge_type === 'contains' ? 1.4 : 0.8)
-      .attr('opacity', d => d.edge_type === 'contains' ? 0.8 : 0.6)
+      .attr('opacity', d => d.edge_type === 'contains' ? Math.min(1, edgeOpacityRef.current * 1.4) : edgeOpacityRef.current)
     linkSelectionRef.current = linkSel as unknown as typeof linkSelectionRef.current
 
     const nodeSel = nodeLayer
@@ -241,15 +251,36 @@ export function useForceSimulation(data: GraphData): UseForceSimulationResult {
       .join('circle')
       .attr('class', 'node')
       .attr('r', (d: SimNode) => nodeR(d, rootId))
-      .attr('fill', (d: SimNode) => nodeColor(d, rootId, groupHues))
+      .attr('fill', (d: SimNode) => nodeColor(d, rootId, groupHues, 0))
     nodeSelectionRef.current = nodeSel as unknown as typeof nodeSelectionRef.current
 
+    const drag = d3.drag<SVGCircleElement, SimNode>()
+      .on('start', function (this: SVGCircleElement, event: d3.D3DragEvent<SVGCircleElement, SimNode, SimNode>, d: SimNode) {
+        if (!event.active) sim.alphaTarget(0.3).restart()
+        d.fx = d.x
+        d.fy = d.y
+        nodeSel.attr('stroke', '#fff').attr('stroke-width', 1.5)
+      })
+      .on('drag', function (this: SVGCircleElement, event: d3.D3DragEvent<SVGCircleElement, SimNode, SimNode>, d: SimNode) {
+        d.fx = event.x
+        d.fy = event.y
+      })
+      .on('end', function (this: SVGCircleElement, event: d3.D3DragEvent<SVGCircleElement, SimNode, SimNode>, d: SimNode) {
+        if (!event.active) sim.alphaTarget(0)
+        if (!pinnedRef.current) {
+          d.fx = null
+          d.fy = null
+          nodeSel.attr('stroke', 'none').attr('stroke-width', 1.5)
+        }
+      })
+    nodeSel.call(drag)
+
     const sim = d3.forceSimulation(nodes)
-      .force('link', d3.forceLink<SimNode, SimLink>(simLinks).id(d => d.id).distance(50).strength(d => d.edge_type === 'contains' ? 0.5 : 0.1))
-      .force('charge', d3.forceManyBody<SimNode>().strength(-260).distanceMax(400))
-      .force('x', d3.forceX<SimNode>(d => computeOrbitalTarget(d, rootId, groupNames, angleStep, centerX, centerY, orbitalRadius, groupCounters).x).strength(d => d.id === rootId ? 0.6 : 0.06))
-      .force('y', d3.forceY<SimNode>(d => computeOrbitalTarget(d, rootId, groupNames, angleStep, centerX, centerY, orbitalRadius, groupCounters).y).strength(d => d.id === rootId ? 0.6 : 0.06))
-      .force('collide', d3.forceCollide<SimNode>(d => nodeR(d, rootId) + 6).strength(1))
+      .force('link', d3.forceLink<SimNode, SimLink>(simLinks).id(d => d.id).distance(90).strength(d => d.edge_type === 'contains' ? 0.3 : 0.08))
+      .force('charge', d3.forceManyBody<SimNode>().strength(-400).distanceMax(650))
+      .force('x', d3.forceX<SimNode>(d => computeOrbitalTarget(d, rootId, groupNames, angleStep, centerX, centerY, orbitalRadius, groupCounters).x).strength(d => d.id === rootId ? 0.6 : 0.04))
+      .force('y', d3.forceY<SimNode>(d => computeOrbitalTarget(d, rootId, groupNames, angleStep, centerX, centerY, orbitalRadius, groupCounters).y).strength(d => d.id === rootId ? 0.6 : 0.04))
+      .force('collide', d3.forceCollide<SimNode>(d => nodeR(d, rootId) + 10).strength(1))
       .alphaDecay(0.015)
       .alphaMin(0.01)
     simRef.current = sim
@@ -290,7 +321,7 @@ export function useForceSimulation(data: GraphData): UseForceSimulationResult {
 
     nodeSel
       .on('mouseenter', function (_event: MouseEvent, d: SimNode) {
-        if (searchRef.current && !(d.title || d.id).toLowerCase().includes(searchRef.current)) return
+        if (searchRef.current && !nodeMatch(d, searchRef.current)) return
         hoverRef.current = d.id
         updateOpacities(d.id, pinnedRef.current, searchRef.current)
         showTooltipNode(d)
@@ -371,7 +402,7 @@ export function useForceSimulation(data: GraphData): UseForceSimulationResult {
           .attr('stroke', '#e8a33d')
           .attr('stroke-width', 0.3)
           .style('display', (showProposedRef.current ? null : 'none') as any)
-          .attr('opacity', 0.08)
+          .attr('opacity', edgeOpacityRef.current * 0.15)
         proposedSelectionRef.current = pSel as unknown as typeof proposedSelectionRef.current
         drawProposedTick()
 
@@ -443,7 +474,7 @@ export function useForceSimulation(data: GraphData): UseForceSimulationResult {
         return sid === activeId || tid === activeId ? 0.7 : 0.04
       })
     } else {
-      nodeSel.style('opacity', (n: SimNode) => (n.title || n.id).toLowerCase().includes(q) ? 1 : 0.08)
+      nodeSel.style('opacity', (n: SimNode) => n.title.toLowerCase().includes(q) || n.id.toLowerCase().includes(q) || n.project_id.toLowerCase().includes(q) || n.type.toLowerCase().includes(q) ? 1 : 0.08)
       linkSel.style('opacity', (l: SimLink) => linkId(l).toLowerCase().includes(q) ? 0.5 : 0)
     }
   }, [])
@@ -460,6 +491,30 @@ export function useForceSimulation(data: GraphData): UseForceSimulationResult {
     } else if (showProposedRef.current) {
       proposedSelectionRef.current?.style('display', null as any)
     }
+  }, [])
+
+  const setEdgeOpacityFn = useCallback((v: number) => {
+    edgeOpacityRef.current = v
+    linkSelectionRef.current?.attr('opacity', (d: SimLink) => d.edge_type === 'contains' ? Math.min(1, v * 1.4) : v)
+    proposedSelectionRef.current?.attr('opacity', v * 0.15)
+  }, [])
+
+  const setHueOffsetFn = useCallback((v: number) => {
+    hueOffsetRef.current = v
+    const nodeSel = nodeSelectionRef.current
+    if (!nodeSel) return
+    const rootId = rootIdRef.current
+    const hues = groupHuesRef.current
+    nodeSel.attr('fill', (d: SimNode) => nodeColor(d, rootId, hues, v))
+  }, [])
+
+  const setDensityFn = useCallback((v: number) => {
+    densityRef.current = v
+    const sim = simRef.current
+    if (!sim) return
+    const strength = -50 - (v / 100) * 950
+    sim.force('charge', d3.forceManyBody<SimNode>().strength(strength).distanceMax(650))
+    sim.alpha(0.3).restart()
   }, [])
 
   const setShowProposedFn = useCallback((show: boolean) => {
@@ -539,6 +594,9 @@ export function useForceSimulation(data: GraphData): UseForceSimulationResult {
     setSearchQuery,
     setShowEdges: setShowEdgesFn,
     setShowProposed: setShowProposedFn,
+    setEdgeOpacity: setEdgeOpacityFn,
+    setHueOffset: setHueOffsetFn,
+    setDensity: setDensityFn,
     setPinnedNodeId,
     clearHover,
   }
