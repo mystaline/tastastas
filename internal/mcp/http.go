@@ -1,16 +1,19 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/mystaline-dev/tastastas/internal/embed"
@@ -45,8 +48,10 @@ func ServeHTTP(
 	// MCP endpoint — all MCP tools available via Streamable HTTP
 	mux.Handle("/mcp", mcpHandler)
 
-	// Graph visualization — GET /graph/{project}
+	// Graph data — both /graph and /api/graph serve same JSON.
+	// SPA fetches from /api/graph/{project}, no reverse proxy in front to strip the prefix.
 	mux.HandleFunc("GET /graph/{project}", HandleGraphData(db))
+	mux.HandleFunc("GET /api/graph/{project}", HandleGraphData(db))
 	mux.HandleFunc("GET /graph/{project}/", HandleGraphSPA(spaDir))
 
 	// REST ingest — POST /ingest auto-detects adapters, same pipeline as MCP ingest tool.
@@ -245,6 +250,13 @@ func HandleGraphData(db store.Store) http.HandlerFunc {
 }
 
 func HandleGraphSPA(spaDir string) http.HandlerFunc {
+	readFile := func(path string) ([]byte, error) {
+		if spaDir != "" {
+			return os.ReadFile(filepath.Join(spaDir, path))
+		}
+		return frontendDist.ReadFile("frontenddist/" + path)
+	}
+
 	return func(w http.ResponseWriter, r *http.Request) {
 		projectID := r.PathValue("project")
 		if projectID == "" {
@@ -253,17 +265,52 @@ func HandleGraphSPA(spaDir string) http.HandlerFunc {
 		prefix := "/graph/" + projectID + "/"
 		subpath := strings.TrimPrefix(r.URL.Path, prefix)
 
+		// SPA built with vite base: /graph/ — assets at /graph/assets/...
+		if projectID == "assets" {
+			if strings.Contains(subpath, "..") {
+				http.NotFound(w, r)
+				return
+			}
+			data, err := readFile("assets/" + subpath)
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			http.ServeContent(w, r, subpath, time.Time{}, bytes.NewReader(data))
+			return
+		}
+
 		if subpath == "" || subpath == "/" {
 			w.Header().Set("Cache-Control", "no-cache")
-			http.ServeFile(w, r, filepath.Join(spaDir, "index.html"))
+			data, err := readFile("index.html")
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			http.ServeContent(w, r, "index.html", time.Time{}, bytes.NewReader(data))
 			return
 		}
+
 		if strings.HasPrefix(subpath, "assets/") && !strings.Contains(subpath, "..") {
+			data, err := readFile(subpath)
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
 			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-			http.ServeFile(w, r, filepath.Join(spaDir, subpath))
+			http.ServeContent(w, r, subpath, time.Time{}, bytes.NewReader(data))
 			return
 		}
-		http.NotFound(w, r)
+
+		// SPA fallback — serve index.html for client-side routing
+		w.Header().Set("Cache-Control", "no-cache")
+		data, err := readFile("index.html")
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		http.ServeContent(w, r, "index.html", time.Time{}, bytes.NewReader(data))
 	}
 }
 

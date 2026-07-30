@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
-  base: './',
+  base: '/graph/',
   build: {
     target: 'es2020',
     outDir: 'dist',
@@ -11,14 +11,10 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      '/graph': {
+      '/api': {
         target: 'http://localhost:8080',
         changeOrigin: true,
-        bypass(req) {
-          if (req.headers.accept?.includes('text/html')) {
-            return '/index.html'
-          }
-        },
+        rewrite: path => path.replace(/^\/api/, ''),
       },
     },
   },

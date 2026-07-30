@@ -17,7 +17,7 @@ export function useGraphData() {
     const query = window.location.search
     const ts = Date.now()
     const cacheBuster = query ? `&_=${ts}` : `?_=${ts}`
-    fetch(`/graph/${project}${query}${cacheBuster}`, {
+    fetch(`/api/graph/${project}${query}${cacheBuster}`, {
       headers: { Accept: 'application/json' },
     })
       .then(res => {

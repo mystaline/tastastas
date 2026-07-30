@@ -20,6 +20,7 @@ $(EMBED_BIN): $(SIDECAR_SRC)
 	cp $(SIDECAR_BIN) $@
 
 tastastas: $(EMBED_BIN)
+	cp -r frontend/dist/. internal/mcp/frontenddist/ 2>/dev/null; \
 	go build -ldflags="$(ldflags)" -o tastastas ./cmd/tastastas
 
 build: frontend-build tastastas
@@ -27,7 +28,8 @@ build: frontend-build tastastas
 run: build
 	./tastastas --serve :8080 --db ~/.local/share/tastastas/memory.db --graph-addr :9292
 
-install: $(EMBED_BIN)
+install: frontend-build
+	cp -r frontend/dist/. internal/mcp/frontenddist/
 	go install -ldflags="$(ldflags)" ./cmd/tastastas
 
 test:

@@ -206,9 +206,12 @@ func main() {
 	)
 	batchSize := flag.Int("batch-size", 32, "max texts per embed batch (16 saves ~50% peak RAM, 32=throughput)")
 	authToken := flag.String("auth-token", "", "bearer token for HTTP server mode (empty = no auth)")
-	spaDir := flag.String("spa-dir", "frontend/dist", "path to built React SPA directory")
+	spaDir := flag.String("spa-dir", "", "path to built React SPA directory (empty = use embedded frontend) — also read from $TASTASTAS_SPA_DIR")
 	flag.Parse()
 
+	if *spaDir == "" {
+		*spaDir = os.Getenv("TASTASTAS_SPA_DIR")
+	}
 	if *spaDir != "" {
 		if info, err := os.Stat(*spaDir); err != nil || !info.IsDir() {
 			log.Printf("warning: --spa-dir %s not found — SPA graph page unavailable (legacy ?v=legacy still works)", *spaDir)
@@ -298,6 +301,7 @@ func main() {
 		go func() {
 			mux := http.NewServeMux()
 			mux.HandleFunc("GET /graph/{project}", mcpserver.HandleGraphData(db))
+			mux.HandleFunc("GET /api/graph/{project}", mcpserver.HandleGraphData(db)) // SPA uses /api prefix, keep for nginx-less setups
 			mux.HandleFunc("GET /graph/{project}/", mcpserver.HandleGraphSPA(*spaDir))
 			log.Printf("graph server listening on %s", *graphAddr)
 			if err := http.ListenAndServe(*graphAddr, mux); err != nil {
