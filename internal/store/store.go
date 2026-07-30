@@ -7,11 +7,36 @@ package store
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 )
 
 // ErrNotFound is returned by GetNode when the id doesn't exist.
 var ErrNotFound = errors.New("node not found")
+
+// ErrVectorSkipped wraps a non-fatal condition: node/chunk metadata was
+// persisted successfully, but its embedding vector was invalid (NaN/Inf,
+// wrong dimension, or unmarshalable) and was skipped rather than written.
+// A log line alone is not enough here — an MCP caller only ever sees the
+// tool's JSON response, never the server's stdout, so callers MUST check
+// errors.Is(err, ErrVectorSkipped) and surface it as a response warning
+// instead of silently treating a skip as full success.
+var ErrVectorSkipped = errors.New("vector skipped: invalid embedding")
+
+// HasNonFiniteFloat32 reports whether emb contains any NaN or Inf value.
+// Both persist (Upsert*) and read (GetNodeEmbeddings, blob decode) paths
+// must guard against this — a corrupt vector that reaches vec_f32() or a
+// cosine similarity computation fails loudly or silently ranks garbage,
+// depending on where it's caught.
+func HasNonFiniteFloat32(emb []float32) bool {
+	for _, v := range emb {
+		f := float64(v)
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return true
+		}
+	}
+	return false
+}
 
 // DisplayName derives a human-readable label from a node ID when the node
 // itself wasn't ingested (stdlib symbols, cross-project refs — GetNode misses).
@@ -50,27 +75,30 @@ type Node struct {
 
 // Edge is a typed, directed relation between two nodes.
 type Edge struct {
-	FromID     string
-	ToID       string
-	EdgeType   string
-	Confidence float64
+	FromID         string
+	ToID           string
+	EdgeType       string
+	Confidence     float64
+	ConfidenceTier string // EXTRACTED, INFERRED, or PROPOSED
+	Bidirectional  bool   // if true, edge is traversable in both directions
 }
 
 // EdgeResult bundles an edge with resolved metadata for both endpoints.
 // Used by project_graph for visualization payloads.
 type EdgeResult struct {
-	FromID     string  `json:"from_id"`
-	FromTitle  string  `json:"from_title"`
-	FromType   string  `json:"from_type"`
-	FromGroup  string  `json:"from_group"`
-	FromSize   int     `json:"from_size"`
-	ToID       string  `json:"to_id"`
-	ToTitle    string  `json:"to_title"`
-	ToType     string  `json:"to_type"`
-	ToGroup    string  `json:"to_group"`
-	ToSize     int     `json:"to_size"`
-	EdgeType   string  `json:"edge_type"`
-	Confidence float64 `json:"confidence"`
+	FromID         string  `json:"from_id"`
+	FromTitle      string  `json:"from_title"`
+	FromType       string  `json:"from_type"`
+	FromGroup      string  `json:"from_group"`
+	FromSize       int     `json:"from_size"`
+	ToID           string  `json:"to_id"`
+	ToTitle        string  `json:"to_title"`
+	ToType         string  `json:"to_type"`
+	ToGroup        string  `json:"to_group"`
+	ToSize         int     `json:"to_size"`
+	EdgeType       string  `json:"edge_type"`
+	Confidence     float64 `json:"confidence"`
+	ConfidenceTier string  `json:"confidence_tier,omitempty"`
 }
 
 // ScoredNode is a Node with a retrieval score attached.
@@ -101,6 +129,13 @@ type ScoredChunk struct {
 	Score float64
 }
 
+// AccessPair represents two nodes accessed together in the same session.
+type AccessPair struct {
+	NodeA string
+	NodeB string
+	Count int
+}
+
 // Store is the full persistence surface tastastas depends on.
 type Store interface {
 	UpsertNode(ctx context.Context, n Node) error
@@ -114,12 +149,24 @@ type Store interface {
 	SearchLexical(ctx context.Context, projectID, query string, limit int) ([]ScoredNode, error)
 
 	// SearchVector runs a nearest-neighbor query scoped to a project and model.
-	SearchVector(ctx context.Context, projectID string, embedding []float32, limit int, modelID string) ([]ScoredNode, error)
+	SearchVector(
+		ctx context.Context,
+		projectID string,
+		embedding []float32,
+		limit int,
+		modelID string,
+	) ([]ScoredNode, error)
 
 	// Chunk operations for unified embeddings
 	UpsertChunks(ctx context.Context, chunks []Chunk) error
 	DeleteChunksByParent(ctx context.Context, parentNodeID string, modelID string) error
-	SearchChunks(ctx context.Context, projectID string, embedding []float32, limit int, modelID string) ([]ScoredChunk, error)
+	SearchChunks(
+		ctx context.Context,
+		projectID string,
+		embedding []float32,
+		limit int,
+		modelID string,
+	) ([]ScoredChunk, error)
 
 	// GetChunksByParent returns chunks for a parent node, ordered by chunk_index.
 	GetChunksByParent(ctx context.Context, parentNodeID string, limit, offset int) ([]Chunk, error)
@@ -157,6 +204,26 @@ type Store interface {
 
 	// ListEdgesByType returns edges matching the given edge type, scoped to a project.
 	ListEdgesByType(ctx context.Context, projectID string, edgeType string, limit, offset int) ([]Edge, error)
+
+	// LogAccess records that a node was accessed in a session.
+	LogAccess(ctx context.Context, projectID, nodeID, sessionID string) error
+
+	// RecentAccesses returns node IDs accessed within the past N seconds, ordered by most recent.
+	RecentAccesses(ctx context.Context, projectID string, withinSec int) ([]string, error)
+
+	// AccessHistory returns access log entries for a node, most recent first.
+	AccessHistory(ctx context.Context, nodeID string, limit int) ([]Node, error)
+
+	// ListNodesByUpdatedAfter returns nodes updated after a given timestamp.
+	ListNodesByUpdatedAfter(ctx context.Context, projectID, after string, limit int) ([]Node, error)
+
+	// GetAccessStats returns access_count and last_accessed_at for a node.
+	GetAccessStats(ctx context.Context, nodeID string) (count int, lastAccessedAt string, err error)
+
+	// GetSessionPairs returns node pairs accessed together in the same session,
+	// counted per-session, for sessions within the past withinSec seconds.
+	// Only returns pairs seen in >= minSessions distinct sessions.
+	GetSessionPairs(ctx context.Context, withinSec int, minSessions int) ([]AccessPair, error)
 
 	// ListEdgesByProject returns all edges for a project with resolved node
 	// metadata (title, type, group) for both endpoints. Paginated.
@@ -218,6 +285,15 @@ type Store interface {
 
 	ListEmbedModels(ctx context.Context, projectID string) ([]ModelInfo, error)
 
+	// ListProjectIDs returns all known project IDs.
+	ListProjectIDs(ctx context.Context) ([]string, error)
+
+	// GetTopNodesByImportance returns the top-N nodes for a project ordered by importance DESC.
+	GetTopNodesByImportance(ctx context.Context, projectID string, limit int) ([]Node, error)
+
+	// GetNodeEmbeddings returns embeddings for the given node IDs.
+	GetNodeEmbeddings(ctx context.Context, nodeIDs []string) (map[string][]float32, error)
+
 	Close() error
 }
 
@@ -262,4 +338,3 @@ type ProjectInfo struct {
 	NodeCount int    `json:"node_count"`
 	EdgeCount int    `json:"edge_count"`
 }
-

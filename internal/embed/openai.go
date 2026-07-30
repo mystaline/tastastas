@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -173,6 +174,13 @@ func (o *OpenAIEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 			return nil, fmt.Errorf("openai: data[%d] has dim %d, expected %d",
 				i, len(d.Embedding), o.dim)
 		}
+		if j := firstNonFinite(d.Embedding); j >= 0 {
+			return nil, fmt.Errorf(
+				"openai: data[%d][%d] is NaN/Inf — provider returned a corrupt embedding, refusing to persist",
+				i,
+				j,
+			)
+		}
 		result[i] = d.Embedding
 	}
 
@@ -181,3 +189,17 @@ func (o *OpenAIEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 }
 
 func (o *OpenAIEmbedder) Close() error { return nil }
+
+// firstNonFinite returns the index of the first NaN/Inf value in emb, or -1
+// if all values are finite. A provider returning corrupt floats must never
+// reach disk — see the sqlite backfill migration that had to defensively
+// filter these out months later because this check didn't exist yet.
+func firstNonFinite(emb []float32) int {
+	for i, v := range emb {
+		f := float64(v)
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return i
+		}
+	}
+	return -1
+}

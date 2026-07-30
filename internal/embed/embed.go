@@ -147,5 +147,14 @@ func (e *Embedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32,
 	if len(out.Embeddings) != len(texts) {
 		return nil, fmt.Errorf("embed: expected %d embeddings, got %d", len(texts), len(out.Embeddings))
 	}
+	for i, v := range out.Embeddings {
+		if j := firstNonFinite(v); j >= 0 {
+			return nil, fmt.Errorf(
+				"embed: ollama data[%d][%d] is NaN/Inf — provider returned a corrupt embedding, refusing to persist",
+				i,
+				j,
+			)
+		}
+	}
 	return out.Embeddings, nil
 }
