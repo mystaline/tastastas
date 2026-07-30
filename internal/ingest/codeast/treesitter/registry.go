@@ -5,6 +5,7 @@ package treesitter
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
@@ -25,10 +26,35 @@ type Extractor interface {
 	ImportRule() *importRule
 }
 
-func Extract(projectID, sourcePath string, source []byte, langName string, ext Extractor) ([]store.Node, []store.Edge, error) {
+// CallExtractor is an optional interface for extractors that can resolve
+// call expressions (calls, member calls, new expressions).
+type CallExtractor interface {
+	CallQueries() map[string]string // call expression capture queries
+}
+
+// TypeRefExtractor is an optional interface for extractors that can emit
+// type reference edges (parameter types, return types, field types, etc.).
+type TypeRefExtractor interface {
+	TypeRefQueries() map[string]string // type annotation capture queries
+}
+
+// RawCall represents a call that could not be resolved within the same file.
+// Collected for cross-file resolution by the global linker.
+type RawCall struct {
+	CalleeName   string // normalized callee identifier
+	CallerNodeID string // node ID of the calling function/method
+	SourceFile   string // relative path
+	SourceLoc    string // line number
+	Lang         string // "typescript" | "javascript" | etc
+	IsMemberCall bool   // obj.method() vs plain func()
+	IsNewCall    bool   // new Foo()
+	Receiver     string // for member calls: the object name (empty for plain calls)
+}
+
+func Extract(projectID, sourcePath string, source []byte, langName string, ext Extractor, projectRoot string) ([]store.Node, []store.Edge, []RawCall, error) {
 	parser := sitter.NewParser()
 	if err := parser.SetLanguage(ext.Language()); err != nil {
-		return nil, nil, fmt.Errorf("ts %s: set lang: %w", langName, err)
+		return nil, nil, nil, fmt.Errorf("ts %s: set lang: %w", langName, err)
 	}
 	defer parser.Close()
 
@@ -59,7 +85,7 @@ func Extract(projectID, sourcePath string, source []byte, langName string, ext E
 		_ = label
 		q, qErr := sitter.NewQuery(ext.Language(), qs)
 		if qErr != nil {
-			return nil, nil, fmt.Errorf("ts %s: query %s: %w", langName, qs, qErr)
+			return nil, nil, nil, fmt.Errorf("ts %s: query %s: %w", langName, qs, qErr)
 		}
 
 		capNames := q.CaptureNames()
@@ -117,10 +143,11 @@ func Extract(projectID, sourcePath string, source []byte, langName string, ext E
 			})
 
 			edges = append(edges, store.Edge{
-				FromID:     moduleID,
-				ToID:       symID,
-				EdgeType:   "defines",
-				Confidence: 1.0,
+				FromID:         moduleID,
+				ToID:           symID,
+				EdgeType:       "defines",
+				Confidence:     1.0,
+				ConfidenceTier: "EXTRACTED",
 			})
 		}
 		cursor.Close()
@@ -131,6 +158,40 @@ func Extract(projectID, sourcePath string, source []byte, langName string, ext E
 	if r := ext.ImportRule(); r != nil {
 		q, qErr := sitter.NewQuery(ext.Language(), r.query)
 		if qErr == nil {
+			cursor := sitter.NewQueryCursor()
+			treeMatches := cursor.Matches(q, root, source)
+			sourceDir := filepath.Dir(sourcePath)
+			for {
+				m := treeMatches.Next()
+				if m == nil {
+					break
+				}
+				if spec := r.srcFrom(m, source); spec != "" {
+					targetID := resolveImport(spec, sourceDir, projectRoot, projectID)
+					if targetID != "" {
+						edges = append(edges, store.Edge{
+							FromID:         moduleID,
+							ToID:           targetID,
+							EdgeType:       "imports",
+							Confidence:     1.0,
+							ConfidenceTier: "EXTRACTED",
+						})
+					}
+				}
+			}
+			cursor.Close()
+			q.Close()
+		}
+	}
+
+	// ── Type reference edges ──
+	if typeRefExt, ok := ext.(TypeRefExtractor); ok {
+		for label, qs := range typeRefExt.TypeRefQueries() {
+			_ = label
+			q, qErr := sitter.NewQuery(ext.Language(), qs)
+			if qErr != nil {
+				continue
+			}
 			capNames := q.CaptureNames()
 			cursor := sitter.NewQueryCursor()
 			matches := cursor.Matches(q, root, source)
@@ -139,23 +200,36 @@ func Extract(projectID, sourcePath string, source []byte, langName string, ext E
 				if m == nil {
 					break
 				}
-				// Build a map: capture name string → node
-				for _, cap := range m.Captures {
-					idx := int(cap.Index)
-					if idx >= len(capNames) {
+				cm := buildCaptureMap(m, capNames)
+				typeIdent := cm["type"]
+				enclosing := cm["enclosing"]
+				if typeIdent == nil {
+					continue
+				}
+				typeName := typeIdent.Utf8Text(source)
+				switch langName {
+				case "typescript", "ts", "javascript", "js":
+					if isPrimitiveTS(typeName) {
 						continue
 					}
-					_ = capNames[idx]
+				case "python", "py":
+					if isPrimitivePython(typeName) {
+						continue
+					}
+				case "rust", "rs":
+					if isPrimitiveRust(typeName) {
+						continue
+					}
 				}
-				if path := r.srcFrom(m, source); path != "" {
-					parts := strings.Split(path, "/")
-					modName := parts[len(parts)-1]
-					modID := fmt.Sprintf("%s/code:package/%s", projectID, strings.TrimSuffix(modName, ".ts"))
+				if symID, ok := symMap[typeName]; ok {
+					// Same-file type reference: resolve immediately
+					_ = enclosing
 					edges = append(edges, store.Edge{
-						FromID:     moduleID,
-						ToID:       modID,
-						EdgeType:   "imports",
-						Confidence: 0.9,
+						FromID:         moduleID,
+						ToID:           symID,
+						EdgeType:       "references",
+						Confidence:     1.0,
+						ConfidenceTier: "EXTRACTED",
 					})
 				}
 			}
@@ -164,7 +238,67 @@ func Extract(projectID, sourcePath string, source []byte, langName string, ext E
 		}
 	}
 
-	return nodes, edges, nil
+	// ── Call resolution (same-file) ──
+	var rawCalls []RawCall
+	if callExt, ok := ext.(CallExtractor); ok {
+		for label, qs := range callExt.CallQueries() {
+			_ = label
+			q, qErr := sitter.NewQuery(ext.Language(), qs)
+			if qErr != nil {
+				continue
+			}
+			capNames := q.CaptureNames()
+			cursor := sitter.NewQueryCursor()
+			matches := cursor.Matches(q, root, source)
+			for {
+				m := matches.Next()
+				if m == nil {
+					break
+				}
+				cm := buildCaptureMap(m, capNames)
+
+				// Determine call type from captures
+				calleeNode := cm["callee"]
+				callNode := cm["node"]
+				memberNode := cm["member"]
+				if calleeNode == nil || callNode == nil {
+					continue
+				}
+
+				calleeName := calleeNode.Utf8Text(source)
+
+				// For same-file calls: attach to file node; linker in P2d refines caller
+				isMember := memberNode != nil
+				isNew := strings.Contains(qs, "new_expression")
+
+				if symID, ok := symMap[calleeName]; ok {
+					// Same-file: resolve immediately
+					edges = append(edges, store.Edge{
+						FromID:         moduleID, // file-level edge by default
+						ToID:           symID,
+						EdgeType:       "calls",
+						Confidence:     1.0,
+						ConfidenceTier: "EXTRACTED",
+					})
+				} else {
+					rawCalls = append(rawCalls, RawCall{
+						CalleeName:   calleeName,
+						CallerNodeID: moduleID,
+						SourceFile:   sourcePath,
+						SourceLoc:    fmt.Sprintf("%d", callNode.StartPosition().Row+1),
+						Lang:         langName,
+						IsMemberCall: isMember,
+						IsNewCall:    isNew,
+						Receiver:     "", // populated for member calls if available
+					})
+				}
+			}
+			cursor.Close()
+			q.Close()
+		}
+	}
+
+	return nodes, edges, rawCalls, nil
 }
 
 // NewForLang returns the appropriate Extractor for the given language name, or nil.
@@ -197,6 +331,21 @@ func FileExts(lang string) []string {
 	}
 }
 
+// isPrimitiveTS returns true for TS/JS built-in types that should not
+// produce reference edges.
+func isPrimitiveTS(name string) bool {
+	switch name {
+	case "string", "number", "boolean", "void", "any", "never", "unknown",
+		"null", "undefined", "bigint", "symbol", "object",
+		"Array", "Map", "Set", "Promise", "Record", "Partial", "Required",
+		"Readonly", "Pick", "Omit", "Exclude", "Extract", "NonNullable",
+		"ReturnType", "InstanceType", "ThisType", "OmitThisParameter",
+		"ThisParameterType", "typeof", "keyof":
+		return true
+	}
+	return false
+}
+
 // buildCaptureMap builds a map of capture name → node for a match.
 func buildCaptureMap(m *sitter.QueryMatch, capNames []string) map[string]*sitter.Node {
 	mc := make(map[string]*sitter.Node, len(m.Captures))
@@ -207,4 +356,27 @@ func buildCaptureMap(m *sitter.QueryMatch, capNames []string) map[string]*sitter
 		}
 	}
 	return mc
+}
+
+func isPrimitivePython(name string) bool {
+	switch name {
+	case "str", "int", "float", "bool", "list", "dict", "tuple", "set",
+		"None", "Optional", "Union", "Any", "Callable", "Iterable", "Type",
+		"bytes", "complex", "frozenset", "range", "slice", "type":
+		return true
+	}
+	return false
+}
+
+func isPrimitiveRust(name string) bool {
+	switch name {
+	case "i8", "i16", "i32", "i64", "i128", "isize",
+		"u8", "u16", "u32", "u64", "u128", "usize",
+		"f32", "f64", "bool", "char", "str",
+		"String", "Vec", "Option", "Result",
+		"HashMap", "BTreeMap", "HashSet", "BTreeSet",
+		"Box", "Rc", "Arc", "Cell", "RefCell", "Mutex":
+		return true
+	}
+	return false
 }

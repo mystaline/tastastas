@@ -46,3 +46,12 @@ func (e *PyExt) ImportRule() *importRule {
 		},
 	}
 }
+
+func (e *PyExt) TypeRefQueries() map[string]string {
+	return map[string]string{
+		"param_type":  `(function_definition parameters: (parameters (typed_parameter type: (identifier) @type))) @enclosing`,
+		"return_type": `(function_definition return_type: (identifier) @type) @enclosing`,
+		"var_type":    `(assignment type: (identifier) @type) @enclosing`,
+	}
+}
+

@@ -42,11 +42,29 @@ func (e *TSExt) ImportRule() *importRule {
 			for _, cap := range m.Captures {
 				text := cap.Node.Utf8Text(src)
 				text = strings.Trim(text, "\"'")
-				if text != "" && !strings.HasPrefix(text, ".") && !strings.HasPrefix(text, "/") {
-					return text
+				if text != "" {
+					return text // return all specifiers — registry.go handles resolution
 				}
 			}
 			return ""
 		},
+	}
+}
+
+func (e *TSExt) TypeRefQueries() map[string]string {
+	return map[string]string{
+		"param_type":   `(function_declaration parameters: (formal_parameters (required_parameter type: (type_identifier) @type))) @enclosing`,
+		"return_type":  `(function_declaration return_type: (type_identifier) @type) @enclosing`,
+		"method_param": `(method_definition parameters: (formal_parameters (required_parameter type: (type_identifier) @type))) @enclosing`,
+		"method_return": `(method_definition return_type: (type_identifier) @type) @enclosing`,
+		"var_type":     `(variable_declarator type: (type_identifier) @type) @enclosing`,
+	}
+}
+
+func (e *TSExt) CallQueries() map[string]string {
+	return map[string]string{
+		"call":        `(call_expression function: (identifier) @callee) @node`,
+		"member_call": `(call_expression function: (member_expression property: (property_identifier) @callee) @member) @node`,
+		"new_call":    `(new_expression constructor: (identifier) @callee) @node`,
 	}
 }

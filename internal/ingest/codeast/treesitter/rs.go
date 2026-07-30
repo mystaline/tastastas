@@ -13,9 +13,9 @@ func (e *RsExt) Language() *sitter.Language {
 
 func (e *RsExt) Queries() map[string]string {
 	return map[string]string{
-		"func":  `(function_item name: (identifier) @name) @node`,
+		"func":   `(function_item name: (identifier) @name) @node`,
 		"struct": `(struct_item name: (type_identifier) @name) @node`,
-		"impl":  `(impl_item name: (type_identifier) @name) @node`,
+		"impl":   `(impl_item type: (type_identifier) @name) @node`,
 	}
 }
 
@@ -44,5 +44,14 @@ func (e *RsExt) ImportRule() *importRule {
 			}
 			return ""
 		},
+	}
+}
+
+func (e *RsExt) TypeRefQueries() map[string]string {
+	return map[string]string{
+		"param_type":  `(function_item parameters: (parameters (parameter type: (identifier) @type))) @enclosing`,
+		"return_type": `(function_item return_type: (identifier) @type) @enclosing`,
+		"let_type":    `(let_declaration type: (identifier) @type) @enclosing`,
+		"field_type":  `(struct_item field_declaration type: (identifier) @type) @enclosing`,
 	}
 }
