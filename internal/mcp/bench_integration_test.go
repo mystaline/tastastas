@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -14,7 +15,7 @@ import (
 )
 
 func TestIntegrationBench(t *testing.T) {
-	dbPath := "/tmp/tastastas-bench.db"
+	dbPath := filepath.Join(os.TempDir(), "tastastas-bench.db")
 	os.Remove(dbPath)
 
 	ctx := context.Background()

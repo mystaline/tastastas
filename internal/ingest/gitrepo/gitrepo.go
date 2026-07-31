@@ -63,6 +63,7 @@ func Ingest(cfg Config) ([]store.Node, error) {
 
 		// Derive ID from relative path: ~/Workspace/foo/bar/MEMORY.md → repo/bar/memory
 		rel, _ := filepath.Rel(cfg.Root, path)
+		rel = filepath.ToSlash(rel)
 		id := pathToID(cfg.ProjectID, rel)
 
 		nodes = append(nodes, store.Node{

@@ -72,6 +72,7 @@ services:
       - "9292:9292"
     volumes:
       - tastastas-data:/data
+      - /home/deploy/workspaces:/workspaces
     command:
       - "--serve"
       - ":8080"
@@ -83,6 +84,7 @@ services:
       - "1h"
     environment:
       - TASTASTAS_OPENAI_KEY=${TASTASTAS_OPENAI_KEY:?required}
+      - TASTASTAS_WORKSPACE=/workspaces
 
 volumes:
   tastastas-data:
@@ -171,6 +173,7 @@ Heavy only during **ingest** (ONNX embedding saturates CPU, RAM spikes). Recall 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--db` | `~/.local/share/tastastas/memory.db` | SQLite path. Also `$TASTASTAS_DB`. |
+| `--workspace-dir` | `/tmp/tastastas-workspaces` | Workspace directory for git clones. Also `$TASTASTAS_WORKSPACE`. |
 
 ### Embed — general
 | Flag | Default | Description |
@@ -217,6 +220,7 @@ Heavy only during **ingest** (ONNX embedding saturates CPU, RAM spikes). Recall 
 | `TASTASTAS_SPA_DIR` | `--spa-dir` |
 | `TASTASTAS_AUTH_TOKEN` | `--auth-token` |
 | `TASTASTAS_EMBED` | `--embed-backend` (docker-compose override) |
+| `TASTASTAS_WORKSPACE` | `--workspace-dir` |
 
 ---
 
