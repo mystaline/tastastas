@@ -62,6 +62,7 @@ func Ingest(cfg Config) ([]store.Node, []store.Edge, error) {
 
 		text := string(content)
 		rel, _ := filepath.Rel(cfg.Root, path)
+		rel = filepath.ToSlash(rel)
 		fm, body := parseFrontmatter(text)
 
 		nodeType := "generic-doc"

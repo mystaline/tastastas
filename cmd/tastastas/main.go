@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -82,9 +83,8 @@ func newEmbedder(backend string, sidecarWorkers, sidecarIntraThreads, batchSize 
 
 func defaultDBPath() string {
 	// Honor $TASTASTAS_DB first, then $XDG_DATA_HOME/tastastas/memory.db,
-	// then ~/.local/share/tastastas/memory.db. Always absolute so the
-	// memory graph is cwd-independent (same DB no matter which project
-	// spawned the binary).
+	// then platform-specific default. Always absolute so the memory graph
+	// is cwd-independent (same DB no matter which project spawned the binary).
 	if v := os.Getenv("TASTASTAS_DB"); v != "" {
 		return v
 	}
@@ -94,7 +94,14 @@ func defaultDBPath() string {
 		if err != nil || home == "" {
 			return "memory.db" // last-ditch fallback (preserves old relative behavior)
 		}
-		base = filepath.Join(home, ".local", "share")
+		if runtime.GOOS == "windows" {
+			base = os.Getenv("LOCALAPPDATA")
+			if base == "" {
+				base = filepath.Join(home, "AppData", "Local")
+			}
+		} else {
+			base = filepath.Join(home, ".local", "share")
+		}
 	}
 	return filepath.Join(base, "tastastas", "memory.db")
 }
@@ -109,53 +116,21 @@ func isRemoteDSN(dsn string) bool {
 		strings.HasPrefix(dsn, "https://")
 }
 
+// expandTilde expands a leading ~/ or ~\ to the user's home directory.
+// MCP clients and Windows shells don't expand tilde, so the binary does.
+func expandTilde(p string) string {
+	if strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			return filepath.Join(home, p[2:])
+		}
+	}
+	return p
+}
+
 func main() {
 	// Version probe — before any flag parsing
 	if len(os.Args) > 1 && (os.Args[1] == "-v" || os.Args[1] == "--version") {
 		fmt.Println(mcpserver.Version)
-		return
-	}
-
-	// Subcommand: update — run pending migrations then exit.
-	if len(os.Args) > 1 && os.Args[1] == "update" {
-		updateCmd := flag.NewFlagSet("update", flag.ExitOnError)
-		dbPath := updateCmd.String("db", defaultDBPath(), "path to SQLite database file")
-		embedDim := updateCmd.Int("embed-dim", 0, "embedding vector dimension")
-		embedBackend := updateCmd.String("embed-backend", "sidecar", "embedder backend")
-		updateCmd.Parse(os.Args[2:])
-
-		if strings.HasPrefix(*dbPath, "~/") {
-			home, err := os.UserHomeDir()
-			if err == nil {
-				*dbPath = filepath.Join(home, (*dbPath)[2:])
-			}
-		}
-
-		if *embedDim <= 0 {
-			switch *embedBackend {
-			case "openai":
-				*embedDim = 1536
-			case "ollama":
-				*embedDim = 768
-			default:
-				*embedDim = 384
-			}
-		}
-		if !isRemoteDSN(*dbPath) {
-			ensureDBDir(*dbPath)
-		}
-		if isRemoteDSN(*dbPath) {
-			_, err := libsqlstore.Open(context.Background(), *dbPath, *embedDim)
-			if err != nil {
-				log.Fatalf("update: open store: %v", err)
-			}
-			return
-		}
-		_, err := sqlitestore.Open(context.Background(), *dbPath, *embedDim)
-		if err != nil {
-			log.Fatalf("update: open store: %v", err)
-		}
-		log.Println("update complete")
 		return
 	}
 
@@ -168,7 +143,7 @@ func main() {
 	dbPath := flag.String(
 		"db",
 		defaultDBPath(),
-		"path to SQLite database file (default: $XDG_DATA_HOME/tastastas/memory.db — cwd-independent so all projects share one source of truth)",
+		"path to SQLite database file (default: platform data dir — $XDG_DATA_HOME on Linux, %LOCALAPPDATA% on Windows — cwd-independent so all projects share one source of truth)",
 	)
 	embedDim := flag.Int(
 		"embed-dim",
@@ -226,7 +201,7 @@ func main() {
 	workspaceDir := flag.String(
 		"workspace-dir",
 		"",
-		"workspace directory for git clones (empty = use $TASTASTAS_WORKSPACE or /tmp/tastastas-workspaces)",
+		"workspace directory for git clones (empty = use $TASTASTAS_WORKSPACE or <TMPDIR>/tastastas-workspaces)",
 	)
 	embedMaxContent := flag.Int(
 		"embed-max-content",
@@ -242,8 +217,9 @@ func main() {
 		*workspaceDir = os.Getenv("TASTASTAS_WORKSPACE")
 	}
 	if *workspaceDir == "" {
-		*workspaceDir = "/tmp/tastastas-workspaces"
+		*workspaceDir = filepath.Join(os.TempDir(), "tastastas-workspaces")
 	}
+	*spaDir = expandTilde(*spaDir)
 	if *spaDir != "" {
 		if info, err := os.Stat(*spaDir); err != nil || !info.IsDir() {
 			log.Printf(
@@ -257,14 +233,9 @@ func main() {
 		*openaiKey = os.Getenv("TASTASTAS_OPENAI_KEY")
 	}
 
-	// Expand ~/ in dbPath — MCP clients spawn without shell, so tilde
+	// Expand ~ in dbPath — MCP clients spawn without shell, so tilde
 	// isn't expanded by the OS.
-	if strings.HasPrefix(*dbPath, "~/") {
-		home, err := os.UserHomeDir()
-		if err == nil {
-			*dbPath = filepath.Join(home, (*dbPath)[2:])
-		}
-	}
+	*dbPath = expandTilde(*dbPath)
 
 	// Ensure DB directory exists (for local SQLite, not remote DSN).
 	if !isRemoteDSN(*dbPath) {

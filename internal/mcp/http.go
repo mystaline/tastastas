@@ -354,6 +354,7 @@ func handleRESTIngest(
 			http.Error(w, `{"error":"root is required"}`, http.StatusBadRequest)
 			return
 		}
+		root = normalizePath(root)
 		if req.Ref != "" {
 			log.Printf("ingest: project=%s ref=%s root=%s", projectID, req.Ref, root)
 		}

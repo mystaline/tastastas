@@ -620,9 +620,9 @@ func resolveGoFilePath(pkg *packages.Package, fn *types.Func, root string) strin
 			if fnDecl, ok := decl.(*ast.FuncDecl); ok && fnDecl.Name.Name == fn.Name() && pkg.Fset != nil {
 				if f := pkg.Fset.Position(fnDecl.Pos()).Filename; f != "" {
 					if rel, err := filepath.Rel(root, f); err == nil {
-						return rel
+						return filepath.ToSlash(rel)
 					}
-					return f
+					return filepath.ToSlash(f)
 				}
 			}
 		}
@@ -690,6 +690,7 @@ func (c *CodeastIngestor) ingestTreeSitterWithCalls(
 			return err
 		}
 		rel, _ := filepath.Rel(c.cfg.Root, path)
+		rel = filepath.ToSlash(rel)
 		nodes, edges, rc, err := treesitter.Extract(c.cfg.ProjectID, rel, source, lang, ext, c.cfg.Root)
 		if err != nil {
 			return err

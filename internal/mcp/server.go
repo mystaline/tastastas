@@ -69,6 +69,17 @@ func resolveRef(cwd, explicitRef string) (string, error) {
 	return ref, nil
 }
 
+// normalizePath expands a leading ~/ or ~\ to the user's home directory.
+// MCP clients pass paths verbatim (no shell), so tilde wouldn't resolve.
+func normalizePath(p string) string {
+	if strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			return filepath.Join(home, p[2:])
+		}
+	}
+	return p
+}
+
 func NewServer(db store.Store, embedder embed.EmbedderBackend, batchSize int, modelID string, workspaceDir string) *mcp.Server {
 	srv := mcp.NewServer(
 		&mcp.Implementation{
@@ -155,6 +166,7 @@ Rules:
 				return errorResult(err), OnboardOutput{}, nil
 			}
 		}
+		cwd = normalizePath(cwd)
 
 		ref, refErr := resolveRef(cwd, args.Ref)
 		if refErr != nil {
@@ -642,6 +654,7 @@ Rules:
 				return errorResult(err), IngestOutput{}, nil
 			}
 		}
+		cwd = normalizePath(cwd)
 
 		if projectID == "" {
 			// Fallback to .memoryrc.yaml project_id if available
