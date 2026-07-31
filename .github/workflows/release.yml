@@ -2,7 +2,7 @@ name: release
 
 # Covers all delivery methods from DEPLOYMENT.md:
 #   1. All-in-one binary (sidecar + frontend + Go) — matrix of 4 platforms
-#   2. Go+SPA binary (no sidecar) — wider matrix, CGO_ENABLED=0, pure-Go SQLite
+#   2. Go+SPA binary (no sidecar) — wider matrix, static musl via zig (tree-sitter needs cgo)
 #   3. Docker image — push to ghcr.io with semver + latest tags
 #
 # Triggered by:
@@ -51,6 +51,16 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
       - run: go test ./...
+      - run: go vet ./...
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - name: Trivy fs scan (go.mod + frontend lockfiles)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"
 
       - uses: actions/setup-node@v4
         with:
@@ -151,16 +161,20 @@ jobs:
           - os: ubuntu-latest
             goos: linux
             goarch: amd64
+            cc: zig cc -target x86_64-linux-musl
           - os: ubuntu-24.04-arm
             goos: linux
             goarch: arm64
+            cc: zig cc -target aarch64-linux-musl
           - os: ubuntu-latest
             goos: linux
             goarch: arm
             goarm: "7"
+            cc: zig cc -target arm-linux-musleabihf
           - os: ubuntu-latest
             goos: linux
             goarch: "386"
+            cc: zig cc -target x86-linux-musl
           - os: macos-latest
             goos: darwin
             goarch: amd64
@@ -170,9 +184,6 @@ jobs:
           - os: windows-latest
             goos: windows
             goarch: amd64
-          - os: windows-latest
-            goos: windows
-            goarch: "386"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -183,13 +194,18 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
+      - name: Install zig (cross C compiler for static musl builds)
+        if: matrix.cc != ''
+        uses: ziglang/setup-zig@v2
+
       - name: Build tastastas binary (no sidecar)
         shell: bash
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
-          CGO_ENABLED: "0"
+          CGO_ENABLED: "1"
+          CC: ${{ matrix.cc }}
         run: |
           suffix=""
           [ "${{ matrix.goos }}" = "windows" ] && suffix=".exe"
@@ -222,26 +238,30 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Prepare Docker tags
-        id: docker_tags
-        run: |
-          tag="${{ needs.test.outputs.tag }}"
-          delimiter="DOCKER_TAGS_EOF"
-          echo "tags<<$delimiter" >> "$GITHUB_OUTPUT"
-          echo "${{ env.REGISTRY }}/${{ github.repository }}:$tag" >> "$GITHUB_OUTPUT"
-          echo "${{ env.REGISTRY }}/${{ github.repository }}:latest" >> "$GITHUB_OUTPUT"
-          ver="${tag#v}"
-          major="${ver%%.*}"
-          rest="${ver#*.}"
-          minor="${rest%%.*}"
-          echo "${{ env.REGISTRY }}/${{ github.repository }}:$major.$minor" >> "$GITHUB_OUTPUT"
-          echo "$delimiter" >> "$GITHUB_OUTPUT"
-
-      - name: Build and push
+      - name: Build image
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: ${{ needs.test.outputs.is_release == 'true' }}
-          tags: ${{ steps.docker_tags.outputs.tags }}
+          push: false
+          load: true
+          tags: ${{ env.REGISTRY }}/${{ github.repository }}:scan
           labels: |
             org.opencontainers.image.version=${{ needs.test.outputs.tag }}
+
+      - name: Trivy image scan (fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository }}:scan
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+      - name: Push image (after scan passes)
+        if: needs.test.outputs.is_release == 'true'
+        run: |
+          img="${{ env.REGISTRY }}/${{ github.repository }}"
+          ver="${{ needs.test.outputs.tag }}"; ver="${ver#v}"
+          major="${ver%%.*}"; rest="${ver#*.}"; minor="${rest%%.*}"
+          for t in "${{ needs.test.outputs.tag }}" latest "$major.$minor"; do
+            docker tag "$img:scan" "$img:$t"
+            docker push "$img:$t"
+          done

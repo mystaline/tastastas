@@ -2,6 +2,10 @@ services:
   tastastas:
     image: ${TASTASTAS_IMAGE:-ghcr.io/mystaline/tastastas:latest}
     restart: unless-stopped
+    read_only: true
+    tmpfs: ["/tmp"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
     ports:
       - "${HTTP_PORT:-8080}:8080"
       - "${GRAPH_PORT:-9292}:9292"
@@ -19,7 +23,7 @@ services:
       - "--openai-model"
       - "${TASTASTAS_OPENAI_MODEL:-nvidia/nemotron-3-embed-1b:free}"
       - "--graph-addr"
-      - ":9292"
+      - "127.0.0.1:9292"
       - "--consolidate-interval"
       - "${TASTASTAS_CONSOLIDATE:-1h}"
     environment:
