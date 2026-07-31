@@ -1,30 +1,23 @@
 services:
   tastastas:
-    build: .
+    image: ${TASTASTAS_IMAGE:-ghcr.io/mystaline-dev/tastastas:latest}
     restart: unless-stopped
     ports:
       - "${HTTP_PORT:-8080}:8080"
       - "${GRAPH_PORT:-9292}:9292"
     volumes:
       - tastastas-data:/data
-    # Uncomment below to override embedded frontend with local build:
-    # run `cd frontend && npm ci && npm run build` first
-    #   - ./frontend/dist:/app/spa
-    # environment:
-    #   - TASTASTAS_SPA_DIR=/app/spa
-    # Embed backend override: set TASTASTAS_EMBED=openai to use OpenAI,
-    # TASTASTAS_EMBED=ollama for Ollama (needs separate ollama service).
-    # Default "none" = lexical-only (FTS5, no vector search).
-    #
-    # See DEPLOYMENT.md for flags, hardware tuning, and a ready-made
-    # production compose using a pushed image (docker-compose.prod.yml).
     command:
       - "--serve"
       - ":8080"
       - "--db"
       - "/data/memory.db"
       - "--embed-backend"
-      - "${TASTASTAS_EMBED:-none}"
+      - "openai"
+      - "--openai-base-url"
+      - "${TASTASTAS_OPENAI_BASE_URL:-https://openrouter.ai/api/v1}"
+      - "--openai-model"
+      - "${TASTASTAS_OPENAI_MODEL:-nvidia/nemotron-3-embed-1b:free}"
       - "--graph-addr"
       - ":9292"
       - "--consolidate-interval"
