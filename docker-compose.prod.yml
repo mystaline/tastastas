@@ -8,7 +8,7 @@ services:
     cap_drop: [ALL]
     ports:
       - "${HTTP_PORT:-8080}:8080"
-      - "${GRAPH_PORT:-9292}:9292"
+      - "127.0.0.1:${GRAPH_PORT:-9292}:9292"
     volumes:
       - tastastas-data:/data
     command:
@@ -23,7 +23,7 @@ services:
       - "--openai-model"
       - "${TASTASTAS_OPENAI_MODEL:-nvidia/nemotron-3-embed-1b:free}"
       - "--graph-addr"
-      - "127.0.0.1:9292"
+      - ":9292"
       - "--consolidate-interval"
       - "${TASTASTAS_CONSOLIDATE:-1h}"
     environment:
