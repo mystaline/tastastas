@@ -213,7 +213,7 @@ Embeds use API probes to auto-detect dimension — no `--embed-dim` flag needed 
 
 | Group | Tool | What it does | Embedder needed? | LLM needed? |
 |-------|------|-------------|-----------------|------------|
-| **Session start** | `init` | Capability overview — call first every session | No | No |
+| **Session start** | `init` | Capability overview + onboarded project list — call first every session | No | No |
 | | | | | |
 | **Store / Delete** | `remember` | Store/update a fact | No | No |
 | | `forget` | Delete node by ID | No | No |
@@ -260,7 +260,7 @@ Runs full pipeline: auto-detect adapters → chunk → embed → hierarchy → T
 
 ```
 Request:
-{ "root": "/path/to/repo", "project_id": "my-project" }
+{ "root": "/path/to/repo", "project_id": "my-project", "ref": "main" }
 
 → 202  {"job_id":"<ulid>","status":"running"}
 → 400  {"error":"root is required"}          — missing root
@@ -306,10 +306,10 @@ Three adapters. Point one at a folder:
 ```bash
 # From curl — httpie or HTTP mode
 curl -X POST localhost:8080/ingest \
-  -d '{"cwd": "/path/to/docs", "project_id": "my-project"}'
+  -d '{"root": "/path/to/docs", "project_id": "my-project", "ref": "main"}'
 
 # From MCP client
-ingest project_id=my-project cwd=/path/to/docs
+ingest project_id=my-project cwd=/path/to/docs ref=main
 ```
 
 `.memoryrc.yaml` example (optional, only needed for typed cross-linking):
@@ -341,7 +341,7 @@ jobs:
       - name: Update tastastas memory
         run: |
           curl -X POST http://your-server:8080/ingest \
-            -d '{"root": "$PWD", "project_id": "my-project"}'
+            -d '{"root": "$PWD", "project_id": "my-project", "ref": "main"}'
 ```
 
 Ingest is idempotent — unchanged files keep their existing chunks and embeddings (content-hash skip). Only changed files are re-processed.
