@@ -24,9 +24,9 @@ import (
 	_ "modernc.org/sqlite/vec"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/mystaline-dev/tastastas/internal/embed"
-	mcpserver "github.com/mystaline-dev/tastastas/internal/mcp"
-	sqlitestore "github.com/mystaline-dev/tastastas/internal/store/sqlite"
+	"github.com/mystaline/tastastas/internal/embed"
+	mcpserver "github.com/mystaline/tastastas/internal/mcp"
+	sqlitestore "github.com/mystaline/tastastas/internal/store/sqlite"
 )
 
 // startHTTPServer boots the real ServeHTTP on a free localhost port (picked

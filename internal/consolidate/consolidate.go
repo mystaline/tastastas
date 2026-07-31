@@ -8,7 +8,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/mystaline-dev/tastastas/internal/store"
+	"github.com/mystaline/tastastas/internal/store"
 )
 
 // Run scans access_log for session-based co-occurrence and upserts

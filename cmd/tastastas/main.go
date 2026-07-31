@@ -23,13 +23,13 @@ import (
 	_ "turso.tech/database/tursogo"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/mystaline-dev/tastastas/internal/consolidate"
-	"github.com/mystaline-dev/tastastas/internal/embed"
-	mcpserver "github.com/mystaline-dev/tastastas/internal/mcp"
-	_ "github.com/mystaline-dev/tastastas/internal/onboard"
-	"github.com/mystaline-dev/tastastas/internal/store"
-	libsqlstore "github.com/mystaline-dev/tastastas/internal/store/libsql"
-	sqlitestore "github.com/mystaline-dev/tastastas/internal/store/sqlite"
+	"github.com/mystaline/tastastas/internal/consolidate"
+	"github.com/mystaline/tastastas/internal/embed"
+	mcpserver "github.com/mystaline/tastastas/internal/mcp"
+	_ "github.com/mystaline/tastastas/internal/onboard"
+	"github.com/mystaline/tastastas/internal/store"
+	libsqlstore "github.com/mystaline/tastastas/internal/store/libsql"
+	sqlitestore "github.com/mystaline/tastastas/internal/store/sqlite"
 )
 
 // newEmbedder picks an embedding backend based on --embed-backend:
@@ -72,9 +72,9 @@ func newEmbedder(backend string, sidecarWorkers, sidecarIntraThreads, batchSize 
 		return embed.NewOpenAI(openaiKey, openaiModel, openaiBaseURL, embedDim, batchSize, maxContentBytes)
 	default:
 		return embed.New(embed.Config{
-			OllamaURL:      ollamaURL,
-			Model:          ollamaModel,
-			MaxBatchSize:   batchSize,
+			OllamaURL:       ollamaURL,
+			Model:           ollamaModel,
+			MaxBatchSize:    batchSize,
 			MaxContentBytes: maxContentBytes,
 		})
 	}

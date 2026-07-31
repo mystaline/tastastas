@@ -41,13 +41,13 @@ Triggered by `tag-release.yml` (`workflow_dispatch` + `tag`) or by pushing a `v*
 | `test` | Go tests + frontend build | Gate |
 | `binary-with-sidecar` | Per-platform all-in-one binary | `make all` (§1) |
 | `go-spa-binary` | Multi-platform Go+SPA binary, no sidecar | `make build` (§2) |
-| `docker-image` | `ghcr.io/mystaline-dev/tastastas:{ver,latest}` | `docker pull` (§3) |
+| `docker-image` | `ghcr.io/mystaline/tastastas:{ver,latest}` | `docker pull` (§3) |
 
 `workflow_dispatch` on release.yml without `tag` = dry-run (builds but no push/upload).
 
 ## Docker image
 
-Published to `ghcr.io/mystaline-dev/tastastas` with tags:
+Published to `ghcr.io/mystaline/tastastas` with tags:
 - `vX.Y.Z` (semver)
 - `X.Y` (major.minor)
 - `latest`

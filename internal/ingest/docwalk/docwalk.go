@@ -21,7 +21,7 @@ import (
 	"github.com/bmatcuk/doublestar/v4"
 	"github.com/goccy/go-yaml"
 
-	"github.com/mystaline-dev/tastastas/internal/store"
+	"github.com/mystaline/tastastas/internal/store"
 )
 
 // Mapping maps files matching PathGlob to NodeType, optionally capturing a
@@ -218,6 +218,7 @@ func Ingest(root string, cfg Config) ([]store.Node, []store.Edge, int, int, erro
 	edges := crossLink(featureIndex)
 	return nodes, edges, filesWalked, filesSkipped, nil
 }
+
 // classify finds the first mapping whose PathGlob matches rel, returns its
 // node type and (if GroupBy set) the captured "feature" slug.
 func classify(rel string, mappings []Mapping) (nodeType, feature string, matched bool) {

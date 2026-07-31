@@ -8,7 +8,7 @@ import (
 	_ "modernc.org/sqlite"
 	_ "modernc.org/sqlite/vec"
 
-	"github.com/mystaline-dev/tastastas/internal/store"
+	"github.com/mystaline/tastastas/internal/store"
 )
 
 func TestDeleteNode(t *testing.T) {

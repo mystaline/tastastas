@@ -7,13 +7,13 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/mystaline-dev/tastastas/internal/store"
+	"github.com/mystaline/tastastas/internal/store"
 )
 
 var (
-	inlineLinkRe  = regexp.MustCompile(`\[([^\]]*)\]\(([^)]+)\)`)
-	wikiLinkRe    = regexp.MustCompile(`\[\[([^\]]+)\]\]`)
-	refLinkRe     = regexp.MustCompile(`(?m)^\[([^\]]+)\]:\s*(\S+)`)
+	inlineLinkRe = regexp.MustCompile(`\[([^\]]*)\]\(([^)]+)\)`)
+	wikiLinkRe   = regexp.MustCompile(`\[\[([^\]]+)\]\]`)
+	refLinkRe    = regexp.MustCompile(`(?m)^\[([^\]]+)\]:\s*(\S+)`)
 )
 
 // ExtractMarkdownLinks parses .md files in root and creates references edges

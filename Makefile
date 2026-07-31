@@ -2,7 +2,7 @@
 .PHONY: all sidecar tastastas build run install test clean frontend-build
 
 version := $(shell git describe --tags --dirty=-dirty 2>/dev/null || echo "dev")
-ldflags := -X github.com/mystaline-dev/tastastas/internal/mcp.Version=$(version)
+ldflags := -X github.com/mystaline/tastastas/internal/mcp.Version=$(version)
 
 SIDECAR_SRC := sidecar/src/main.rs sidecar/Cargo.toml
 SIDECAR_BIN := sidecar/target/release/tastastas-embed

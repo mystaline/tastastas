@@ -13,8 +13,8 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/mystaline-dev/tastastas/internal/ingest/codeast/treesitter"
-	"github.com/mystaline-dev/tastastas/internal/store"
+	"github.com/mystaline/tastastas/internal/ingest/codeast/treesitter"
+	"github.com/mystaline/tastastas/internal/store"
 	"golang.org/x/tools/go/packages"
 )
 

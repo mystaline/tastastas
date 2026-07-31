@@ -18,7 +18,7 @@ import (
 
 	"strings"
 
-	"github.com/mystaline-dev/tastastas/internal/store"
+	"github.com/mystaline/tastastas/internal/store"
 )
 
 // Edge type tiers for enrichNode edge filtering.
@@ -108,7 +108,7 @@ type RecallParams struct {
 	ProjectID string
 	Query     string
 	Embedding []float32 // optional; nil = lexical-only mode
-	ModelID   string   // filter vectors by model; "" = no filter (legacy)
+	ModelID   string    // filter vectors by model; "" = no filter (legacy)
 	Limit     int
 
 	// LinkThreshold overrides Config.CrossSourceThreshold when > 0.

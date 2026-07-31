@@ -2,7 +2,7 @@
 package mcp
 
 import (
-	"github.com/mystaline-dev/tastastas/internal/store"
+	"github.com/mystaline/tastastas/internal/store"
 )
 
 // --- Input/Output types (Go types auto-generate MCP JSON schema) ---
@@ -29,7 +29,7 @@ type RememberOutput struct {
 
 type RecallInput struct {
 	ProjectID     string   `json:"project_id,omitempty"`
-	ProjectIDs    []string `json:"project_ids,omitempty"`   // explicit multi-project filter
+	ProjectIDs    []string `json:"project_ids,omitempty"` // explicit multi-project filter
 	Query         string   `json:"query"`
 	Limit         int      `json:"limit,omitempty"`
 	LinkThreshold float64  `json:"link_threshold,omitempty"` // override default 0.75
@@ -256,11 +256,11 @@ type QueryGraphInput struct {
 }
 
 type QueryGraphOutput struct {
-	NodeID          string         `json:"node_id"`
-	Title           string         `json:"title"`
-	ContentExcerpt  string         `json:"content_excerpt,omitempty"`
-	NeighborCounts  map[string]int `json:"neighbor_counts,omitempty"`
-	Edges           []EdgeResult   `json:"edges"`
+	NodeID         string         `json:"node_id"`
+	Title          string         `json:"title"`
+	ContentExcerpt string         `json:"content_excerpt,omitempty"`
+	NeighborCounts map[string]int `json:"neighbor_counts,omitempty"`
+	Edges          []EdgeResult   `json:"edges"`
 }
 
 type EdgeResult struct {
@@ -273,9 +273,9 @@ type EdgeResult struct {
 }
 
 type ProjectGraphInput struct {
-	ProjectID      string   `json:"project_id,omitempty"`
-	MaxEdges       int      `json:"max_edges,omitempty"`  // default 5000
-	EdgeTypes      []string `json:"edge_types,omitempty"` // empty = all non-proposed types
+	ProjectID       string   `json:"project_id,omitempty"`
+	MaxEdges        int      `json:"max_edges,omitempty"`  // default 5000
+	EdgeTypes       []string `json:"edge_types,omitempty"` // empty = all non-proposed types
 	ConfidenceTiers []string `json:"confidence_tiers,omitempty"`
 }
 

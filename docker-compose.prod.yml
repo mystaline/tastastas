@@ -1,6 +1,6 @@
 services:
   tastastas:
-    image: ${TASTASTAS_IMAGE:-ghcr.io/mystaline-dev/tastastas:latest}
+    image: ${TASTASTAS_IMAGE:-ghcr.io/mystaline/tastastas:latest}
     restart: unless-stopped
     ports:
       - "${HTTP_PORT:-8080}:8080"

@@ -16,7 +16,7 @@ import (
 	"sort"
 	"testing"
 
-	mcpserver "github.com/mystaline-dev/tastastas/internal/mcp"
+	mcpserver "github.com/mystaline/tastastas/internal/mcp"
 )
 
 // expectedWireShapes maps each MCP tool name to the exact JSON field names
@@ -29,7 +29,7 @@ var expectedWireShapes = map[string][]string{
 	"forget":               {"status"},
 	"link":                 {"status"},
 	"check_impact":         {"stale_nodes"},
-	"onboard_check":       {"chunk_count", "edge_count", "edge_type_counts", "has_chunks", "has_conventions", "has_edges", "has_embeddings", "has_nodes", "node_count", "stale_count", "vec_count"},
+	"onboard_check":        {"chunk_count", "edge_count", "edge_type_counts", "has_chunks", "has_conventions", "has_edges", "has_embeddings", "has_nodes", "node_count", "stale_count", "vec_count"},
 	"extract_and_remember": {"facts"},
 	"ingest":               {"auto_linked", "chunks_created", "conventions_inferred", "edges_created", "job_id", "nodes_ingested", "proposals_queued", "status"},
 	"query_graph":          {"content_excerpt", "edges", "neighbor_counts", "node_id", "title"},
@@ -82,7 +82,7 @@ func TestOutputWireContract(t *testing.T) {
 		"forget":               reflect.TypeOf(mcpserver.ForgetOutput{}),
 		"link":                 reflect.TypeOf(mcpserver.LinkOutput{}),
 		"check_impact":         reflect.TypeOf(mcpserver.CheckImpactOutput{}),
-		"onboard_check":       reflect.TypeOf(mcpserver.OnboardCheckOutput{}),
+		"onboard_check":        reflect.TypeOf(mcpserver.OnboardCheckOutput{}),
 		"extract_and_remember": reflect.TypeOf(mcpserver.ExtractAndRememberOutput{}),
 		"ingest":               reflect.TypeOf(mcpserver.IngestOutput{}),
 		"query_graph":          reflect.TypeOf(mcpserver.QueryGraphOutput{}),

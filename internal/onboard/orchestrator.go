@@ -20,15 +20,15 @@ import (
 	golang "github.com/tree-sitter/tree-sitter-go/bindings/go"
 	ts "github.com/tree-sitter/tree-sitter-typescript/bindings/go"
 
-	"github.com/mystaline-dev/tastastas/internal/chunker"
-	"github.com/mystaline-dev/tastastas/internal/embed"
-	"github.com/mystaline-dev/tastastas/internal/ingest/codeast"
-	"github.com/mystaline-dev/tastastas/internal/ingest/codeast/treesitter"
-	"github.com/mystaline-dev/tastastas/internal/ingest/docwalk"
-	"github.com/mystaline-dev/tastastas/internal/ingest/gitrepo"
-	"github.com/mystaline-dev/tastastas/internal/ingest/markdownglob"
-	"github.com/mystaline-dev/tastastas/internal/ingest/obsidian"
-	"github.com/mystaline-dev/tastastas/internal/store"
+	"github.com/mystaline/tastastas/internal/chunker"
+	"github.com/mystaline/tastastas/internal/embed"
+	"github.com/mystaline/tastastas/internal/ingest/codeast"
+	"github.com/mystaline/tastastas/internal/ingest/codeast/treesitter"
+	"github.com/mystaline/tastastas/internal/ingest/docwalk"
+	"github.com/mystaline/tastastas/internal/ingest/gitrepo"
+	"github.com/mystaline/tastastas/internal/ingest/markdownglob"
+	"github.com/mystaline/tastastas/internal/ingest/obsidian"
+	"github.com/mystaline/tastastas/internal/store"
 )
 
 // ModuleEntry describes a detected module root and its metadata.

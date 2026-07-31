@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/mystaline/tastastas/internal/store"
 	sitter "github.com/tree-sitter/go-tree-sitter"
-	"github.com/mystaline-dev/tastastas/internal/store"
 )
 
 const maxDeclLen = 1 << 30 // effectively unlimited — full body stored in DB, truncated in-memory in caller

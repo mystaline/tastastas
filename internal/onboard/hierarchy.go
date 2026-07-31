@@ -4,7 +4,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/mystaline-dev/tastastas/internal/store"
+	"github.com/mystaline/tastastas/internal/store"
 )
 
 // dirNode tracks a candidate directory during tree-building: its prefix

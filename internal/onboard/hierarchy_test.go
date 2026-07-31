@@ -3,7 +3,7 @@ package onboard
 import (
 	"testing"
 
-	"github.com/mystaline-dev/tastastas/internal/store"
+	"github.com/mystaline/tastastas/internal/store"
 )
 
 func TestBuildHierarchy_FlatDocProject(t *testing.T) {

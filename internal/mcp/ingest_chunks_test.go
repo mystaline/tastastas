@@ -9,10 +9,10 @@ import (
 	_ "modernc.org/sqlite"
 	_ "modernc.org/sqlite/vec"
 
-	"github.com/mystaline-dev/tastastas/internal/embed"
-	"github.com/mystaline-dev/tastastas/internal/ingest/docwalk"
-	"github.com/mystaline-dev/tastastas/internal/onboard"
-	sqlitestore "github.com/mystaline-dev/tastastas/internal/store/sqlite"
+	"github.com/mystaline/tastastas/internal/embed"
+	"github.com/mystaline/tastastas/internal/ingest/docwalk"
+	"github.com/mystaline/tastastas/internal/onboard"
+	sqlitestore "github.com/mystaline/tastastas/internal/store/sqlite"
 )
 
 // TestDocwalkChunksAndEmbeds proves docwalk-ingested nodes get chunked and
@@ -51,13 +51,13 @@ func TestDocwalkChunksAndEmbeds(t *testing.T) {
 	}
 
 	result, err := onboard.Run(ctx, onboard.Config{
-		Nodes:            nodes,
-		Edges:            nil,
-		SkipPostProcess:  true,
+		Nodes:             nodes,
+		Edges:             nil,
+		SkipPostProcess:   true,
 		SkipNodeEmbedding: false,
-		ProjectID:        "docwalk-chunk-test",
-		Embedder:         sc,
-		Store:            db,
+		ProjectID:         "docwalk-chunk-test",
+		Embedder:          sc,
+		Store:             db,
 	})
 	if err != nil {
 		t.Fatalf("onboard.Run: %v", err)

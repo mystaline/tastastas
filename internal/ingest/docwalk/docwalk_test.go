@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mystaline-dev/tastastas/internal/store"
+	"github.com/mystaline/tastastas/internal/store"
 )
 
 func TestLoadConfig(t *testing.T) {

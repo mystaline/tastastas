@@ -6,7 +6,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"github.com/mystaline-dev/tastastas/internal/store"
+	"github.com/mystaline/tastastas/internal/store"
 )
 
 func openTest(t *testing.T) *Store {

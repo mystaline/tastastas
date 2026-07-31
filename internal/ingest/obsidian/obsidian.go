@@ -11,8 +11,8 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/mystaline-dev/tastastas/internal/store"
 	"github.com/goccy/go-yaml"
+	"github.com/mystaline/tastastas/internal/store"
 )
 
 // Config holds obsidian ingestion settings.

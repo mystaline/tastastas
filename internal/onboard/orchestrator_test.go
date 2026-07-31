@@ -9,21 +9,21 @@ import (
 
 	_ "modernc.org/sqlite/vec"
 
-	"github.com/mystaline-dev/tastastas/internal/chunker"
-	"github.com/mystaline-dev/tastastas/internal/store"
-	sqlitestore "github.com/mystaline-dev/tastastas/internal/store/sqlite"
+	"github.com/mystaline/tastastas/internal/chunker"
+	"github.com/mystaline/tastastas/internal/store"
+	sqlitestore "github.com/mystaline/tastastas/internal/store/sqlite"
 )
 
 func TestNamePrefix(t *testing.T) {
 	tests := []struct{ in, want string }{
-		{ "GetUserByID", "Get" },
-		{ "handleRequest", "handle" },
-		{ "NewServer", "New" },
-		{ "isValid", "is" },
-		{ "toJSON", "to" },
-		{ "x", "" },
-		{ "ab", "ab" }, // two-letter lowercase prefixes are valid
-		{ "abc123", "abc" },
+		{"GetUserByID", "Get"},
+		{"handleRequest", "handle"},
+		{"NewServer", "New"},
+		{"isValid", "is"},
+		{"toJSON", "to"},
+		{"x", ""},
+		{"ab", "ab"}, // two-letter lowercase prefixes are valid
+		{"abc123", "abc"},
 	}
 	for _, tt := range tests {
 		got := namePrefix(tt.in)
@@ -34,7 +34,10 @@ func TestNamePrefix(t *testing.T) {
 }
 
 func TestTokenize(t *testing.T) {
-	tests := []struct{ in string; want []string }{
+	tests := []struct {
+		in   string
+		want []string
+	}{
 		{"GetUserByID", []string{"get", "user", "by", "id"}},
 		{"handle_request", []string{"handle", "request"}},
 		{"to-json", []string{"to", "json"}},
@@ -205,19 +208,19 @@ func TestRunWithPreBuiltNodes(t *testing.T) {
 
 	nodes := []store.Node{
 		{
-			ID: "test/code:function/testpkg.Foo",
+			ID:        "test/code:function/testpkg.Foo",
 			ProjectID: "test",
-			NodeType: "code:function",
-			Title:    "Foo",
-			Content:  "func Foo() { return 1 }",
+			NodeType:  "code:function",
+			Title:     "Foo",
+			Content:   "func Foo() { return 1 }",
 		},
 	}
 
 	result, err := Run(ctx, Config{
-		Nodes:            nodes,
-		SkipPostProcess:  true,
-		ProjectID:        "test",
-		Store:            db,
+		Nodes:           nodes,
+		SkipPostProcess: true,
+		ProjectID:       "test",
+		Store:           db,
 	})
 	if err != nil {
 		t.Fatalf("Run() with Nodes: %v", err)

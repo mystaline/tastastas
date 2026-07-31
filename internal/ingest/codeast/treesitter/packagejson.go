@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/mystaline-dev/tastastas/internal/store"
+	"github.com/mystaline/tastastas/internal/store"
 )
 
 // ExtractPackageManifests walks root looking for package.json files and
@@ -32,11 +32,11 @@ func ExtractPackageManifests(root, projectID string) ([]store.Node, []store.Edge
 }
 
 type pkgJSON struct {
-	Name                 string            `json:"name"`
-	Dependencies         map[string]string `json:"dependencies"`
-	DevDependencies      map[string]string `json:"devDependencies"`
-	PeerDependencies     map[string]string `json:"peerDependencies"`
-	Workspaces           []string          `json:"workspaces"`
+	Name             string            `json:"name"`
+	Dependencies     map[string]string `json:"dependencies"`
+	DevDependencies  map[string]string `json:"devDependencies"`
+	PeerDependencies map[string]string `json:"peerDependencies"`
+	Workspaces       []string          `json:"workspaces"`
 }
 
 func parsePackageJSON(pkgPath, root, projectID string) ([]store.Node, []store.Edge) {

@@ -7,9 +7,9 @@ import (
 	_ "modernc.org/sqlite"
 	_ "modernc.org/sqlite/vec"
 
-	"github.com/mystaline-dev/tastastas/internal/embed"
-	"github.com/mystaline-dev/tastastas/internal/store"
-	"github.com/mystaline-dev/tastastas/internal/store/sqlite"
+	"github.com/mystaline/tastastas/internal/embed"
+	"github.com/mystaline/tastastas/internal/store"
+	"github.com/mystaline/tastastas/internal/store/sqlite"
 )
 
 // TestRecallHybridScoring proves fused lexical+vector scoring (B2 in the

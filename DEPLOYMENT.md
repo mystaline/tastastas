@@ -58,15 +58,15 @@ export TASTASTAS_OPENAI_KEY=$KEY
 ```bash
 # dev machine
 docker build -t tastastas .
-docker tag tastastas ghcr.io/mystaline-dev/tastastas:latest
-docker push ghcr.io/mystaline-dev/tastastas:latest
+docker tag tastastas ghcr.io/mystaline/tastastas:latest
+docker push ghcr.io/mystaline/tastastas:latest
 ```
 
 ```yaml
 # target — docker-compose.yml
 services:
   tastastas:
-    image: ghcr.io/mystaline-dev/tastastas
+    image: ghcr.io/mystaline/tastastas
     ports:
       - "8080:8080"
       - "9292:9292"
@@ -91,7 +91,7 @@ volumes:
 ## 4. Build directly on server
 
 ```bash
-git clone https://github.com/mystaline-dev/tastastas && cd tastastas
+git clone https://github.com/mystaline/tastastas && cd tastastas
 make build   # or make all (with sidecar, needs Rust)
 ./tastastas --serve :8080 --graph-addr :9292
 ```
@@ -99,7 +99,7 @@ make build   # or make all (with sidecar, needs Rust)
 ## 5. Docker compose on server
 
 ```bash
-git clone https://github.com/mystaline-dev/tastastas && cd tastastas
+git clone https://github.com/mystaline/tastastas && cd tastastas
 docker compose up -d
 ```
 

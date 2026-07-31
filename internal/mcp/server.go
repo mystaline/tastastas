@@ -11,22 +11,22 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
-	"strings"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/mystaline-dev/tastastas/internal/dedupe"
-	"github.com/mystaline-dev/tastastas/internal/embed"
-	"github.com/mystaline-dev/tastastas/internal/extract"
-	"github.com/mystaline-dev/tastastas/internal/ingest/docwalk"
-	"github.com/mystaline-dev/tastastas/internal/ingest/gitrepo"
-	"github.com/mystaline-dev/tastastas/internal/ingest/obsidian"
-	"github.com/mystaline-dev/tastastas/internal/onboard"
-	"github.com/mystaline-dev/tastastas/internal/retrieve"
-	"github.com/mystaline-dev/tastastas/internal/store"
+	"github.com/mystaline/tastastas/internal/dedupe"
+	"github.com/mystaline/tastastas/internal/embed"
+	"github.com/mystaline/tastastas/internal/extract"
+	"github.com/mystaline/tastastas/internal/ingest/docwalk"
+	"github.com/mystaline/tastastas/internal/ingest/gitrepo"
+	"github.com/mystaline/tastastas/internal/ingest/obsidian"
+	"github.com/mystaline/tastastas/internal/onboard"
+	"github.com/mystaline/tastastas/internal/retrieve"
+	"github.com/mystaline/tastastas/internal/store"
 )
 
 // Version is set at build time via -ldflags. Falls back to "dev".
@@ -268,14 +268,14 @@ Rules:
 			}
 
 			if _, err := onboard.Run(ctx, onboard.Config{
-				Nodes:            []store.Node{n},
-				Edges:            edges,
-				SkipPostProcess:  true,
-				ProjectID:        projectID,
-				ModelID:          modelID,
-				Embedder:         embedder,
-				Store:            db,
-				BatchSize:        batchSize,
+				Nodes:           []store.Node{n},
+				Edges:           edges,
+				SkipPostProcess: true,
+				ProjectID:       projectID,
+				ModelID:         modelID,
+				Embedder:        embedder,
+				Store:           db,
+				BatchSize:       batchSize,
 			}); err != nil {
 				if !errors.Is(err, store.ErrVectorSkipped) {
 					return errorResult(err), RememberOutput{}, nil
@@ -744,15 +744,15 @@ Rules:
 			}
 
 			_, runErr := onboard.Run(jobCtx, onboard.Config{
-				Nodes:              storedNodes,
-				Edges:              nil,
-				SkipNodeEmbedding:  true,
-				SkipPostProcess:    true,
-				ProjectID:          projectID,
-				ModelID:            modelID,
-				Embedder:           embedder,
-				Store:              db,
-				BatchSize:          batchSize,
+				Nodes:             storedNodes,
+				Edges:             nil,
+				SkipNodeEmbedding: true,
+				SkipPostProcess:   true,
+				ProjectID:         projectID,
+				ModelID:           modelID,
+				Embedder:          embedder,
+				Store:             db,
+				BatchSize:         batchSize,
 			})
 			if runErr != nil {
 				err = runErr

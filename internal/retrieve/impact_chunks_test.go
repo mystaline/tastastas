@@ -7,8 +7,8 @@ import (
 	_ "modernc.org/sqlite"
 	_ "modernc.org/sqlite/vec"
 
-	"github.com/mystaline-dev/tastastas/internal/store"
-	"github.com/mystaline-dev/tastastas/internal/store/sqlite"
+	"github.com/mystaline/tastastas/internal/store"
+	"github.com/mystaline/tastastas/internal/store/sqlite"
 )
 
 // TestCheckImpactUnaffectedByChunks proves check_impact's graph traversal

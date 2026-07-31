@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mystaline-dev/tastastas/internal/store"
+	"github.com/mystaline/tastastas/internal/store"
 )
 
 // ingestMu serializes access to the embedder for ingest jobs. Only one

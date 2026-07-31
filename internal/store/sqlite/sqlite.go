@@ -15,9 +15,9 @@ import (
 	"math"
 	"strings"
 
-	"github.com/mystaline-dev/tastastas/internal/store"
 	"github.com/mystaline/mig/pkg/database"
 	"github.com/mystaline/mig/pkg/migrator"
+	"github.com/mystaline/tastastas/internal/store"
 )
 
 type Store struct {

@@ -19,7 +19,7 @@ import (
 	"math"
 	"strings"
 
-	"github.com/mystaline-dev/tastastas/internal/store"
+	"github.com/mystaline/tastastas/internal/store"
 	_ "github.com/tursodatabase/libsql-client-go/libsql"
 	_ "turso.tech/database/tursogo"
 )
@@ -1347,7 +1347,6 @@ func (s *Store) ClearProject(ctx context.Context, projectID, modelID string) (st
 	return store.ClearProjectResult{Nodes: nodes, Edges: edges}, nil
 }
 
-
 func (s *Store) LogAccess(ctx context.Context, projectID, nodeID, sessionID string) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO access_log (project_id, node_id, session_id) VALUES (?, ?, ?)`,
@@ -1503,7 +1502,6 @@ func (s *Store) GetTopNodesByImportance(ctx context.Context, projectID string, l
 	}
 	return out, rows.Err()
 }
-
 
 func (s *Store) ListProjects(ctx context.Context) ([]store.ProjectInfo, error) {
 	nodeRows, err := s.db.QueryContext(ctx, `SELECT project_id, COUNT(*) FROM nodes GROUP BY project_id`)

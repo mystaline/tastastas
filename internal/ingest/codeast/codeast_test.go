@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/mystaline-dev/tastastas/internal/store/sqlite"
-	"github.com/mystaline-dev/tastastas/internal/store"
+	"github.com/mystaline/tastastas/internal/store"
+	"github.com/mystaline/tastastas/internal/store/sqlite"
 
 	_ "modernc.org/sqlite"
 	_ "modernc.org/sqlite/vec"
@@ -67,10 +67,10 @@ func (w *Widget) Show() {
 
 	// Should have at least: package, Foo, Bar, Widget, Widget.Show
 	want := map[string]bool{
-		"test/code:package/testpkg":           false,
-		"test/code:function/testpkg.Foo":     false,
-		"test/code:function/testpkg.Bar":     false,
-		"test/code:type/testpkg.Widget":      false,
+		"test/code:package/testpkg":      false,
+		"test/code:function/testpkg.Foo": false,
+		"test/code:function/testpkg.Bar": false,
+		"test/code:type/testpkg.Widget":  false,
 	}
 	for _, n := range nodes {
 		if _, ok := want[n.ID]; ok {

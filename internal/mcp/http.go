@@ -15,9 +15,9 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/mystaline-dev/tastastas/internal/embed"
-	"github.com/mystaline-dev/tastastas/internal/onboard"
-	"github.com/mystaline-dev/tastastas/internal/store"
+	"github.com/mystaline/tastastas/internal/embed"
+	"github.com/mystaline/tastastas/internal/onboard"
+	"github.com/mystaline/tastastas/internal/store"
 )
 
 // mutating endpoints require it via the Authorization: Bearer {token} header.

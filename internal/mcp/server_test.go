@@ -9,8 +9,8 @@ import (
 	_ "modernc.org/sqlite"
 	_ "modernc.org/sqlite/vec"
 
-	"github.com/mystaline-dev/tastastas/internal/ingest/docwalk"
-	sqlitestore "github.com/mystaline-dev/tastastas/internal/store/sqlite"
+	"github.com/mystaline/tastastas/internal/ingest/docwalk"
+	sqlitestore "github.com/mystaline/tastastas/internal/store/sqlite"
 )
 
 // TestMCPSmoke runs the full ingest→recall loop via MCP tool handlers

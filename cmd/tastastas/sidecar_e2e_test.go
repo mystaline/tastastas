@@ -7,10 +7,10 @@ import (
 	_ "modernc.org/sqlite"
 	_ "modernc.org/sqlite/vec"
 
-	"github.com/mystaline-dev/tastastas/internal/embed"
-	"github.com/mystaline-dev/tastastas/internal/retrieve"
-	"github.com/mystaline-dev/tastastas/internal/store"
-	sqlitestore "github.com/mystaline-dev/tastastas/internal/store/sqlite"
+	"github.com/mystaline/tastastas/internal/embed"
+	"github.com/mystaline/tastastas/internal/retrieve"
+	"github.com/mystaline/tastastas/internal/store"
+	sqlitestore "github.com/mystaline/tastastas/internal/store/sqlite"
 )
 
 // TestSidecarEndToEndRecall proves the --embed-backend=sidecar wiring works
