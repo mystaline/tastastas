@@ -200,8 +200,10 @@ func TestE2EHTTPHealthAndIngest(t *testing.T) {
 		t.Fatalf("/health: expected status=ok, got %+v", health)
 	}
 
-	// POST /ingest — REST ingest shape check.
-	// Use testdata directory root so ingest walks our existing test fixtures.
+	// POST /ingest — REST ingest shape check. Ingest is async now
+	// (internal/mcp/jobs.go): it returns 202 + job_id immediately, and the
+	// caller polls GET /ingest/jobs/{id}. Use testdata directory root so
+	// ingest walks our existing test fixtures.
 	ingestBody, _ := json.Marshal(map[string]string{
 		"root":       "testdata",
 		"project_id": "e2e-http",
@@ -211,7 +213,7 @@ func TestE2EHTTPHealthAndIngest(t *testing.T) {
 		t.Fatalf("POST /ingest: %v", err)
 	}
 	defer resp2.Body.Close()
-	if resp2.StatusCode != http.StatusOK {
+	if resp2.StatusCode != http.StatusAccepted {
 		b, _ := io.ReadAll(resp2.Body)
 		t.Fatalf("POST /ingest: status %d: %s", resp2.StatusCode, b)
 	}

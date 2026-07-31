@@ -42,7 +42,16 @@ func buildBinary(t *testing.T) string {
 // so tests don't share state.
 func connect(t *testing.T, bin, dbPath string) *mcp.ClientSession {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	return connectWithTimeout(t, bin, dbPath, 30*time.Second)
+}
+
+// connectWithTimeout is connect with a caller-chosen session budget. The
+// timeout matters: exec.CommandContext kills the spawned server when the
+// session context fires, so tests that kick off long async jobs (ingest)
+// must pass a budget larger than the job itself.
+func connectWithTimeout(t *testing.T, bin, dbPath string, timeout time.Duration) *mcp.ClientSession {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	t.Cleanup(cancel)
 
 	cmd := exec.CommandContext(ctx, bin, "-db", dbPath, "-embed-backend", "none")

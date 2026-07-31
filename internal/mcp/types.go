@@ -23,9 +23,8 @@ type RememberInput struct {
 }
 
 type RememberOutput struct {
-	ID      string `json:"id"`
-	Status  string `json:"status"`
-	Warning string `json:"warning,omitempty"` // set if the embedding vector was invalid and skipped (metadata still stored)
+	ID     string `json:"id"`
+	Status string `json:"status"`
 }
 
 type RecallInput struct {
