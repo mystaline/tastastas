@@ -11,6 +11,7 @@ package libsql
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -262,16 +263,16 @@ func (s *Store) GetNodeEmbeddings(ctx context.Context, nodeIDs []string) (map[st
 
 func (s *Store) Close() error { return s.db.Close() }
 
-// blobToFloat32Slice converts a raw vec0 blob (big-endian float32 bytes) into
-// a []float32 slice.
+// blobToFloat32Slice converts a raw vec0 blob (little-endian float32 bytes) into
+// a []float32 slice. vec0's C extension stores float32 in platform-native byte
+// order; on amd64 this is little-endian.
 func blobToFloat32Slice(blob []byte, dim int) []float32 {
 	if len(blob) == 0 {
 		return nil
 	}
 	out := make([]float32, dim)
 	for i := 0; i < dim && i*4+4 <= len(blob); i++ {
-		bits := uint32(blob[i*4])<<24 | uint32(blob[i*4+1])<<16 | uint32(blob[i*4+2])<<8 | uint32(blob[i*4+3])
-		out[i] = float32(math.Float32frombits(bits))
+		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(blob[i*4:]))
 	}
 	return out
 }
