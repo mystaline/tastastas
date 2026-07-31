@@ -448,9 +448,13 @@ func detectModuleRoots(root string) []ModuleEntry {
 			if depth > 3 {
 				return filepath.SkipDir
 			}
-		}
-		if shouldSkipDir(d.Name()) {
-			return filepath.SkipDir
+			// Only prune subdirectories. The root entry itself is never
+			// skipped: with a relative root like "../.." its name is ".."
+			// (dot-prefixed) and skipping it would drop every module — the
+			// whole codeast pass — silently.
+			if shouldSkipDir(d.Name()) {
+				return filepath.SkipDir
+			}
 		}
 		var langs []string
 		if exists(filepath.Join(path, "go.mod")) {
