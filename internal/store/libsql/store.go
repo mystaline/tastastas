@@ -960,7 +960,7 @@ func (s *Store) MarkStaleDownstream(ctx context.Context, changedID string, maxDe
 	return nodes, nil
 }
 
-func (s *Store) Stats(ctx context.Context, projectID string) (store.StoreStats, error) {
+func (s *Store) Stats(ctx context.Context, projectID, modelID string) (store.StoreStats, error) {
 	var st store.StoreStats
 	row := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM nodes WHERE project_id = ?`, projectID)
 	if err := row.Scan(&st.NodeCount); err != nil {

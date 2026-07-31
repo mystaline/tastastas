@@ -197,6 +197,7 @@ type OnboardOutput struct {
 
 type OnboardCheckInput struct {
 	ProjectID string `json:"project_id,omitempty"`
+	ModelID   string `json:"model_id,omitempty"` // filter vectors to this model (empty = all models)
 }
 
 type OnboardCheckOutput struct {
@@ -304,8 +305,9 @@ type GraphEdge struct {
 
 type ClearProjectInput struct {
 	ProjectID string `json:"project_id"`
-	ModelID   string `json:"model_id,omitempty"`
+	ModelID   string `json:"model_id,omitempty"` // model to clear (default = current server model)
 	Confirm   bool   `json:"confirm"`
+	Purge     bool   `json:"purge"` // clear all models for this project
 }
 
 type ClearProjectOutput struct {

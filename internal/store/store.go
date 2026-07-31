@@ -194,7 +194,7 @@ type Store interface {
 	MarkStaleDownstream(ctx context.Context, changedID string, maxDepth int) ([]Node, error)
 
 	// Stats returns aggregate counts for a project.
-	Stats(ctx context.Context, projectID string) (StoreStats, error)
+	Stats(ctx context.Context, projectID string, modelID string) (StoreStats, error)
 
 	// EdgeTypeCounts returns edge count per edge type for a project.
 	EdgeTypeCounts(ctx context.Context, projectID string) (map[string]int, error)

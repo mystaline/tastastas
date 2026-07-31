@@ -63,7 +63,7 @@ func modelWarning(ctx context.Context, db store.Store, projectID, modelID string
 	if modelID == "" {
 		return ""
 	}
-	stats, err := db.Stats(ctx, projectID)
+	stats, err := db.Stats(ctx, projectID, "")
 	if err != nil || stats.NodeCount == 0 {
 		return ""
 	}
@@ -182,14 +182,18 @@ Rules:
 
 	// Tool 3: onboard_check
 	mcp.AddTool(srv, &mcp.Tool{
-		Name: "onboard_check", Description: "Check graph state for a project. Read-only.",
+		Name: "onboard_check", Description: "Check graph state for a project filtered by model. Read-only. model_id optional (default: current server model). Pass empty string for all models.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args OnboardCheckInput) (*mcp.CallToolResult, OnboardCheckOutput, error) {
 		projectID := args.ProjectID
 		if projectID == "" {
 			projectID = "default"
 		}
+		checkModelID := args.ModelID
+		if checkModelID == "" {
+			checkModelID = modelID // fallback to server's current model
+		}
 
-		stats, err := db.Stats(ctx, projectID)
+		stats, err := db.Stats(ctx, projectID, checkModelID)
 		if err != nil {
 			return errorResult(err), OnboardCheckOutput{}, nil
 		}
@@ -990,7 +994,7 @@ Rules:
 	// Tool 15: clear_project — synchronous, requires confirm
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "clear_project",
-		Description: "Delete all data for a project, or only vectors for a specific model. Requires confirm: true to prevent accidental deletion.",
+		Description: "Delete project data. Default: clears current model only (safe — keeps other models' vectors). model_id optional: override target model. purge=true: clear ALL models (full wipe). Requires confirm: true.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args ClearProjectInput) (*mcp.CallToolResult, ClearProjectOutput, error) {
 		if !args.Confirm {
 			return errorResult(fmt.Errorf("clear_project requires confirm: true")), ClearProjectOutput{}, nil
@@ -999,7 +1003,14 @@ Rules:
 			return errorResult(fmt.Errorf("project_id is required")), ClearProjectOutput{}, nil
 		}
 
-		result, err := db.ClearProject(ctx, args.ProjectID, args.ModelID)
+		targetModelID := args.ModelID
+		if args.Purge {
+			targetModelID = "" // clear all models
+		} else if targetModelID == "" {
+			targetModelID = modelID // default: current server model
+		}
+
+		result, err := db.ClearProject(ctx, args.ProjectID, targetModelID)
 		if err != nil {
 			return errorResult(err), ClearProjectOutput{}, nil
 		}

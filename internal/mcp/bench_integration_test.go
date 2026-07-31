@@ -131,7 +131,7 @@ func TestIntegrationBench(t *testing.T) {
 	// ── 6. Stats per project ──
 	t.Run("stats", func(t *testing.T) {
 		for _, pid := range []string{"tastastas", "project-alpha", "project-beta"} {
-			stats, err := db.Stats(ctx, pid)
+			stats, err := db.Stats(ctx, pid, "")
 			if err != nil {
 				t.Logf("stats %s: %v", pid, err)
 				continue

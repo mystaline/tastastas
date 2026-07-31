@@ -1068,7 +1068,7 @@ func (s *Store) MarkStaleDownstream(ctx context.Context, changedID string, maxDe
 	return nodes, nil
 }
 
-func (s *Store) Stats(ctx context.Context, projectID string) (store.StoreStats, error) {
+func (s *Store) Stats(ctx context.Context, projectID, modelID string) (store.StoreStats, error) {
 	var st store.StoreStats
 	row := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM nodes WHERE project_id = ?`, projectID)
 	if err := row.Scan(&st.NodeCount); err != nil {
@@ -1097,17 +1097,37 @@ func (s *Store) Stats(ctx context.Context, projectID string) (store.StoreStats, 
 	if err := row.Scan(&st.StaleCount); err != nil {
 		return st, fmt.Errorf("sqlite: stats stale: %w", err)
 	}
-	// VecCount = node_vectors + chunk_vectors scoped to project.
-	// Route through mapping tables since vec0 PK is now composite.
-	row = s.db.QueryRowContext(
-		ctx,
-		`SELECT (
-			SELECT COUNT(*) FROM node_vectors v JOIN node_vector_model nvm ON nvm.id = v.node_id JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ?
-		) + (
-			SELECT COUNT(*) FROM chunk_vectors v JOIN chunk_vector_model cvm ON cvm.id = v.chunk_id JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?
-		)`,
-		projectID, projectID,
-	)
+
+	// VecCount = node_vectors + chunk_vectors scoped to project and optionally model.
+	if modelID != "" {
+		row = s.db.QueryRowContext(
+			ctx,
+			`SELECT (
+				SELECT COUNT(*) FROM node_vectors v JOIN node_vector_model nvm ON nvm.id = v.node_id JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ? AND nvm.model_id = ?
+			) + (
+				SELECT COUNT(*) FROM chunk_vectors v JOIN chunk_vector_model cvm ON cvm.id = v.chunk_id JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ? AND cvm.model_id = ?
+			)`,
+			projectID, modelID, projectID, modelID,
+		)
+	} else {
+		row = s.db.QueryRowContext(
+			ctx,
+			`SELECT (
+				SELECT COUNT(*) FROM node_vectors WHERE node_id IN (
+					SELECT nvm.id FROM node_vector_model nvm JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ?
+				)
+			) + (
+				SELECT COUNT(*) FROM chunk_vectors WHERE chunk_id IN (
+					SELECT cvm.id FROM chunk_vector_model cvm JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?
+				)
+			) + (
+				SELECT COUNT(*) FROM node_vectors WHERE node_id IN (SELECT id FROM nodes WHERE project_id = ?) AND node_id NOT IN (SELECT nvm.id FROM node_vector_model nvm JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ?)
+			) + (
+				SELECT COUNT(*) FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE parent_node_id IN (SELECT id FROM nodes WHERE project_id = ?)) AND chunk_id NOT IN (SELECT cvm.id FROM chunk_vector_model cvm JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)
+			)`,
+			projectID, projectID, projectID, projectID, projectID, projectID,
+		)
+	}
 	if err := row.Scan(&st.VecCount); err != nil {
 		return st, fmt.Errorf("sqlite: stats vectors: %w", err)
 	}
@@ -1556,6 +1576,7 @@ func (s *Store) ClearProject(ctx context.Context, projectID, modelID string) (st
 	_ = tx.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM chunks c JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?`,
 		projectID).Scan(&chunks)
+	// Count model-prefixed vectors (stored with an explicit modelID).
 	_ = tx.QueryRowContext(
 		ctx,
 		`SELECT COUNT(*) FROM node_vectors WHERE node_id IN (SELECT nvm.id FROM node_vector_model nvm JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ?)`,
@@ -1566,7 +1587,22 @@ func (s *Store) ClearProject(ctx context.Context, projectID, modelID string) (st
 		`SELECT COUNT(*) FROM chunk_vectors WHERE chunk_id IN (SELECT cvm.id FROM chunk_vector_model cvm JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`,
 		projectID,
 	).Scan(&chunkVecs)
+	// Count non-prefixed vectors (stored without modelID — old sidecar/REST
+	// path before model-aware storage). These have no node_vector_model /
+	// chunk_vector_model row, so they must be counted by direct ID match.
+	var bareNodeVecs, bareChunkVecs int
+	_ = tx.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM node_vectors WHERE node_id IN (SELECT id FROM nodes WHERE project_id = ?) AND node_id NOT IN (SELECT nvm.id FROM node_vector_model nvm JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ?)`,
+		projectID, projectID,
+	).Scan(&bareNodeVecs)
+	_ = tx.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE parent_node_id IN (SELECT id FROM nodes WHERE project_id = ?)) AND chunk_id NOT IN (SELECT cvm.id FROM chunk_vector_model cvm JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`,
+		projectID, projectID,
+	).Scan(&bareChunkVecs)
 
+	// Delete model-prefixed vectors.
 	_, _ = tx.ExecContext(
 		ctx,
 		`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT cvm.id FROM chunk_vector_model cvm JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`,
@@ -1576,6 +1612,18 @@ func (s *Store) ClearProject(ctx context.Context, projectID, modelID string) (st
 		ctx,
 		`DELETE FROM node_vectors WHERE node_id IN (SELECT nvm.id FROM node_vector_model nvm JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ?)`,
 		projectID,
+	)
+	// Delete non-prefixed vectors — direct ID match bypasses the model
+	// mapping table since these were stored without modelID.
+	_, _ = tx.ExecContext(
+		ctx,
+		`DELETE FROM node_vectors WHERE node_id IN (SELECT id FROM nodes WHERE project_id = ?) AND node_id NOT IN (SELECT nvm.id FROM node_vector_model nvm JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ?)`,
+		projectID, projectID,
+	)
+	_, _ = tx.ExecContext(
+		ctx,
+		`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE parent_node_id IN (SELECT id FROM nodes WHERE project_id = ?)) AND chunk_id NOT IN (SELECT cvm.id FROM chunk_vector_model cvm JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`,
+		projectID, projectID,
 	)
 	_, _ = tx.ExecContext(
 		ctx,
@@ -1605,7 +1653,7 @@ func (s *Store) ClearProject(ctx context.Context, projectID, modelID string) (st
 		Nodes:   nodes,
 		Edges:   edges,
 		Chunks:  chunks,
-		Vectors: nodeVecs + chunkVecs,
+		Vectors: nodeVecs + chunkVecs + bareNodeVecs + bareChunkVecs,
 	}, nil
 }
 
