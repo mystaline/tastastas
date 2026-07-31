@@ -234,7 +234,9 @@ func AutoDetectAdapters(ctx context.Context, db store.Store, root, projectID str
 		}
 	}
 
-	// Go: one ingest per module root (go/packages needs its module's root)
+	// Go: process one module at a time — each packages.Load can use hundreds
+	// of MB even without NeedDeps, and running N concurrently would OOM.
+	goLimit := make(chan struct{}, 1)
 	for _, m := range modules {
 		if !slices.Contains(m.Languages, "go") {
 			continue
@@ -242,6 +244,8 @@ func AutoDetectAdapters(ctx context.Context, db store.Store, root, projectID str
 		modRoot := m.Root
 		adapterName := "codeast-go-" + filepath.Base(modRoot)
 		startAdapter(adapterName, func() ([]store.Node, []store.Edge, []treesitter.RawCall, int, error) {
+			goLimit <- struct{}{} // acquire — blocks until previous Go module finishes
+			defer func() { <-goLimit }()
 			ca := codeast.New(db, codeast.Config{
 				Root: modRoot, ProjectID: projectID,
 				Languages:        []string{"go"},

@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/mystaline-dev/tastastas/internal/ingest/codeast/treesitter"
@@ -119,6 +120,11 @@ func (c *CodeastIngestor) IngestWithCalls(
 		return nil, nil, nil, fmt.Errorf("codeast: all languages failed: %s", strings.Join(langErrs, "; "))
 	}
 
+	// Free AST memory before post-processing — packages.Load (even without
+	// NeedDeps) can hold hundreds of MB of type-checked ASTs that won't be
+	// touched again until the next onboard call.
+	runtime.GC()
+
 	// Package manifest extraction for TS/JS projects (P2f)
 	if hasTS {
 		pkgNodes, pkgEdges := treesitter.ExtractPackageManifests(c.cfg.Root, c.cfg.ProjectID)
@@ -132,7 +138,7 @@ func (c *CodeastIngestor) IngestWithCalls(
 func (c *CodeastIngestor) ingestGo() ([]store.Node, []store.Edge, error) {
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedTypes | packages.NeedTypesInfo |
-			packages.NeedSyntax | packages.NeedImports | packages.NeedDeps,
+			packages.NeedSyntax | packages.NeedImports,
 		Dir: c.cfg.Root,
 	}
 
@@ -143,15 +149,13 @@ func (c *CodeastIngestor) ingestGo() ([]store.Node, []store.Edge, error) {
 
 	var nodes []store.Node
 	var edges []store.Edge
-	pkgNodes := make(map[string]string) // pkg path -> node ID
+	pkgNodes := make(map[string]string)
 
 	for _, pkg := range pkgs {
 		if len(pkg.Errors) > 0 {
-			// Skip packages with errors but don't fail entirely
 			continue
 		}
 
-		// Create package node
 		pkgNodeID := fmt.Sprintf("%s/code:package/%s", c.cfg.ProjectID, pkg.PkgPath)
 		pkgNodes[pkg.PkgPath] = pkgNodeID
 
@@ -167,7 +171,8 @@ func (c *CodeastIngestor) ingestGo() ([]store.Node, []store.Edge, error) {
 			Importance:    0.5,
 		})
 
-		// Extract functions and types
+		fileCache := make(map[string][]byte)
+
 		for ident, obj := range pkg.TypesInfo.Defs {
 			if obj == nil {
 				continue
@@ -175,15 +180,11 @@ func (c *CodeastIngestor) ingestGo() ([]store.Node, []store.Edge, error) {
 
 			switch o := obj.(type) {
 			case *types.Func:
-				if o.Pkg() == pkg.Types { // only functions defined in this package
-					// Skip interface method declarations (no body, Recv().Underlying()
-					// belongs to the interface, not a concrete type) — they're not
-					// separately-callable symbols and would collide with the
-					// concrete type's method of the same name.
+				if o.Pkg() == pkg.Types {
 					if isInterfaceMethod(o) {
 						continue
 					}
-					n := c.makeFuncNode(pkg, ident.Name, o)
+					n := c.makeFuncNode(pkg, ident.Name, o, fileCache)
 					nodes = append(nodes, n)
 					edges = append(edges, store.Edge{
 						FromID: pkgNodeID, ToID: n.ID,
@@ -191,7 +192,7 @@ func (c *CodeastIngestor) ingestGo() ([]store.Node, []store.Edge, error) {
 					})
 				}
 			case *types.TypeName:
-				if o.Pkg() == pkg.Types { // only types defined in this package
+				if o.Pkg() == pkg.Types {
 					n := c.makeTypeNode(pkg, ident.Name, o)
 					nodes = append(nodes, n)
 					edges = append(edges, store.Edge{
@@ -202,9 +203,6 @@ func (c *CodeastIngestor) ingestGo() ([]store.Node, []store.Edge, error) {
 			}
 		}
 
-		// Extract call edges — resolve each FuncDecl's *types.Func via
-		// TypesInfo.Defs so the from-ID matches makeFuncNode's qualified
-		// (receiver-aware) naming exactly.
 		for _, file := range pkg.Syntax {
 			for _, decl := range file.Decls {
 				fnDecl, ok := decl.(*ast.FuncDecl)
@@ -224,7 +222,6 @@ func (c *CodeastIngestor) ingestGo() ([]store.Node, []store.Edge, error) {
 			}
 		}
 
-		// Import edges
 		for _, imp := range pkg.Imports {
 			if toPkgID, ok := pkgNodes[imp.PkgPath]; ok {
 				edges = append(edges, store.Edge{
@@ -446,22 +443,19 @@ func isInterfaceMethod(fn *types.Func) bool {
 	return isIface
 }
 
-func (c *CodeastIngestor) makeFuncNode(pkg *packages.Package, ident string, fn *types.Func) store.Node {
+func (c *CodeastIngestor) makeFuncNode(pkg *packages.Package, ident string, fn *types.Func, fileCache map[string][]byte) store.Node {
 	qname := funcQualifiedName(fn)
 	fnID := fmt.Sprintf("%s/code:function/%s.%s", c.cfg.ProjectID, pkg.PkgPath, qname)
 	sig := fn.Type().String()
 	doc := ""
 	var bodySrc string
 
-	// TODO: use hashmap instean of iterating over all files for each function
 	for _, file := range pkg.Syntax {
 		for _, decl := range file.Decls {
 			fnDecl, ok := decl.(*ast.FuncDecl)
 			if !ok || fnDecl.Name.Name != fn.Name() {
 				continue
 			}
-			// Match receiver too — a bare name match alone conflates
-			// distinct methods that share a name across types.
 			if !declMatchesReceiver(fnDecl, fn) {
 				continue
 			}
@@ -471,12 +465,18 @@ func (c *CodeastIngestor) makeFuncNode(pkg *packages.Package, ident string, fn *
 			if fnDecl.Body != nil && pkg.Fset != nil {
 				start := pkg.Fset.Position(fnDecl.Body.Pos()).Offset
 				end := pkg.Fset.Position(fnDecl.Body.End()).Offset
-				if start >= 0 && end > start {
-					// Read source bytes from the actual file
-					if src, err := os.ReadFile(pkg.Fset.Position(fnDecl.Pos()).Filename); err == nil {
-						if end <= len(src) {
-							bodySrc = string(src[start:end])
+				fname := pkg.Fset.Position(fnDecl.Pos()).Filename
+				if start >= 0 && end > start && fname != "" {
+					src, ok := fileCache[fname]
+					if !ok {
+						data, err := os.ReadFile(fname)
+						if err == nil {
+							fileCache[fname] = data
+							src = data
 						}
+					}
+					if len(src) > 0 && end <= len(src) {
+						bodySrc = string(src[start:end])
 					}
 				}
 			}

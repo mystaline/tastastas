@@ -12,7 +12,7 @@ import (
 	"github.com/mystaline-dev/tastastas/internal/store"
 )
 
-const maxDeclLen = 1 << 30 // effectively unlimited — full body flows to chunker
+const maxDeclLen = 1 << 30 // effectively unlimited — full body stored in DB, truncated in-memory in caller
 
 type importRule struct {
 	query   string
@@ -125,10 +125,6 @@ func Extract(projectID, sourcePath string, source []byte, langName string, ext E
 			symMap[symName] = symID
 
 			content := declNode.Utf8Text(source)
-			// ponytail: full declaration including body, capped below.
-			if len(content) > maxDeclLen {
-				content = content[:maxDeclLen] + "..."
-			}
 
 			nodes = append(nodes, store.Node{
 				ID:            symID,
