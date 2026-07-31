@@ -232,7 +232,7 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4.5.2
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
