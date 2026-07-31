@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -33,6 +32,7 @@ func ServeHTTP(
 	spaDir string,
 ) error {
 	jobs := newJobStore(db)
+	SetJobContext(ctx)
 
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
 		srv := mcp.NewServer(&mcp.Implementation{
@@ -77,10 +77,20 @@ func ServeHTTP(
 	server := &http.Server{Addr: addr, Handler: handler}
 	go func() {
 		<-ctx.Done()
-		server.Close()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer shutdownCancel()
+		server.Shutdown(shutdownCtx)
 	}()
 
-	return server.ListenAndServe()
+	err := server.ListenAndServe()
+
+	// Server loop ended (signal or error) — cancel in-flight jobs and wait
+	// for them so the caller can close the DB without racing job goroutines.
+	CancelJobs()
+	if !WaitForJobs(30 * time.Second) {
+		log.Printf("http: jobs still running after 30s shutdown wait; closing DB anyway")
+	}
+	return err
 }
 
 func withBearerAuth(token string) func(http.Handler) http.Handler {
@@ -316,7 +326,13 @@ func HandleGraphSPA(spaDir string) http.HandlerFunc {
 
 // handleRESTIngest handles POST /ingest — auto-detect adapters, same pipeline
 // as the MCP ingest tool. Async: returns { job_id, status } immediately.
-func handleRESTIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobStore, batchSize int, modelID string) http.HandlerFunc {
+func handleRESTIngest(
+	db store.Store,
+	embedder embed.EmbedderBackend,
+	jobs *jobStore,
+	batchSize int,
+	modelID string,
+) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Root      string `json:"root"`
@@ -337,69 +353,30 @@ func handleRESTIngest(db store.Store, embedder embed.EmbedderBackend, jobs *jobS
 			return
 		}
 
-		job := jobs.create()
+		job := jobs.create(projectID)
 		safeGo(func() {
-			ctx := context.Background()
-			nodes, edges, _, filesWalked, filesSkipped, err := onboard.AutoDetectAdapters(ctx, db, root, projectID)
-			if err != nil {
-				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("detect adapters: %w", err))
-				return
-			}
-			jobs.updateCounts(job.ID, filesWalked, filesSkipped)
-			for _, n := range nodes {
-				if err := db.UpsertNode(ctx, n); err != nil {
-					jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert node: %w", err))
-					return
-				}
-			}
-			if err := db.UpsertEdges(ctx, edges); err != nil {
-				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert edges: %w", err))
-				return
-			}
-			jobs.updatePhase(job.ID, "waiting")
 			ingestMu.Lock()
-			jobs.updatePhase(job.ID, "chunking")
-
-			embedOnce := sync.OnceFunc(func() { jobs.updatePhase(job.ID, "embedding") })
-			chunkCount, err := chunkAndEmbedNodes(
-				ctx, db, embedder, nodes, batchSize, "",
-				func(embedded, total int) {
-					embedOnce()
+			result, err := onboard.Run(jobCtx, onboard.Config{
+				CWD:       root,
+				ProjectID: projectID,
+				ModelID:   modelID,
+				Embedder:  embedder,
+				Store:     db,
+				BatchSize: batchSize,
+				OnChunkProgress: func(embedded, total int) {
+					jobs.updatePhase(job.ID, "embedding")
 					jobs.updateChunksEmbedded(job.ID, embedded, total)
 				},
-				func() { jobs.updatePhase(job.ID, "persisting") },
-			)
-			if err != nil {
-				ingestMu.Unlock()
-				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("chunk/embed: %w", err))
-				return
-			}
-			if embedder != nil {
-				_ = onboard.EmbedNodes(ctx, db, nodes, embedder, batchSize, "")
-			}
+				OnPersistChunks: func() { jobs.updatePhase(job.ID, "persisting") },
+			})
 			ingestMu.Unlock()
 
-			jobs.updatePhase(job.ID, "linking")
-
-			convNodes := onboard.InferConventions(ctx, db, projectID, nodes)
-			for _, cn := range convNodes {
-				_ = db.UpsertNode(ctx, cn)
-			}
-			nodes = append(nodes, convNodes...)
-			hierNodes, hierEdges := onboard.BuildHierarchy(projectID, nodes)
-			for _, n := range hierNodes {
-				if err := db.UpsertNode(ctx, n); err != nil {
-					jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert hierarchy node: %w", err))
-					return
-				}
-			}
-			if err := db.UpsertEdges(ctx, hierEdges); err != nil {
-				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert hierarchy edges: %w", err))
+			if err != nil {
+				jobs.finish(job.ID, 0, 0, 0, err)
 				return
 			}
-			nodes = append(nodes, hierNodes...)
-			auto, proposals := onboard.Tier2ScoreAndLink(ctx, db, projectID, nodes)
-			jobs.finish(job.ID, len(nodes), len(edges), chunkCount, nil, len(convNodes), auto, proposals)
+			jobs.finish(job.ID, len(result.AllNodes), result.CallGraphEdges, result.ChunkCount, nil,
+				result.ConventionsInferred, result.AutoLinked, result.ProposalsQueued)
 		})
 
 		w.Header().Set("Content-Type", "application/json")

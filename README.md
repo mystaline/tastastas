@@ -50,7 +50,8 @@ Claude Code:
       "command": "/path/to/tastastas",
       "args": [
         "--db", "~/.local/share/tastastas/memory.db",
-        "--graph-addr", ":9292"
+        "--graph-addr", ":9292",
+        "--consolidate-interval", "1h"
       ]
     }
   }
@@ -64,7 +65,8 @@ Kilo Code:
   "command": [
     "/path/to/tastastas",
     "--db", "~/.local/share/tastastas/memory.db",
-    "--graph-addr", ":9292"
+    "--graph-addr", ":9292",
+    "--consolidate-interval", "1h"
   ],
   "enabled": true
 }
@@ -82,7 +84,8 @@ Claude Code:
       "args": [
         "--db", "~/.local/share/tastastas/memory.db",
         "--embed-backend", "ollama",
-        "--graph-addr", ":9292"
+        "--graph-addr", ":9292",
+        "--consolidate-interval", "1h"
       ]
     }
   }
@@ -97,7 +100,8 @@ Kilo Code:
     "/path/to/tastastas",
     "--db", "~/.local/share/tastastas/memory.db",
     "--embed-backend", "ollama",
-    "--graph-addr", ":9292"
+    "--graph-addr", ":9292",
+    "--consolidate-interval", "1h"
   ],
   "enabled": true
 }
@@ -108,7 +112,7 @@ Kilo Code:
 ```bash
 # Prefer env var (not in process list)
 export TASTASTAS_OPENAI_KEY=sk-...
-./tastastas --embed-backend openai
+./tastastas --embed-backend openai --consolidate-interval 1h
 ```
 
 Claude Code:
@@ -121,7 +125,8 @@ Claude Code:
       "args": [
         "--db", "~/.local/share/tastastas/memory.db",
         "--embed-backend", "openai",
-        "--graph-addr", ":9292"
+        "--graph-addr", ":9292",
+        "--consolidate-interval", "1h"
       ],
       "env": {
         "TASTASTAS_OPENAI_KEY": "sk-..."
@@ -139,7 +144,8 @@ Kilo Code:
     "/path/to/tastastas",
     "--db", "~/.local/share/tastastas/memory.db",
     "--embed-backend", "openai",
-    "--graph-addr", ":9292"
+    "--graph-addr", ":9292",
+    "--consolidate-interval", "1h"
   ],
   "env": {
     "TASTASTAS_OPENAI_KEY": "sk-..."
@@ -164,17 +170,21 @@ See [DEPLOYMENT.md](./DEPLOYMENT.md#hardware--tuning) for hardware requirements 
 ## How it works
 
 ```
-Source → [AutoDetectAdapters] → n → [EmbedNodes] → n → [InferConventions]
-  → n + conv → [BuildHierarchy] → n + dir + contains → [Tier2ScoreAndLink]
-  → auto-linked + proposed edges
+Source → [AutoDetectAdapters] → n + edges + rawCalls → [CrossFileLinker]
+  → [EmbedNodes] → n → [InferConventions] → [BuildHierarchy]
+  → [DocLinkExtraction] → [Tier2ScoreAndLink] → [CrossProjectLink]
+  → edges tagged EXTRACTED / INFERRED / PROPOSED
 ```
 
-1. **Adapters** walk a directory — docwalk (`.memoryrc.yaml` mapping), codeast (Go AST), gitrepo, obsidian, markdown-glob. Each returns typed nodes + structural edges.
-2. **EmbedNodes** batch-embeds node content (ollama or sidecar ONNX).
-3. **InferConventions** detects naming patterns from code symbols (`Get*`/`handle*` prefixes).
-4. **BuildHierarchy** generates synthetic `directory` nodes connected by `contains` edges — every file becomes reachable from the repo root. Single-child pass-through folders collapse.
-5. **Tier2ScoreAndLink** pairs every two nodes: `0.4·cos + 0.2·typeCompat + 0.2·pathProximity + 0.2·identifierOverlap - templateCollisionPenalty`. Above 0.80 = `auto-linked`. Above 0.55 = `proposed` (review queue). Below = skipped.
-6. **Graph view** at `GET /graph/{project_id}` renders structural edges + auto-linked edges as a force-directed D3 visualization. Proposed edges hidden — use `query_graph` to inspect.
+1. **Adapters** walk a directory — docwalk (`.memoryrc.yaml` mapping), codeast (Go AST, tree-sitter for TS/Python/Rust), gitrepo, obsidian, markdown-glob. Each returns typed nodes + structural edges + raw calls (unresolved function references from tree-sitter).
+2. **CrossFileLinker** resolves raw calls against a global label index built from all ingested nodes — auto-links cross-module `calls` edges.
+3. **EmbedNodes** batch-embeds node content (ollama, openai, or sidecar ONNX).
+4. **InferConventions** detects naming patterns from code symbols (`Get*`/`handle*` prefixes).
+5. **BuildHierarchy** generates synthetic `directory` nodes connected by `contains` edges — every file becomes reachable from the repo root. Single-child pass-through folders collapse.
+6. **DocLinkExtraction** parses .md files for inline/wikilink/reference-style links to existing nodes — creates `references` edges.
+7. **Tier2ScoreAndLink** pairs every two nodes: `0.4·cos + 0.2·typeCompat + 0.2·pathProximity + 0.2·identifierOverlap - templateCollisionPenalty`. Above 0.80 = `INFERRED`. Above 0.55 = `PROPOSED`. Skipped below. Also runs cross-project linking — matches code symbols by name across projects.
+8. **Consolidation** (background cron) — session co-occurrence analysis creates `co-accessed` `INFERRED` edges via `--consolidate-interval`.
+9. **Graph view** at `GET /graph/{project_id}` renders edges tagged EXTRACTED (structural) + INFERRED (auto-linked) as a force-directed D3 visualization. PROPOSED edges hidden — use `query_graph` to inspect.
 
 ### Model identity & isolation
 
@@ -190,9 +200,9 @@ Embeds use API probes to auto-detect dimension — no `--embed-dim` flag needed 
 
 ### Architecture notes
 
-- **Typed edges** — `implements` (API Spec→PRD), `specifies` (ERD→PRD), `tests` (TestCases→PRD), `contains` (directory→file), `depends-on` (via link tool or manual), `auto-linked` (Tier 2 similarity > 0.80), `proposed` (review queue, 0.55–0.80).
+- **Typed edges** — `implements` (API Spec→PRD), `specifies` (ERD→PRD), `tests` (TestCases→PRD), `contains` (directory→file), `calls` (code→code), `references` (type annotations, doc links), `depends-on` (via link tool or package.json), `co-accessed` (session co-occurrence). Each edge carries a `ConfidenceTier`: `EXTRACTED` (structural, 1.0), `INFERRED` (Tier 2 similarity > 0.80, session co-occurrence), or `PROPOSED` (review queue, 0.55–0.80).
 - **Template collision penalty** (`-0.20`) — same-filename docs in different directories don't auto-link anymore (previously files with same name in different features scored false 1.0 on identifier overlap, clearing the auto-link gate).
-- **4-tier linking** — Structural (confidence 1.0) → Tier 2 inferred (~0.80) → Proposed (review queue) → Explicit (manually linked).
+- **4-tier linking** — `EXTRACTED` (structural, 1.0) → `INFERRED` (Tier 2 ~0.80, co-occurrence, conventions) → `PROPOSED` (review queue, 0.55–0.80) → Explicit (manually linked via `link` tool).
 - **External content FTS5** — SQLite's built-in full-text search, no Elasticsearch.
 - **vec0 extension** — embedded vector search, no vector DB separate.
 - **Store interface** — abstracted. Swap sqlite→libsql (Turso) without changing callers.
@@ -212,13 +222,20 @@ Embeds use API probes to auto-detect dimension — no `--embed-dim` flag needed 
 | | `recall_chunks` | Paginated chunk retrieval by parent + index | No | No |
 | | | | | |
 | **Graph** | `link` | Connect two nodes with typed edge | No | No |
-| | `query_graph` | Query edges from/to a specific node | No | No |
-| | `project_graph` | Return all edges — whole project graph shape | No | No |
 | | | | | |
 | **Ingestion / Impact** | `ingest` | Walk doc/code tree → searchable memory | No* | No |
 | | `onboard` | Full pipeline: detect → ingest → embed → link | No* | No |
 | | `onboard_check` | Check graph state for a project (read-only stats) | No | No |
 | | `check_impact` | "What's stale because this changed?" | No | No |
+| | | | | |
+| **Graph / Discovery** | `query_graph` | Query edges from/to a specific node | No | No |
+| | `project_graph` | Return all edges — whole project graph shape | No | No |
+| | `find_path` | BFS shortest path between two nodes | No | No |
+| | `link_projects` | Link current project's code symbols to other known projects | No | No |
+| | | | | |
+| **Maintenance** | `clear_project` | Delete a project's data (nodes, edges, vectors) | No | No |
+| | `list_projects` | List all known projects with node/edge counts | No | No |
+| | `check_recent` | List nodes updated within N days | No | No |
 | | | | | |
 | **LLM extraction** | `extract_and_remember` | Pull facts from raw conversation text | **Yes** | **Yes** |
 | | | | | |
@@ -268,13 +285,13 @@ Idempotent: unchanged files skip re-chunk + re-embed (content-hash skip).
 Accept: application/json
 → 200  {"project_id":"my-project","total_edges":36000,"returned":500,
          "nodes":[{"id":"...","title":"...","type":"...","group":"...","weight":2},...],
-         "edges":[{"source":"...","target":"...","edge_type":"contains","confidence":1.0},...]}
+         "edges":[{"source":"...","target":"...","edge_type":"contains","confidence":1.0,"confidence_tier":"EXTRACTED"},...]}
 
 Accept: text/html (default)
 → 200  D3 force-directed graph HTML page
 ```
 
-### `POST /mcp` — MCP Streamable HTTP (all 14 tools)
+### `POST /mcp` — MCP Streamable HTTP (all 20 tools)
 
 See [Tools (MCP)](#tools-mcp) section below. Request/response follows the [MCP Streamable HTTP spec](https://spec.modelcontextprotocol.io/).
 
@@ -417,7 +434,7 @@ Not competing. [Graphify](https://github.com/Graphify-Labs/graphify) (96.5k ★,
 | **Non-code content** | Docs, PRDs, ERDs, specs, conventions, code, git history, conversation facts, custom notes | Docs, PDFs, images, video/audio, office files |
 | **Recency / Staleness** | Built-in: `2^(-age / halfLife)` decay + stale propagation on change | Snapshot at build time. `--update` / `watch` / git hooks for differential re-sync. No query-time decay or propagation |
 | **Live updates** | CRUD at any time — `remember`, `link`, `forget`, `ingest` all work while server is running | Rebuild the graph. Auto-rebuild on git commit via hook |
-| **Edge types** | 4 tiers: structural (1.0) → inferred (~0.80) → proposed (review) → explicit | `EXTRACTED` / `INFERRED` / `AMBIGUOUS` — each edge tagged with confidence tier |
+| **Edge types** | 4 tiers: `EXTRACTED` (1.0) → `INFERRED` (~0.80, co-occurrence) → `PROPOSED` (review, 0.55–0.80) → explicit (manual link) | `EXTRACTED` / `INFERRED` / `AMBIGUOUS` — each edge tagged with confidence tier |
 | **Embeddings** | Yes — vec0 extension, ONNX sidecar or Ollama | None — pure graph, no vector store |
 | **Output** | MCP tool responses + live D3 graph page at `GET /graph/{project}` | `graph.html`, `GRAPH_REPORT.md`, `graph.json` (git-committable) |
 | **MCP** | Native MCP server (stdio or HTTP) | `python -m graphify.serve graph.json` (separate process) |

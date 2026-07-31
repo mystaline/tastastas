@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"go/ast"
 	"go/types"
+	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/mystaline-dev/tastastas/internal/ingest/codeast/treesitter"
@@ -17,11 +19,21 @@ import (
 )
 
 type Config struct {
-	Root         string
-	ProjectID    string
-	Languages    []string
-	ExcludeGlobs []string
-	Incremental  bool
+	Root             string
+	ProjectID        string
+	Languages        []string
+	ExcludeGlobs     []string
+	Incremental      bool
+	WorkspaceModules []string // P0: module paths from detectModuleRoots, used for cross-pkg call stubs in P2a
+}
+
+func extractEdgeTier(edgeType string) string {
+	switch edgeType {
+	case "defines", "calls", "imports":
+		return "EXTRACTED"
+	default:
+		return "INFERRED"
+	}
 }
 
 type CodeastIngestor struct {
@@ -35,55 +47,98 @@ func New(db store.Store, cfg Config) *CodeastIngestor {
 
 // Ingest runs code ingestion for the configured languages.
 func (c *CodeastIngestor) Ingest(ctx context.Context) ([]store.Node, []store.Edge, error) {
+	nodes, edges, _, err := c.IngestWithCalls(ctx)
+	return nodes, edges, err
+}
+
+// IngestWithCalls is like Ingest but also returns raw_calls for cross-file linking.
+// A single language's ingestion failure (bad query, parse error, etc.) is
+// logged and skipped rather than aborting every other language's results —
+// one broken tree-sitter query for Rust must never take down Go/TS ingestion.
+func (c *CodeastIngestor) IngestWithCalls(
+	ctx context.Context,
+) ([]store.Node, []store.Edge, []treesitter.RawCall, error) {
 	var allNodes []store.Node
 	var allEdges []store.Edge
+	var allRawCalls []treesitter.RawCall
+	hasTS := false
+	var langErrs []string
 
 	for _, lang := range c.cfg.Languages {
 		switch lang {
 		case "go":
 			nodes, edges, err := c.ingestGo()
 			if err != nil {
-				return nil, nil, err
+				langErrs = append(langErrs, fmt.Sprintf("go: %v", err))
+				continue
 			}
 
 			allNodes = append(allNodes, nodes...)
 			allEdges = append(allEdges, edges...)
 		case "typescript", "ts", "javascript", "js":
-			nodes, edges, err := c.ingestTreeSitter(lang)
+			nodes, edges, rc, err := c.ingestTreeSitterWithCalls(lang)
 			if err != nil {
-				return nil, nil, err
+				langErrs = append(langErrs, fmt.Sprintf("%s: %v", lang, err))
+				continue
 			}
 
 			allNodes = append(allNodes, nodes...)
 			allEdges = append(allEdges, edges...)
+			allRawCalls = append(allRawCalls, rc...)
+			hasTS = true
 		case "python", "py":
-			nodes, edges, err := c.ingestTreeSitter(lang)
+			nodes, edges, rc, err := c.ingestTreeSitterWithCalls(lang)
 			if err != nil {
-				return nil, nil, err
+				langErrs = append(langErrs, fmt.Sprintf("%s: %v", lang, err))
+				continue
 			}
 
 			allNodes = append(allNodes, nodes...)
 			allEdges = append(allEdges, edges...)
+			allRawCalls = append(allRawCalls, rc...)
 		case "rust", "rs":
-			nodes, edges, err := c.ingestTreeSitter(lang)
+			nodes, edges, rc, err := c.ingestTreeSitterWithCalls(lang)
 			if err != nil {
-				return nil, nil, err
+				langErrs = append(langErrs, fmt.Sprintf("%s: %v", lang, err))
+				continue
 			}
 
 			allNodes = append(allNodes, nodes...)
 			allEdges = append(allEdges, edges...)
+			allRawCalls = append(allRawCalls, rc...)
 		default:
-			return nil, nil, fmt.Errorf("unsupported language: %s", lang)
+			langErrs = append(langErrs, fmt.Sprintf("unsupported language: %s", lang))
 		}
 	}
 
-	return allNodes, allEdges, nil
+	if len(langErrs) > 0 {
+		log.Printf("codeast: %d language(s) skipped due to errors: %s", len(langErrs), strings.Join(langErrs, "; "))
+	}
+	// Fail only if every language failed and nothing was ingested — a total
+	// loss, not a partial one.
+	if len(allNodes) == 0 && len(langErrs) > 0 && len(langErrs) == len(c.cfg.Languages) {
+		return nil, nil, nil, fmt.Errorf("codeast: all languages failed: %s", strings.Join(langErrs, "; "))
+	}
+
+	// Free AST memory before post-processing — packages.Load (even without
+	// NeedDeps) can hold hundreds of MB of type-checked ASTs that won't be
+	// touched again until the next onboard call.
+	runtime.GC()
+
+	// Package manifest extraction for TS/JS projects (P2f)
+	if hasTS {
+		pkgNodes, pkgEdges := treesitter.ExtractPackageManifests(c.cfg.Root, c.cfg.ProjectID)
+		allNodes = append(allNodes, pkgNodes...)
+		allEdges = append(allEdges, pkgEdges...)
+	}
+
+	return allNodes, allEdges, allRawCalls, nil
 }
 
 func (c *CodeastIngestor) ingestGo() ([]store.Node, []store.Edge, error) {
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedTypes | packages.NeedTypesInfo |
-			packages.NeedSyntax | packages.NeedImports | packages.NeedDeps,
+			packages.NeedSyntax | packages.NeedImports,
 		Dir: c.cfg.Root,
 	}
 
@@ -94,15 +149,13 @@ func (c *CodeastIngestor) ingestGo() ([]store.Node, []store.Edge, error) {
 
 	var nodes []store.Node
 	var edges []store.Edge
-	pkgNodes := make(map[string]string) // pkg path -> node ID
+	pkgNodes := make(map[string]string)
 
 	for _, pkg := range pkgs {
 		if len(pkg.Errors) > 0 {
-			// Skip packages with errors but don't fail entirely
 			continue
 		}
 
-		// Create package node
 		pkgNodeID := fmt.Sprintf("%s/code:package/%s", c.cfg.ProjectID, pkg.PkgPath)
 		pkgNodes[pkg.PkgPath] = pkgNodeID
 
@@ -118,7 +171,8 @@ func (c *CodeastIngestor) ingestGo() ([]store.Node, []store.Edge, error) {
 			Importance:    0.5,
 		})
 
-		// Extract functions and types
+		fileCache := make(map[string][]byte)
+
 		for ident, obj := range pkg.TypesInfo.Defs {
 			if obj == nil {
 				continue
@@ -126,36 +180,29 @@ func (c *CodeastIngestor) ingestGo() ([]store.Node, []store.Edge, error) {
 
 			switch o := obj.(type) {
 			case *types.Func:
-				if o.Pkg() == pkg.Types { // only functions defined in this package
-					// Skip interface method declarations (no body, Recv().Underlying()
-					// belongs to the interface, not a concrete type) — they're not
-					// separately-callable symbols and would collide with the
-					// concrete type's method of the same name.
+				if o.Pkg() == pkg.Types {
 					if isInterfaceMethod(o) {
 						continue
 					}
-					n := c.makeFuncNode(pkg, ident.Name, o)
+					n := c.makeFuncNode(pkg, ident.Name, o, fileCache)
 					nodes = append(nodes, n)
 					edges = append(edges, store.Edge{
 						FromID: pkgNodeID, ToID: n.ID,
-						EdgeType: "defines", Confidence: 1.0,
+						EdgeType: "defines", Confidence: 1.0, ConfidenceTier: "EXTRACTED",
 					})
 				}
 			case *types.TypeName:
-				if o.Pkg() == pkg.Types { // only types defined in this package
+				if o.Pkg() == pkg.Types {
 					n := c.makeTypeNode(pkg, ident.Name, o)
 					nodes = append(nodes, n)
 					edges = append(edges, store.Edge{
 						FromID: pkgNodeID, ToID: n.ID,
-						EdgeType: "defines", Confidence: 1.0,
+						EdgeType: "defines", Confidence: 1.0, ConfidenceTier: "EXTRACTED",
 					})
 				}
 			}
 		}
 
-		// Extract call edges — resolve each FuncDecl's *types.Func via
-		// TypesInfo.Defs so the from-ID matches makeFuncNode's qualified
-		// (receiver-aware) naming exactly.
 		for _, file := range pkg.Syntax {
 			for _, decl := range file.Decls {
 				fnDecl, ok := decl.(*ast.FuncDecl)
@@ -175,20 +222,195 @@ func (c *CodeastIngestor) ingestGo() ([]store.Node, []store.Edge, error) {
 			}
 		}
 
-		// Import edges
 		for _, imp := range pkg.Imports {
 			if toPkgID, ok := pkgNodes[imp.PkgPath]; ok {
 				edges = append(edges, store.Edge{
-					FromID:     pkgNodeID,
-					ToID:       toPkgID,
-					EdgeType:   "imports",
-					Confidence: 1.0,
+					FromID:         pkgNodeID,
+					ToID:           toPkgID,
+					EdgeType:       "imports",
+					Confidence:     1.0,
+					ConfidenceTier: "EXTRACTED",
 				})
 			}
 		}
 	}
 
+	// Type reference edges: parameter/return/field types (Go)
+	typeNodeIndex := buildGoTypeNodeIndex(c.cfg.ProjectID, pkgs, pkgNodes)
+	for _, pkg := range pkgs {
+		if len(pkg.Errors) > 0 {
+			continue
+		}
+		refs := c.extractGoTypeRefs(pkg, typeNodeIndex)
+		edges = append(edges, refs...)
+	}
+
 	return nodes, edges, nil
+}
+
+// buildGoTypeNodeIndex builds a map of "pkgPath.TypeName" → node ID for all
+// workspace type nodes, used for type reference edge resolution.
+func buildGoTypeNodeIndex(projectID string, pkgs []*packages.Package, pkgNodes map[string]string) map[string]string {
+	idx := make(map[string]string)
+	for _, pkg := range pkgs {
+		if len(pkg.Errors) > 0 {
+			continue
+		}
+		for _, obj := range pkg.TypesInfo.Defs {
+			if tn, ok := obj.(*types.TypeName); ok && tn.Pkg() != nil {
+				if _, ok := pkgNodes[tn.Pkg().Path()]; ok {
+					key := tn.Pkg().Path() + "." + tn.Name()
+					id := fmt.Sprintf("%s/code:type/%s.%s", projectID, tn.Pkg().Path(), tn.Name())
+					idx[key] = id
+				}
+			}
+		}
+	}
+	return idx
+}
+
+// predeclaredTypes are Go built-in types that should never produce reference edges.
+var predeclaredTypes = map[string]bool{
+	"bool": true, "int": true, "int8": true, "int16": true, "int32": true, "int64": true,
+	"uint": true, "uint8": true, "uint16": true, "uint32": true, "uint64": true,
+	"uintptr": true, "float32": true, "float64": true, "complex64": true, "complex128": true,
+	"string": true, "byte": true, "rune": true, "error": true,
+	"any": true, "comparable": true, "true": true, "false": true, "iota": true, "nil": true,
+}
+
+func (c *CodeastIngestor) extractGoTypeRefs(pkg *packages.Package, typeIndex map[string]string) []store.Edge {
+	var refs []store.Edge
+
+	for _, file := range pkg.Syntax {
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.FuncDecl:
+				if node.Type == nil {
+					return true
+				}
+				// Find the func node ID
+				fnObj, ok := pkg.TypesInfo.Defs[node.Name]
+				if !ok || fnObj == nil {
+					return true
+				}
+				fn, ok := fnObj.(*types.Func)
+				if !ok {
+					return true
+				}
+				fromID := c.funcNodeID(pkg, funcQualifiedName(fn))
+
+				// Walk params and returns
+				if node.Type.Params != nil {
+					for _, field := range node.Type.Params.List {
+						refs = append(refs, c.extractTypeRefFromExpr(field.Type, pkg, typeIndex, fromID)...)
+					}
+				}
+				if node.Type.Results != nil {
+					for _, field := range node.Type.Results.List {
+						refs = append(refs, c.extractTypeRefFromExpr(field.Type, pkg, typeIndex, fromID)...)
+					}
+				}
+			case *ast.GenDecl:
+				if node.Tok.String() != "type" {
+					return true
+				}
+				for _, spec := range node.Specs {
+					ts, ok := spec.(*ast.TypeSpec)
+					if !ok {
+						continue
+					}
+					typeObj, ok := pkg.TypesInfo.Defs[ts.Name]
+					if !ok || typeObj == nil {
+						continue
+					}
+					tn, ok := typeObj.(*types.TypeName)
+					if !ok {
+						continue
+					}
+					fromID := fmt.Sprintf("%s/code:type/%s.%s", c.cfg.ProjectID, pkg.PkgPath, tn.Name())
+
+					// Walk struct fields
+					if st, ok := ts.Type.(*ast.StructType); ok {
+						for _, field := range st.Fields.List {
+							refs = append(refs, c.extractTypeRefFromExpr(field.Type, pkg, typeIndex, fromID)...)
+						}
+					}
+					// Walk interface methods
+					if it, ok := ts.Type.(*ast.InterfaceType); ok {
+						for _, method := range it.Methods.List {
+							refs = append(refs, c.extractTypeRefFromExpr(method.Type, pkg, typeIndex, fromID)...)
+						}
+					}
+				}
+			}
+			return true
+		})
+	}
+
+	return refs
+}
+
+func (c *CodeastIngestor) extractTypeRefFromExpr(
+	expr ast.Expr,
+	pkg *packages.Package,
+	typeIndex map[string]string,
+	fromID string,
+) []store.Edge {
+	if pkg.TypesInfo == nil {
+		return nil
+	}
+	tv, ok := pkg.TypesInfo.Types[expr]
+	if !ok || tv.Type == nil {
+		return nil
+	}
+	return c.resolveTypeRef(tv.Type, typeIndex, fromID)
+}
+
+func (c *CodeastIngestor) resolveTypeRef(t types.Type, typeIndex map[string]string, fromID string) []store.Edge {
+	switch t := t.(type) {
+	case *types.Named:
+		if t.Obj().Pkg() == nil {
+			return nil // predeclared type
+		}
+		if predeclaredTypes[t.Obj().Name()] {
+			return nil
+		}
+		key := t.Obj().Pkg().Path() + "." + t.Obj().Name()
+		if toID, ok := typeIndex[key]; ok {
+			return []store.Edge{{
+				FromID:         fromID,
+				ToID:           toID,
+				EdgeType:       "references",
+				Confidence:     1.0,
+				ConfidenceTier: "EXTRACTED",
+			}}
+		}
+		return nil
+	case *types.Pointer:
+		return c.resolveTypeRef(t.Elem(), typeIndex, fromID)
+	case *types.Slice:
+		return c.resolveTypeRef(t.Elem(), typeIndex, fromID)
+	case *types.Array:
+		return c.resolveTypeRef(t.Elem(), typeIndex, fromID)
+	case *types.Map:
+		var refs []store.Edge
+		refs = append(refs, c.resolveTypeRef(t.Key(), typeIndex, fromID)...)
+		refs = append(refs, c.resolveTypeRef(t.Elem(), typeIndex, fromID)...)
+		return refs
+	case *types.Chan:
+		return c.resolveTypeRef(t.Elem(), typeIndex, fromID)
+	case *types.Signature:
+		var refs []store.Edge
+		for i := 0; i < t.Params().Len(); i++ {
+			refs = append(refs, c.resolveTypeRef(t.Params().At(i).Type(), typeIndex, fromID)...)
+		}
+		for i := 0; i < t.Results().Len(); i++ {
+			refs = append(refs, c.resolveTypeRef(t.Results().At(i).Type(), typeIndex, fromID)...)
+		}
+		return refs
+	default:
+		return nil
+	}
 }
 
 // funcQualifiedName returns a name unique within a package even when
@@ -221,22 +443,19 @@ func isInterfaceMethod(fn *types.Func) bool {
 	return isIface
 }
 
-func (c *CodeastIngestor) makeFuncNode(pkg *packages.Package, ident string, fn *types.Func) store.Node {
+func (c *CodeastIngestor) makeFuncNode(pkg *packages.Package, ident string, fn *types.Func, fileCache map[string][]byte) store.Node {
 	qname := funcQualifiedName(fn)
 	fnID := fmt.Sprintf("%s/code:function/%s.%s", c.cfg.ProjectID, pkg.PkgPath, qname)
 	sig := fn.Type().String()
 	doc := ""
 	var bodySrc string
 
-	// TODO: use hashmap instean of iterating over all files for each function
 	for _, file := range pkg.Syntax {
 		for _, decl := range file.Decls {
 			fnDecl, ok := decl.(*ast.FuncDecl)
 			if !ok || fnDecl.Name.Name != fn.Name() {
 				continue
 			}
-			// Match receiver too — a bare name match alone conflates
-			// distinct methods that share a name across types.
 			if !declMatchesReceiver(fnDecl, fn) {
 				continue
 			}
@@ -246,12 +465,18 @@ func (c *CodeastIngestor) makeFuncNode(pkg *packages.Package, ident string, fn *
 			if fnDecl.Body != nil && pkg.Fset != nil {
 				start := pkg.Fset.Position(fnDecl.Body.Pos()).Offset
 				end := pkg.Fset.Position(fnDecl.Body.End()).Offset
-				if start >= 0 && end > start {
-					// Read source bytes from the actual file
-					if src, err := os.ReadFile(pkg.Fset.Position(fnDecl.Pos()).Filename); err == nil {
-						if end <= len(src) {
-							bodySrc = string(src[start:end])
+				fname := pkg.Fset.Position(fnDecl.Pos()).Filename
+				if start >= 0 && end > start && fname != "" {
+					src, ok := fileCache[fname]
+					if !ok {
+						data, err := os.ReadFile(fname)
+						if err == nil {
+							fileCache[fname] = data
+							src = data
 						}
+					}
+					if len(src) > 0 && end <= len(src) {
+						bodySrc = string(src[start:end])
 					}
 				}
 			}
@@ -338,6 +563,31 @@ func recvTypeName(expr ast.Expr) string {
 	return ""
 }
 
+// calleeNodeID resolves the node ID for a callee function.
+// If the callee is in a different package, it uses the callee's own package path
+// (not the caller's). Stdlib and external deps are skipped (returns "").
+func (c *CodeastIngestor) calleeNodeID(pkg *packages.Package, callee *types.Func) string {
+	calleePkg := callee.Pkg()
+	if calleePkg != nil && calleePkg.Path() != pkg.PkgPath {
+		if !c.isWorkspacePackage(calleePkg.Path()) {
+			return "" // skip stdlib (fmt, context, sync) and external deps
+		}
+		return fmt.Sprintf("%s/code:function/%s.%s",
+			c.cfg.ProjectID, calleePkg.Path(), funcQualifiedName(callee))
+	}
+	return c.funcNodeID(pkg, funcQualifiedName(callee))
+}
+
+// isWorkspacePackage checks if pkgPath belongs to any detected workspace module.
+func (c *CodeastIngestor) isWorkspacePackage(pkgPath string) bool {
+	for _, mod := range c.cfg.WorkspaceModules {
+		if pkgPath == mod || strings.HasPrefix(pkgPath, mod+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *CodeastIngestor) extractCalls(pkg *packages.Package, fn *ast.FuncDecl, fromID string, edges *[]store.Edge) {
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -345,14 +595,17 @@ func (c *CodeastIngestor) extractCalls(pkg *packages.Package, fn *ast.FuncDecl, 
 			return true
 		}
 
-		// Resolve callee using TypesInfo
 		if callee := resolveCallee(pkg.TypesInfo, call); callee != nil {
-			toID := c.funcNodeID(pkg, funcQualifiedName(callee))
+			toID := c.calleeNodeID(pkg, callee)
+			if toID == "" {
+				return true // skip stdlib/external, no stub edge
+			}
 			*edges = append(*edges, store.Edge{
-				FromID:     fromID,
-				ToID:       toID,
-				EdgeType:   "calls",
-				Confidence: 1.0,
+				FromID:         fromID,
+				ToID:           toID,
+				EdgeType:       "calls",
+				Confidence:     1.0,
+				ConfidenceTier: "EXTRACTED",
 			})
 		}
 		return true
@@ -396,12 +649,18 @@ func resolveCallee(info *types.Info, call *ast.CallExpr) *types.Func {
 }
 
 func (c *CodeastIngestor) ingestTreeSitter(lang string) ([]store.Node, []store.Edge, error) {
+	n, e, _, err := c.ingestTreeSitterWithCalls(lang)
+	return n, e, err
+}
+
+func (c *CodeastIngestor) ingestTreeSitterWithCalls(
+	lang string,
+) ([]store.Node, []store.Edge, []treesitter.RawCall, error) {
 	ext := treesitter.NewForLang(lang)
 	if ext == nil {
-		return nil, nil, fmt.Errorf("unsupported tree-sitter language: %s", lang)
+		return nil, nil, nil, fmt.Errorf("unsupported tree-sitter language: %s", lang)
 	}
 
-	// Walk files matching the language extension
 	walkExts := treesitter.FileExts(lang)
 	extSet := make(map[string]bool, len(walkExts))
 	for _, e := range walkExts {
@@ -410,13 +669,15 @@ func (c *CodeastIngestor) ingestTreeSitter(lang string) ([]store.Node, []store.E
 
 	var allNodes []store.Node
 	var allEdges []store.Edge
+	var allRawCalls []treesitter.RawCall
 
 	err := filepath.WalkDir(c.cfg.Root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
-			if path != c.cfg.Root && (strings.HasPrefix(d.Name(), ".") || d.Name() == "vendor" || d.Name() == "node_modules" || d.Name() == "dist" || d.Name() == "bin") {
+			if path != c.cfg.Root &&
+				(strings.HasPrefix(d.Name(), ".") || d.Name() == "vendor" || d.Name() == "node_modules" || d.Name() == "dist" || d.Name() == "bin") {
 				return filepath.SkipDir
 			}
 			return nil
@@ -429,13 +690,14 @@ func (c *CodeastIngestor) ingestTreeSitter(lang string) ([]store.Node, []store.E
 			return err
 		}
 		rel, _ := filepath.Rel(c.cfg.Root, path)
-		nodes, edges, err := treesitter.Extract(c.cfg.ProjectID, rel, source, lang, ext)
+		nodes, edges, rc, err := treesitter.Extract(c.cfg.ProjectID, rel, source, lang, ext, c.cfg.Root)
 		if err != nil {
 			return err
 		}
 		allNodes = append(allNodes, nodes...)
 		allEdges = append(allEdges, edges...)
+		allRawCalls = append(allRawCalls, rc...)
 		return nil
 	})
-	return allNodes, allEdges, err
+	return allNodes, allEdges, allRawCalls, err
 }

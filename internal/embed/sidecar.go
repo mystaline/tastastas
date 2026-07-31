@@ -152,6 +152,8 @@ func (s *SidecarEmbedder) Close() error {
 	return err
 }
 
+func (s *SidecarEmbedder) MaxContentBytes() int { return 0 }
+
 // Embed returns the embedding vector for a single text.
 func (s *SidecarEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
 	vecs, err := s.EmbedBatch(ctx, []string{text})
@@ -239,6 +241,15 @@ func (s *SidecarEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]f
 		}
 		if len(resp.Embeddings) != len(texts) {
 			return nil, fmt.Errorf("embed: expected %d embeddings, got %d", len(texts), len(resp.Embeddings))
+		}
+		for i, v := range resp.Embeddings {
+			if j := firstNonFinite(v); j >= 0 {
+				return nil, fmt.Errorf(
+					"embed: sidecar data[%d][%d] is NaN/Inf — worker returned a corrupt embedding, refusing to persist",
+					i,
+					j,
+				)
+			}
 		}
 		return resp.Embeddings, nil
 	}

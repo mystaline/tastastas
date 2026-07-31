@@ -79,6 +79,8 @@ services:
       - ":9292"
       - "--embed-backend"
       - "openai"
+      - "--consolidate-interval"
+      - "1h"
     environment:
       - TASTASTAS_OPENAI_KEY=${TASTASTAS_OPENAI_KEY:?required}
 
@@ -112,6 +114,7 @@ docker compose up -d
 | HTTP + OpenAI | `TASTASTAS_OPENAI_KEY=$KEY ./tastastas --serve :8080 --graph-addr :9292 --embed-backend openai` |
 | HTTP + Ollama | `./tastastas --serve :8080 --embed-backend ollama --ollama-url http://ollama:11434` |
 | OpenRouter | `TASTASTAS_OPENAI_KEY=$OR_KEY ./tastastas --serve :8080 --graph-addr :9292 --embed-backend openai --openai-base-url https://openrouter.ai/api/v1` |
+| With consolidation | `./tastastas --serve :8080 --consolidate-interval 1h` |
 | Custom DB path | `./tastastas --db /path/to/db` |
 | Auth + HTTP | `./tastastas --serve :8080 --auth-token mytoken` |
 
@@ -200,6 +203,11 @@ Heavy only during **ingest** (ONNX embedding saturates CPU, RAM spikes). Recall 
 |------|---------|-------------|
 | `--spa-dir` | `""` | Filesystem SPA override. Also `$TASTASTAS_SPA_DIR`. |
 
+### Consolidation
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--consolidate-interval` | `""` | Background cron interval e.g. `1h`, `30m`. Empty = disabled. Detects session co-occurrence → creates `co-accessed` edges. |
+
 ### Env variables
 
 | Variable | Equivalent flag |
@@ -208,6 +216,7 @@ Heavy only during **ingest** (ONNX embedding saturates CPU, RAM spikes). Recall 
 | `TASTASTAS_OPENAI_KEY` | `--openai-api-key` |
 | `TASTASTAS_SPA_DIR` | `--spa-dir` |
 | `TASTASTAS_AUTH_TOKEN` | `--auth-token` |
+| `TASTASTAS_EMBED` | `--embed-backend` (docker-compose override) |
 
 ---
 

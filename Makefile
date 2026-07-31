@@ -40,7 +40,7 @@ clean:
 	cargo clean --manifest-path sidecar/Cargo.toml
 
 # Docker
-.PHONY: docker-build docker-up docker-down docker-logs
+.PHONY: docker-build docker-up docker-down docker-logs release
 
 docker-build:
 	docker build -t tastastas .
@@ -54,21 +54,8 @@ docker-down:
 docker-logs:
 	docker compose logs -f
 
-# Release — tag & push. Usage: make release [MAJOR=n] [MINOR=n] [PATCH=n]
 .PHONY: release
 
-MAJOR ?=
-MINOR ?=
-PATCH ?=
-
 release:
-	@latest=$$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0"); \
-	ver=$${latest#v}; \
-	cur_major=$$(echo "$$ver" | cut -d. -f1); \
-	cur_minor=$$(echo "$$ver" | cut -d. -f2); \
-	cur_patch=$$(echo "$$ver" | cut -d. -f3); \
-	major=$${MAJOR:-$$cur_major}; \
-	minor=$${MINOR:-$$cur_minor}; \
-	patch=$${PATCH:-$$((cur_patch + 1))}; \
-	tag="v$$major.$$minor.$$patch"; \
-	git tag "$$tag" && git push origin "$$tag" && echo "pushed $$tag"
+	@echo "Use CI: gh workflow run tag-release.yml --field bump=patch"
+	@echo "  or:   gh workflow run tag-release.yml --field version=v1.2.3"

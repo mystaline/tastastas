@@ -10,9 +10,48 @@ import (
 )
 
 // ingestMu serializes access to the embedder for ingest jobs. Only one
-// goroutine calls chunkAndEmbedNodes at a time; others set their job phase
+// goroutine calls onboard.Run at a time; others set their job phase
 // to "waiting" so callers see the queue position.
 var ingestMu sync.Mutex
+
+// jobWG tracks in-flight async jobs so shutdown can wait for them before
+// closing the DB. Jobs are spawned via safeGo; WaitForJobs must only be
+// called once no new jobs can be spawned (server loop exited).
+var jobWG sync.WaitGroup
+
+// jobCtx is the context async jobs run under. Derived from the server's
+// context via SetJobContext so a signal cancels long-running ingests
+// instead of letting them race db.Close at shutdown.
+var (
+	jobCtx    = context.Background()
+	jobCancel = func() {}
+)
+
+// SetJobContext sets the context async ingest jobs run under. Call once at
+// startup with the process's root (signal-aware) context.
+func SetJobContext(ctx context.Context) {
+	jobCancel()
+	jobCtx, jobCancel = context.WithCancel(ctx)
+}
+
+// CancelJobs cancels the context all async jobs run under.
+func CancelJobs() { jobCancel() }
+
+// WaitForJobs blocks until all in-flight jobs finish or the timeout elapses.
+// Returns true if every job completed.
+func WaitForJobs(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		jobWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
 
 // ingestJob tracks one async ingest run. Big-directory ingests (docwalk over
 // a whole workspace) can take minutes — long enough to blow past any client
@@ -21,6 +60,7 @@ var ingestMu sync.Mutex
 // a goroutine; GET /ingest/jobs/{id} polls status.
 type ingestJob struct {
 	ID              string             `json:"id"`
+	ProjectID       string             `json:"project_id,omitempty"`
 	Status          string             `json:"status"`          // "running" | "done" | "error"
 	Phase           string             `json:"phase,omitempty"` // "walking" | "syncing" | "waiting" | "chunking" | "embedding" | "persisting" | "linking" | "" (done/error)
 	Nodes           int                `json:"nodes_ingested,omitempty"`
@@ -33,6 +73,7 @@ type ingestJob struct {
 	FilesWalked     int                `json:"files_walked,omitempty"`
 	FilesSkipped    int                `json:"files_skipped,omitempty"`
 	Error           string             `json:"error,omitempty"`
+	Warnings        []string           `json:"warnings,omitempty"` // non-fatal issues (e.g. corrupt embeddings skipped) — job still completed
 	StartedAt       time.Time          `json:"started_at"`
 	EndedAt         time.Time          `json:"ended_at,omitempty"`
 	cancel          context.CancelFunc // for job cancellation
@@ -53,7 +94,7 @@ func newJobStore(st store.Store) *jobStore {
 	return &jobStore{store: st, jobs: map[string]*ingestJob{}}
 }
 
-func (js *jobStore) create() *ingestJob {
+func (js *jobStore) create(projectID string) *ingestJob {
 	js.mu.Lock()
 	defer js.mu.Unlock()
 
@@ -63,6 +104,7 @@ func (js *jobStore) create() *ingestJob {
 
 	j := &ingestJob{
 		ID:        id,
+		ProjectID: projectID,
 		Status:    "running",
 		Phase:     "walking",
 		StartedAt: time.Now(),
@@ -86,6 +128,40 @@ func (js *jobStore) get(id string) (ingestJob, bool) {
 		return ingestJob{}, false
 	}
 	return *j, true // copy: caller must not see mutations after unlock
+}
+
+// latestByProject returns the most recent job for a project, if any.
+func (js *jobStore) latestByProject(projectID string) (ingestJob, bool) {
+	js.mu.RLock()
+	defer js.mu.RUnlock()
+
+	var latest *ingestJob
+	for _, j := range js.jobs {
+		if j.ProjectID == projectID {
+			if latest == nil || j.StartedAt.After(latest.StartedAt) {
+				latest = j
+			}
+		}
+	}
+	if latest == nil {
+		return ingestJob{}, false
+	}
+	return *latest, true
+}
+
+// addWarning appends a non-fatal warning to a running job — used when a
+// vector write is skipped (corrupt embedding) but the job itself continues,
+// so a caller polling job status still sees it happened instead of it only
+// being visible in the server's own stdout log.
+func (js *jobStore) addWarning(id, msg string) {
+	js.mu.Lock()
+	defer js.mu.Unlock()
+
+	j, ok := js.jobs[id]
+	if !ok {
+		return
+	}
+	j.Warnings = append(j.Warnings, msg)
 }
 
 // finish marks the job done/error and updates final counts.

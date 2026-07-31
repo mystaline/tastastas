@@ -140,3 +140,5 @@ func (p *SidecarPool) Close() error {
 	}
 	return firstErr
 }
+
+func (p *SidecarPool) MaxContentBytes() int { return 0 }

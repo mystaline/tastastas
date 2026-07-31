@@ -7,11 +7,12 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"log"
+	"math"
 	"strings"
 
 	"github.com/mystaline-dev/tastastas/internal/store"
@@ -71,43 +72,43 @@ func (s *Store) initSchema(ctx context.Context) error {
 	}
 
 	// 3. vec0 tables are dimension-specific. If an existing vec0 table has a
-		// different dimension (e.g. user switched embedder from ollama 768-dim to
-		// sidecar 384-dim), drop + re-create automatically. vec0 doesn't support
-		// ALTER TABLE to change float[N].
-		for _, tbl := range []string{"node_vectors", "chunk_vectors"} {
-			exists := 0
-			s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_list WHERE name = ?", tbl).Scan(&exists)
-			if exists != 0 {
-				// Check current dimension
-				var sqlStr string
-				s.db.QueryRowContext(ctx, "SELECT sql FROM sqlite_master WHERE name = ? AND type = 'table'", tbl).
-					Scan(&sqlStr)
-				wantDim := fmt.Sprintf("float[%d]", s.dim)
-				if !strings.Contains(sqlStr, wantDim) {
-					if _, err := s.db.ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl); err != nil {
-						return fmt.Errorf("sqlite: drop stale %s: %w", tbl, err)
-					}
+	// different dimension (e.g. user switched embedder from ollama 768-dim to
+	// sidecar 384-dim), drop + re-create automatically. vec0 doesn't support
+	// ALTER TABLE to change float[N].
+	for _, tbl := range []string{"node_vectors", "chunk_vectors"} {
+		exists := 0
+		s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_list WHERE name = ?", tbl).Scan(&exists)
+		if exists != 0 {
+			// Check current dimension
+			var sqlStr string
+			s.db.QueryRowContext(ctx, "SELECT sql FROM sqlite_master WHERE name = ? AND type = 'table'", tbl).
+				Scan(&sqlStr)
+			wantDim := fmt.Sprintf("float[%d]", s.dim)
+			if !strings.Contains(sqlStr, wantDim) {
+				if _, err := s.db.ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl); err != nil {
+					return fmt.Errorf("sqlite: drop stale %s: %w", tbl, err)
 				}
 			}
-			colName := "node_id"
-			if tbl == "chunk_vectors" {
-				colName = "chunk_id"
-			}
-			stmt := fmt.Sprintf(
-				`CREATE VIRTUAL TABLE IF NOT EXISTS %s USING vec0(%s TEXT PRIMARY KEY, embedding float[%d])`,
-				tbl, colName, s.dim,
-			)
-			if _, err := s.db.ExecContext(ctx, stmt); err != nil {
-				return fmt.Errorf("sqlite: create %s: %w", tbl, err)
-			}
 		}
+		colName := "node_id"
+		if tbl == "chunk_vectors" {
+			colName = "chunk_id"
+		}
+		stmt := fmt.Sprintf(
+			`CREATE VIRTUAL TABLE IF NOT EXISTS %s USING vec0(%s TEXT PRIMARY KEY, embedding float[%d])`,
+			tbl, colName, s.dim,
+		)
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("sqlite: create %s: %w", tbl, err)
+		}
+	}
 
-		// 4. Backfill legacy vec0 rows to composite PK format.
-		// Must run after vec0 tables are confirmed to exist and match dimension.
-		if err := s.backfillVec0ModelIDs(ctx); err != nil {
-			return fmt.Errorf("sqlite: backfill vec0 model ids: %w", err)
-		}
-		return nil
+	// 4. Backfill legacy vec0 rows to composite PK format.
+	// Must run after vec0 tables are confirmed to exist and match dimension.
+	if err := s.backfillVec0ModelIDs(ctx); err != nil {
+		return fmt.Errorf("sqlite: backfill vec0 model ids: %w", err)
+	}
+	return nil
 }
 
 // backfillVec0ModelIDs migrates legacy vec0 rows (pre-V2) to composite PK
@@ -207,9 +208,17 @@ func (s *Store) backfillVec0ModelIDs(ctx context.Context) error {
 	}
 
 	for _, r := range nodeVecs {
+		if len(r.emb) == 0 || store.HasNonFiniteFloat32(r.emb) {
+			log.Printf("sqlite: backfill: skipping node %s, invalid legacy embedding (empty or NaN/Inf)", r.id)
+			continue
+		}
 		modelID := modelForNode[r.id]
 		newID := modelID + ":" + r.id
-		vecJSON, _ := json.Marshal(r.emb)
+		vecJSON, jerr := json.Marshal(r.emb)
+		if jerr != nil {
+			log.Printf("sqlite: backfill: skipping node %s, marshal error: %v", r.id, jerr)
+			continue
+		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO node_vectors (node_id, embedding) VALUES (?, vec_f32(?))`,
 			newID, string(vecJSON)); err != nil {
@@ -222,9 +231,17 @@ func (s *Store) backfillVec0ModelIDs(ctx context.Context) error {
 		}
 	}
 	for _, r := range chunkVecs {
+		if len(r.emb) == 0 || store.HasNonFiniteFloat32(r.emb) {
+			log.Printf("sqlite: backfill: skipping chunk %s, invalid legacy embedding (empty or NaN/Inf)", r.id)
+			continue
+		}
 		modelID := defaultModel
 		newID := modelID + ":" + r.id
-		vecJSON, _ := json.Marshal(r.emb)
+		vecJSON, jerr := json.Marshal(r.emb)
+		if jerr != nil {
+			log.Printf("sqlite: backfill: skipping chunk %s, marshal error: %v", r.id, jerr)
+			continue
+		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO chunk_vectors (chunk_id, embedding) VALUES (?, vec_f32(?))`,
 			newID, string(vecJSON)); err != nil {
@@ -240,20 +257,64 @@ func (s *Store) backfillVec0ModelIDs(ctx context.Context) error {
 	return tx.Commit()
 }
 
-// blobToFloat32Slice converts a raw vec0 blob (big-endian float32 bytes) into
-// a []float32 slice. vec0 stores embeddings as raw bytes internally.
+// blobToFloat32Slice converts a raw vec0 blob (little-endian float32 bytes) into
+// a []float32 slice. vec0's C extension stores float32 in platform-native byte
+// order; on amd64 this is little-endian.
 func blobToFloat32Slice(blob []byte, dim int) []float32 {
 	if len(blob) == 0 {
 		return nil
 	}
-	// vec0 uses platform-native float32 storage (4 bytes per element).
 	out := make([]float32, dim)
 	for i := 0; i < dim && i*4+4 <= len(blob); i++ {
-		// Read as big-endian IEEE 754 float32
-		bits := uint32(blob[i*4])<<24 | uint32(blob[i*4+1])<<16 | uint32(blob[i*4+2])<<8 | uint32(blob[i*4+3])
-		out[i] = float32(math.Float32frombits(bits))
+		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(blob[i*4:]))
 	}
 	return out
+}
+
+func (s *Store) GetNodeEmbeddings(ctx context.Context, nodeIDs []string) (map[string][]float32, error) {
+	if len(nodeIDs) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, len(nodeIDs))
+	args := make([]any, len(nodeIDs))
+	for i, id := range nodeIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	query := "SELECT nvm.node_id, v.embedding FROM node_vectors v JOIN node_vector_model nvm ON nvm.id = v.node_id WHERE nvm.node_id IN (" + strings.Join(
+		placeholders,
+		",",
+	) + ")"
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: get node embeddings: %w", err)
+	}
+	defer rows.Close()
+	result := make(map[string][]float32)
+	for rows.Next() {
+		var id string
+		var blob []byte
+		if err := rows.Scan(&id, &blob); err != nil {
+			return nil, err
+		}
+		if len(blob) != s.dim*4 {
+			log.Printf(
+				"sqlite: WARN skipping read of %s: blob len %d bytes, expected %d for dim %d (truncated/corrupt row)",
+				id,
+				len(blob),
+				s.dim*4,
+				s.dim,
+			)
+			continue
+		}
+		emb := blobToFloat32Slice(blob, s.dim)
+		if store.HasNonFiniteFloat32(emb) {
+			log.Printf("sqlite: WARN skipping read of %s: stored embedding contains NaN/Inf (corrupt row)", id)
+			continue
+		}
+		result[id] = emb
+	}
+	return result, rows.Err()
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -312,18 +373,34 @@ func (s *Store) UpsertNode(ctx context.Context, n store.Node) error {
 		return fmt.Errorf("sqlite: upsert node %s: %w", n.ID, err)
 	}
 
-	if len(n.Embedding) > 0 {
-		if len(n.Embedding) != s.dim {
-			return fmt.Errorf(
-				"sqlite: node %s embedding has dim %d, store configured for dim %d",
-				n.ID,
-				len(n.Embedding),
-				s.dim,
-			)
-		}
-		vecJSON, err := json.Marshal(n.Embedding)
-		if err != nil {
-			return fmt.Errorf("sqlite: marshal embedding for %s: %w", n.ID, err)
+	var vectorSkipped error
+	switch {
+	case len(n.Embedding) > 0 && store.HasNonFiniteFloat32(n.Embedding):
+		log.Printf(
+			"sqlite: WARN skipping vector write for node %s: embedding contains NaN/Inf (metadata still upserted)",
+			n.ID,
+		)
+		vectorSkipped = fmt.Errorf("node %s: %w: contains NaN/Inf", n.ID, store.ErrVectorSkipped)
+	case len(n.Embedding) > 0 && len(n.Embedding) != s.dim:
+		log.Printf(
+			"sqlite: WARN skipping vector write for node %s: embedding dim %d != store dim %d (metadata still upserted)",
+			n.ID,
+			len(n.Embedding),
+			s.dim,
+		)
+		vectorSkipped = fmt.Errorf(
+			"node %s: %w: dim %d != store dim %d",
+			n.ID,
+			store.ErrVectorSkipped,
+			len(n.Embedding),
+			s.dim,
+		)
+	case len(n.Embedding) > 0:
+		vecJSON, jerr := json.Marshal(n.Embedding)
+		if jerr != nil {
+			log.Printf("sqlite: WARN skipping vector write for node %s: marshal error: %v", n.ID, jerr)
+			vectorSkipped = fmt.Errorf("node %s: %w: marshal error: %v", n.ID, store.ErrVectorSkipped, jerr)
+			break
 		}
 		nodeVecID := n.ID
 		if n.ModelID != "" {
@@ -355,6 +432,9 @@ func (s *Store) UpsertNode(ctx context.Context, n store.Node) error {
 	if n.Title != "" {
 		_, _ = s.ResolveUnresolved(ctx, n.ProjectID, n.ID, n.Title)
 	}
+	if vectorSkipped != nil {
+		return vectorSkipped
+	}
 	return nil
 }
 
@@ -365,11 +445,25 @@ func (s *Store) UpsertEdge(ctx context.Context, e store.Edge) error {
 	if e.Confidence == 0 {
 		e.Confidence = 1.0
 	}
+	if e.ConfidenceTier == "" {
+		e.ConfidenceTier = "INFERRED"
+	}
+	bidir := 0
+	if e.Bidirectional {
+		bidir = 1
+	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO edges (from_id, to_id, edge_type, confidence)
-		VALUES (?, ?, ?, ?)
-		ON CONFLICT(from_id, to_id, edge_type) DO UPDATE SET confidence = excluded.confidence
-	`, e.FromID, e.ToID, e.EdgeType, e.Confidence)
+		INSERT INTO edges (from_id, to_id, edge_type, confidence, confidence_tier, bidirectional)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(from_id, to_id, edge_type) DO UPDATE SET
+			confidence = MAX(edges.confidence, excluded.confidence),
+			confidence_tier = CASE
+				WHEN edges.confidence_tier = 'EXTRACTED' OR excluded.confidence_tier = 'EXTRACTED' THEN 'EXTRACTED'
+				WHEN edges.confidence_tier = 'PROPOSED' AND excluded.confidence_tier = 'PROPOSED' THEN 'PROPOSED'
+				ELSE 'INFERRED'
+			END,
+			bidirectional = MAX(edges.bidirectional, excluded.bidirectional)
+	`, e.FromID, e.ToID, e.EdgeType, e.Confidence, e.ConfidenceTier, bidir)
 	if err != nil {
 		return fmt.Errorf("sqlite: upsert edge %s->%s(%s): %w", e.FromID, e.ToID, e.EdgeType, err)
 	}
@@ -404,14 +498,29 @@ func (s *Store) UpsertEdges(ctx context.Context, edges []store.Edge) error {
 			if e.Confidence == 0 {
 				e.Confidence = 1.0
 			}
-			valStrings = append(valStrings, "(?,?,?,?)")
-			args = append(args, e.FromID, e.ToID, e.EdgeType, e.Confidence)
+			tier := e.ConfidenceTier
+			if tier == "" {
+				tier = "INFERRED"
+			}
+			bidir := 0
+			if e.Bidirectional {
+				bidir = 1
+			}
+			valStrings = append(valStrings, "(?,?,?,?,?,?)")
+			args = append(args, e.FromID, e.ToID, e.EdgeType, e.Confidence, tier, bidir)
 		}
 		_, err = tx.ExecContext(ctx,
 			fmt.Sprintf(`
-				INSERT INTO edges (from_id, to_id, edge_type, confidence)
+				INSERT INTO edges (from_id, to_id, edge_type, confidence, confidence_tier, bidirectional)
 				VALUES %s
-				ON CONFLICT(from_id, to_id, edge_type) DO UPDATE SET confidence = excluded.confidence
+				ON CONFLICT(from_id, to_id, edge_type) DO UPDATE SET
+					confidence = MAX(edges.confidence, excluded.confidence),
+					confidence_tier = CASE
+						WHEN edges.confidence_tier = 'EXTRACTED' OR excluded.confidence_tier = 'EXTRACTED' THEN 'EXTRACTED'
+						WHEN edges.confidence_tier = 'PROPOSED' AND excluded.confidence_tier = 'PROPOSED' THEN 'PROPOSED'
+						ELSE 'INFERRED'
+					END,
+					bidirectional = MAX(edges.bidirectional, excluded.bidirectional)
 			`, strings.Join(valStrings, ",")),
 			args...,
 		)
@@ -565,9 +674,36 @@ func (s *Store) SearchVector(
 const upsertChunkBatch = 100
 const upsertEdgeBatch = 100
 
+// isValidChunkEmbedding reports whether c's embedding is safe to persist:
+// non-empty, correct dimension, and free of NaN/Inf. Pure check — no
+// logging here, callers log once at their own call site.
+func isValidChunkEmbedding(c store.Chunk, dim int) bool {
+	if len(c.Embedding) == 0 {
+		return false
+	}
+	if len(c.Embedding) != dim {
+		return false
+	}
+	return !store.HasNonFiniteFloat32(c.Embedding)
+}
+
 func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 	if len(chunks) == 0 {
 		return nil
+	}
+	var skippedIDs []string
+	for _, c := range chunks {
+		if len(c.Embedding) > 0 && !isValidChunkEmbedding(c, s.dim) {
+			reason := "unknown"
+			switch {
+			case store.HasNonFiniteFloat32(c.Embedding):
+				reason = "NaN/Inf"
+			case len(c.Embedding) != s.dim:
+				reason = fmt.Sprintf("dim %d != store dim %d", len(c.Embedding), s.dim)
+			}
+			log.Printf("sqlite: WARN skipping vector write for chunk %s: %s", c.ID, reason)
+			skippedIDs = append(skippedIDs, c.ID)
+		}
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -660,60 +796,56 @@ func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 			return fmt.Errorf("sqlite: insert chunk batch %d-%d: %w", i, end, err)
 		}
 
-		// Multi-row INSERT for chunk_vectors with ON CONFLICT (chunk_id is PRIMARY KEY)
-		var vecValStrings []string
-		var vecArgs []any
+		// Insert chunk_vectors for entries whose embedding validated above.
 		for _, c := range batch {
-			if len(c.Embedding) == 0 {
+			if !isValidChunkEmbedding(c, s.dim) {
 				continue
 			}
-			if len(c.Embedding) != s.dim {
-				return fmt.Errorf(
-					"sqlite: chunk %s embedding has dim %d, store configured for dim %d",
-					c.ID,
-					len(c.Embedding),
-					s.dim,
-				)
+			vecJSON, jerr := json.Marshal(c.Embedding)
+			if jerr != nil {
+				log.Printf("sqlite: WARN skipping vector write for chunk %s: marshal error: %v", c.ID, jerr)
+				skippedIDs = append(skippedIDs, c.ID)
+				continue
 			}
-			vecJSON, _ := json.Marshal(c.Embedding)
-			vecValStrings = append(vecValStrings, "(?, vec_f32(?))")
-			vecArgs = append(vecArgs, c.ID, string(vecJSON))
-		}
-		if len(vecValStrings) > 0 {
-			for _, c := range batch {
-				if len(c.Embedding) == 0 {
-					continue
-				}
-				vecJSON, _ := json.Marshal(c.Embedding)
-				chunkVecID := c.ID
-				if c.ModelID != "" {
-					chunkVecID = c.ModelID + ":" + c.ID
-				}
-				_, err = tx.ExecContext(ctx, `DELETE FROM chunk_vectors WHERE chunk_id = ?`, chunkVecID)
+			chunkVecID := c.ID
+			if c.ModelID != "" {
+				chunkVecID = c.ModelID + ":" + c.ID
+			}
+			_, err = tx.ExecContext(ctx, `DELETE FROM chunk_vectors WHERE chunk_id = ?`, chunkVecID)
+			if err != nil {
+				return fmt.Errorf("sqlite: delete chunk vector %s: %w", c.ID, err)
+			}
+			_, err = tx.ExecContext(
+				ctx,
+				`INSERT INTO chunk_vectors (chunk_id, embedding) VALUES (?, vec_f32(?))`,
+				chunkVecID,
+				string(vecJSON),
+			)
+			if err != nil {
+				return fmt.Errorf("sqlite: insert chunk vector %s: %w", c.ID, err)
+			}
+			if c.ModelID != "" {
+				_, err = tx.ExecContext(ctx,
+					`INSERT OR REPLACE INTO chunk_vector_model (id, chunk_id, model_id) VALUES (?, ?, ?)`,
+					chunkVecID, c.ID, c.ModelID)
 				if err != nil {
-					return fmt.Errorf("sqlite: delete chunk vector %s: %w", c.ID, err)
-				}
-				_, err = tx.ExecContext(
-					ctx,
-					`INSERT INTO chunk_vectors (chunk_id, embedding) VALUES (?, vec_f32(?))`,
-					chunkVecID,
-					string(vecJSON),
-				)
-				if err != nil {
-					return fmt.Errorf("sqlite: insert chunk vector %s: %w", c.ID, err)
-				}
-				if c.ModelID != "" {
-					_, err = tx.ExecContext(ctx,
-						`INSERT OR REPLACE INTO chunk_vector_model (id, chunk_id, model_id) VALUES (?, ?, ?)`,
-						chunkVecID, c.ID, c.ModelID)
-					if err != nil {
-						return fmt.Errorf("sqlite: insert chunk vector model mapping for %s: %w", c.ID, err)
-					}
+					return fmt.Errorf("sqlite: insert chunk vector model mapping for %s: %w", c.ID, err)
 				}
 			}
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if len(skippedIDs) > 0 {
+		return fmt.Errorf(
+			"%d chunk(s) skipped [%s]: %w",
+			len(skippedIDs),
+			strings.Join(skippedIDs, ", "),
+			store.ErrVectorSkipped,
+		)
+	}
+	return nil
 }
 
 func (s *Store) DeleteChunksByParent(ctx context.Context, parentNodeID string, modelID string) error {
@@ -878,15 +1010,22 @@ func (s *Store) neighborsBFS(
 	for d := 0; d < depth && len(frontier) > 0; d++ {
 		var next []string
 		for _, fromID := range frontier {
-			q := `SELECT from_id, to_id, edge_type, confidence FROM edges WHERE from_id = ?` + typeFilter
-			queryArgs := append([]any{fromID}, args...)
+			edgeCols := "from_id, to_id, edge_type, confidence, confidence_tier, bidirectional"
+			q := `SELECT ` + edgeCols + ` FROM edges WHERE from_id = ?` + typeFilter + `
+UNION ALL
+SELECT to_id, from_id, edge_type, confidence, confidence_tier, bidirectional FROM edges WHERE to_id = ? AND bidirectional = 1` + typeFilter
+			queryArgs := make([]any, 0, 2+2*len(edgeTypes))
+			queryArgs = append(queryArgs, fromID)
+			queryArgs = append(queryArgs, args...)
+			queryArgs = append(queryArgs, fromID)
+			queryArgs = append(queryArgs, args...)
 			rows, err := s.db.QueryContext(ctx, q, queryArgs...)
 			if err != nil {
 				return nil, nil, nil, fmt.Errorf("sqlite: neighbors query: %w", err)
 			}
 			for rows.Next() {
 				var e store.Edge
-				if err := rows.Scan(&e.FromID, &e.ToID, &e.EdgeType, &e.Confidence); err != nil {
+				if err := rows.Scan(&e.FromID, &e.ToID, &e.EdgeType, &e.Confidence, &e.ConfidenceTier, &e.Bidirectional); err != nil {
 					rows.Close()
 					return nil, nil, nil, fmt.Errorf("sqlite: scan edge: %w", err)
 				}
@@ -929,7 +1068,7 @@ func (s *Store) MarkStaleDownstream(ctx context.Context, changedID string, maxDe
 	return nodes, nil
 }
 
-func (s *Store) Stats(ctx context.Context, projectID string) (store.StoreStats, error) {
+func (s *Store) Stats(ctx context.Context, projectID, modelID string) (store.StoreStats, error) {
 	var st store.StoreStats
 	row := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM nodes WHERE project_id = ?`, projectID)
 	if err := row.Scan(&st.NodeCount); err != nil {
@@ -958,17 +1097,37 @@ func (s *Store) Stats(ctx context.Context, projectID string) (store.StoreStats, 
 	if err := row.Scan(&st.StaleCount); err != nil {
 		return st, fmt.Errorf("sqlite: stats stale: %w", err)
 	}
-	// VecCount = node_vectors + chunk_vectors scoped to project.
-	// Route through mapping tables since vec0 PK is now composite.
-	row = s.db.QueryRowContext(
-		ctx,
-		`SELECT (
-			SELECT COUNT(*) FROM node_vectors v JOIN node_vector_model nvm ON nvm.id = v.node_id JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ?
-		) + (
-			SELECT COUNT(*) FROM chunk_vectors v JOIN chunk_vector_model cvm ON cvm.id = v.chunk_id JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?
-		)`,
-		projectID, projectID,
-	)
+
+	// VecCount = node_vectors + chunk_vectors scoped to project and optionally model.
+	if modelID != "" {
+		row = s.db.QueryRowContext(
+			ctx,
+			`SELECT (
+				SELECT COUNT(*) FROM node_vectors v JOIN node_vector_model nvm ON nvm.id = v.node_id JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ? AND nvm.model_id = ?
+			) + (
+				SELECT COUNT(*) FROM chunk_vectors v JOIN chunk_vector_model cvm ON cvm.id = v.chunk_id JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ? AND cvm.model_id = ?
+			)`,
+			projectID, modelID, projectID, modelID,
+		)
+	} else {
+		row = s.db.QueryRowContext(
+			ctx,
+			`SELECT (
+				SELECT COUNT(*) FROM node_vectors WHERE node_id IN (
+					SELECT nvm.id FROM node_vector_model nvm JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ?
+				)
+			) + (
+				SELECT COUNT(*) FROM chunk_vectors WHERE chunk_id IN (
+					SELECT cvm.id FROM chunk_vector_model cvm JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?
+				)
+			) + (
+				SELECT COUNT(*) FROM node_vectors WHERE node_id IN (SELECT id FROM nodes WHERE project_id = ?) AND node_id NOT IN (SELECT nvm.id FROM node_vector_model nvm JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ?)
+			) + (
+				SELECT COUNT(*) FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE parent_node_id IN (SELECT id FROM nodes WHERE project_id = ?)) AND chunk_id NOT IN (SELECT cvm.id FROM chunk_vector_model cvm JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)
+			)`,
+			projectID, projectID, projectID, projectID, projectID, projectID,
+		)
+	}
 	if err := row.Scan(&st.VecCount); err != nil {
 		return st, fmt.Errorf("sqlite: stats vectors: %w", err)
 	}
@@ -983,7 +1142,7 @@ func (s *Store) Stats(ctx context.Context, projectID string) (store.StoreStats, 
 	}
 
 	st.EmbedModelID, _ = s.GetEmbedModelID(ctx, projectID) // best-effort
-	st.Models, _ = s.ListEmbedModels(ctx, projectID)        // best-effort
+	st.Models, _ = s.ListEmbedModels(ctx, projectID)       // best-effort
 
 	return st, nil
 }
@@ -1000,8 +1159,12 @@ func (s *Store) GetEmbedModelID(ctx context.Context, projectID string) (string, 
 
 func (s *Store) GetEmbedModelStatus(ctx context.Context, projectID, modelID string) (string, error) {
 	var status string
-	err := s.db.QueryRowContext(ctx,
-		`SELECT status FROM project_embed_config WHERE project_id = ? AND model_id = ?`, projectID, modelID).Scan(&status)
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT status FROM project_embed_config WHERE project_id = ? AND model_id = ?`,
+		projectID,
+		modelID,
+	).Scan(&status)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -1142,10 +1305,16 @@ func (s *Store) ListEdgesByType(
 	edgeType string,
 	limit, offset int,
 ) ([]store.Edge, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT e.from_id, e.to_id, e.edge_type, e.confidence
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT e.from_id, e.to_id, e.edge_type, e.confidence, e.confidence_tier, e.bidirectional
 		FROM edges e JOIN nodes n ON n.id = e.from_id
 		WHERE n.project_id = ? AND e.edge_type = ? ORDER BY e.created_at DESC LIMIT ? OFFSET ?`,
-		projectID, edgeType, limit, offset)
+		projectID,
+		edgeType,
+		limit,
+		offset,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1155,7 +1324,7 @@ func (s *Store) ListEdgesByType(
 	var out []store.Edge
 	for rows.Next() {
 		var e store.Edge
-		if err := rows.Scan(&e.FromID, &e.ToID, &e.EdgeType, &e.Confidence); err != nil {
+		if err := rows.Scan(&e.FromID, &e.ToID, &e.EdgeType, &e.Confidence, &e.ConfidenceTier, &e.Bidirectional); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
@@ -1171,7 +1340,7 @@ func (s *Store) ListEdgesByProject(
 	limit, offset int,
 ) ([]store.EdgeResult, int, error) {
 	// Use COUNT(*) OVER() windowed to get total count in same query.
-	q := `SELECT e.from_id, fn.title, fn.node_type, LENGTH(fn.content), e.to_id, tn.title, tn.node_type, LENGTH(tn.content), e.edge_type, e.confidence,
+	q := `SELECT e.from_id, fn.title, fn.node_type, LENGTH(fn.content), e.to_id, tn.title, tn.node_type, LENGTH(tn.content), e.edge_type, e.confidence, e.confidence_tier,
 	       COUNT(*) OVER() AS total
 		FROM edges e
 		JOIN nodes fn ON fn.id = e.from_id
@@ -1202,7 +1371,7 @@ func (s *Store) ListEdgesByProject(
 		var er store.EdgeResult
 		var fromTitle, fromType, toTitle, toType string
 		var totalRow int
-		if err := rows.Scan(&er.FromID, &fromTitle, &fromType, &er.FromSize, &er.ToID, &toTitle, &toType, &er.ToSize, &er.EdgeType, &er.Confidence, &totalRow); err != nil {
+		if err := rows.Scan(&er.FromID, &fromTitle, &fromType, &er.FromSize, &er.ToID, &toTitle, &toType, &er.ToSize, &er.EdgeType, &er.Confidence, &er.ConfidenceTier, &totalRow); err != nil {
 			return nil, 0, fmt.Errorf("sqlite: scan edge result: %w", err)
 		}
 		total = totalRow
@@ -1230,8 +1399,16 @@ func extractGroup(id, projectID string) string {
 
 func (s *Store) GetEdgesFrom(ctx context.Context, nodeID string, edgeTypes []string) ([]store.Edge, error) {
 	typeFilter, args := buildEdgeTypeFilter(edgeTypes)
-	q := `SELECT from_id, to_id, edge_type, confidence FROM edges WHERE from_id = ?` + typeFilter
-	queryArgs := append([]any{nodeID}, args...)
+	edgeCols := "from_id, to_id, edge_type, confidence, confidence_tier, bidirectional"
+	q := `SELECT ` + edgeCols + ` FROM edges WHERE from_id = ?` + typeFilter + `
+UNION
+SELECT to_id, from_id, edge_type, confidence, confidence_tier, bidirectional FROM edges WHERE to_id = ? AND bidirectional = 1` + typeFilter + `
+ORDER BY confidence DESC`
+	queryArgs := make([]any, 0, 2+2*len(edgeTypes))
+	queryArgs = append(queryArgs, nodeID)
+	queryArgs = append(queryArgs, args...)
+	queryArgs = append(queryArgs, nodeID)
+	queryArgs = append(queryArgs, args...)
 	rows, err := s.db.QueryContext(ctx, q, queryArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: get edges from: %w", err)
@@ -1241,7 +1418,7 @@ func (s *Store) GetEdgesFrom(ctx context.Context, nodeID string, edgeTypes []str
 	var out []store.Edge
 	for rows.Next() {
 		var e store.Edge
-		if err := rows.Scan(&e.FromID, &e.ToID, &e.EdgeType, &e.Confidence); err != nil {
+		if err := rows.Scan(&e.FromID, &e.ToID, &e.EdgeType, &e.Confidence, &e.ConfidenceTier, &e.Bidirectional); err != nil {
 			return nil, fmt.Errorf("sqlite: scan edge: %w", err)
 		}
 		out = append(out, e)
@@ -1251,8 +1428,16 @@ func (s *Store) GetEdgesFrom(ctx context.Context, nodeID string, edgeTypes []str
 
 func (s *Store) GetEdgesTo(ctx context.Context, nodeID string, edgeTypes []string) ([]store.Edge, error) {
 	typeFilter, args := buildEdgeTypeFilter(edgeTypes)
-	q := `SELECT from_id, to_id, edge_type, confidence FROM edges WHERE to_id = ?` + typeFilter
-	queryArgs := append([]any{nodeID}, args...)
+	edgeCols := "from_id, to_id, edge_type, confidence, confidence_tier, bidirectional"
+	q := `SELECT ` + edgeCols + ` FROM edges WHERE to_id = ?` + typeFilter + `
+UNION
+SELECT to_id, from_id, edge_type, confidence, confidence_tier, bidirectional FROM edges WHERE from_id = ? AND bidirectional = 1` + typeFilter + `
+ORDER BY confidence DESC`
+	queryArgs := make([]any, 0, 2+2*len(edgeTypes))
+	queryArgs = append(queryArgs, nodeID)
+	queryArgs = append(queryArgs, args...)
+	queryArgs = append(queryArgs, nodeID)
+	queryArgs = append(queryArgs, args...)
 	rows, err := s.db.QueryContext(ctx, q, queryArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: get edges to: %w", err)
@@ -1262,7 +1447,7 @@ func (s *Store) GetEdgesTo(ctx context.Context, nodeID string, edgeTypes []strin
 	var out []store.Edge
 	for rows.Next() {
 		var e store.Edge
-		if err := rows.Scan(&e.FromID, &e.ToID, &e.EdgeType, &e.Confidence); err != nil {
+		if err := rows.Scan(&e.FromID, &e.ToID, &e.EdgeType, &e.Confidence, &e.ConfidenceTier, &e.Bidirectional); err != nil {
 			return nil, fmt.Errorf("sqlite: scan edge: %w", err)
 		}
 		out = append(out, e)
@@ -1329,22 +1514,49 @@ func (s *Store) ClearProject(ctx context.Context, projectID, modelID string) (st
 
 	if modelID != "" {
 		var nodeVecs, chunkVecs int
-		_ = tx.QueryRowContext(ctx,
+		_ = tx.QueryRowContext(
+			ctx,
 			`SELECT COUNT(*) FROM node_vector_model WHERE model_id = ? AND node_id IN (SELECT id FROM nodes WHERE project_id = ?)`,
-			modelID, projectID).Scan(&nodeVecs)
-		_ = tx.QueryRowContext(ctx,
+			modelID,
+			projectID,
+		).Scan(&nodeVecs)
+		_ = tx.QueryRowContext(
+			ctx,
 			`SELECT COUNT(*) FROM chunk_vector_model WHERE model_id = ? AND chunk_id IN (SELECT c.id FROM chunks c JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`,
-			modelID, projectID).Scan(&chunkVecs)
+			modelID,
+			projectID,
+		).Scan(&chunkVecs)
 
-		_, _ = tx.ExecContext(ctx,
+		_, _ = tx.ExecContext(
+			ctx,
 			`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunk_vector_model WHERE model_id = ? AND chunk_id IN (SELECT c.id FROM chunks c JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?))`,
-			modelID, projectID)
-		_, _ = tx.ExecContext(ctx,
+			modelID,
+			projectID,
+		)
+		_, _ = tx.ExecContext(
+			ctx,
 			`DELETE FROM node_vectors WHERE node_id IN (SELECT id FROM node_vector_model WHERE model_id = ? AND node_id IN (SELECT id FROM nodes WHERE project_id = ?))`,
-			modelID, projectID)
-		_, _ = tx.ExecContext(ctx, `DELETE FROM node_vector_model WHERE model_id = ? AND node_id IN (SELECT id FROM nodes WHERE project_id = ?)`, modelID, projectID)
-		_, _ = tx.ExecContext(ctx, `DELETE FROM chunk_vector_model WHERE model_id = ? AND chunk_id IN (SELECT c.id FROM chunks c JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`, modelID, projectID)
-		_, _ = tx.ExecContext(ctx, `DELETE FROM project_embed_config WHERE project_id = ? AND model_id = ?`, projectID, modelID)
+			modelID,
+			projectID,
+		)
+		_, _ = tx.ExecContext(
+			ctx,
+			`DELETE FROM node_vector_model WHERE model_id = ? AND node_id IN (SELECT id FROM nodes WHERE project_id = ?)`,
+			modelID,
+			projectID,
+		)
+		_, _ = tx.ExecContext(
+			ctx,
+			`DELETE FROM chunk_vector_model WHERE model_id = ? AND chunk_id IN (SELECT c.id FROM chunks c JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`,
+			modelID,
+			projectID,
+		)
+		_, _ = tx.ExecContext(
+			ctx,
+			`DELETE FROM project_embed_config WHERE project_id = ? AND model_id = ?`,
+			projectID,
+			modelID,
+		)
 
 		if err := tx.Commit(); err != nil {
 			return store.ClearProjectResult{}, fmt.Errorf("sqlite: commit model clear: %w", err)
@@ -1355,31 +1567,81 @@ func (s *Store) ClearProject(ctx context.Context, projectID, modelID string) (st
 	// Full clear.
 	var nodes, edges, chunks, nodeVecs, chunkVecs int
 	_ = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM nodes WHERE project_id = ?`, projectID).Scan(&nodes)
-	_ = tx.QueryRowContext(ctx,
+	_ = tx.QueryRowContext(
+		ctx,
 		`SELECT COUNT(*) FROM edges WHERE from_id IN (SELECT id FROM nodes WHERE project_id = ?) OR to_id IN (SELECT id FROM nodes WHERE project_id = ?)`,
-		projectID, projectID).Scan(&edges)
+		projectID,
+		projectID,
+	).Scan(&edges)
 	_ = tx.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM chunks c JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?`,
 		projectID).Scan(&chunks)
-	_ = tx.QueryRowContext(ctx,
+	// Count model-prefixed vectors (stored with an explicit modelID).
+	_ = tx.QueryRowContext(
+		ctx,
 		`SELECT COUNT(*) FROM node_vectors WHERE node_id IN (SELECT nvm.id FROM node_vector_model nvm JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ?)`,
-		projectID).Scan(&nodeVecs)
-	_ = tx.QueryRowContext(ctx,
+		projectID,
+	).Scan(&nodeVecs)
+	_ = tx.QueryRowContext(
+		ctx,
 		`SELECT COUNT(*) FROM chunk_vectors WHERE chunk_id IN (SELECT cvm.id FROM chunk_vector_model cvm JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`,
-		projectID).Scan(&chunkVecs)
+		projectID,
+	).Scan(&chunkVecs)
+	// Count non-prefixed vectors (stored without modelID — old sidecar/REST
+	// path before model-aware storage). These have no node_vector_model /
+	// chunk_vector_model row, so they must be counted by direct ID match.
+	var bareNodeVecs, bareChunkVecs int
+	_ = tx.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM node_vectors WHERE node_id IN (SELECT id FROM nodes WHERE project_id = ?) AND node_id NOT IN (SELECT nvm.id FROM node_vector_model nvm JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ?)`,
+		projectID, projectID,
+	).Scan(&bareNodeVecs)
+	_ = tx.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE parent_node_id IN (SELECT id FROM nodes WHERE project_id = ?)) AND chunk_id NOT IN (SELECT cvm.id FROM chunk_vector_model cvm JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`,
+		projectID, projectID,
+	).Scan(&bareChunkVecs)
 
-	_, _ = tx.ExecContext(ctx,
+	// Delete model-prefixed vectors.
+	_, _ = tx.ExecContext(
+		ctx,
 		`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT cvm.id FROM chunk_vector_model cvm JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`,
-		projectID)
-	_, _ = tx.ExecContext(ctx,
+		projectID,
+	)
+	_, _ = tx.ExecContext(
+		ctx,
 		`DELETE FROM node_vectors WHERE node_id IN (SELECT nvm.id FROM node_vector_model nvm JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ?)`,
-		projectID)
-	_, _ = tx.ExecContext(ctx, `DELETE FROM node_vector_model WHERE node_id IN (SELECT id FROM nodes WHERE project_id = ?)`, projectID)
-	_, _ = tx.ExecContext(ctx, `DELETE FROM chunk_vector_model WHERE chunk_id IN (SELECT c.id FROM chunks c JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`, projectID)
+		projectID,
+	)
+	// Delete non-prefixed vectors — direct ID match bypasses the model
+	// mapping table since these were stored without modelID.
+	_, _ = tx.ExecContext(
+		ctx,
+		`DELETE FROM node_vectors WHERE node_id IN (SELECT id FROM nodes WHERE project_id = ?) AND node_id NOT IN (SELECT nvm.id FROM node_vector_model nvm JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ?)`,
+		projectID, projectID,
+	)
+	_, _ = tx.ExecContext(
+		ctx,
+		`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE parent_node_id IN (SELECT id FROM nodes WHERE project_id = ?)) AND chunk_id NOT IN (SELECT cvm.id FROM chunk_vector_model cvm JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`,
+		projectID, projectID,
+	)
+	_, _ = tx.ExecContext(
+		ctx,
+		`DELETE FROM node_vector_model WHERE node_id IN (SELECT id FROM nodes WHERE project_id = ?)`,
+		projectID,
+	)
+	_, _ = tx.ExecContext(
+		ctx,
+		`DELETE FROM chunk_vector_model WHERE chunk_id IN (SELECT c.id FROM chunks c JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`,
+		projectID,
+	)
 	_, _ = tx.ExecContext(ctx, `DELETE FROM project_embed_config WHERE project_id = ?`, projectID)
-	_, _ = tx.ExecContext(ctx,
+	_, _ = tx.ExecContext(
+		ctx,
 		`DELETE FROM edge_proposals WHERE from_id IN (SELECT id FROM nodes WHERE project_id = ?) OR to_id IN (SELECT id FROM nodes WHERE project_id = ?)`,
-		projectID, projectID)
+		projectID,
+		projectID,
+	)
 	_, _ = tx.ExecContext(ctx, `DELETE FROM unresolved_references WHERE project_id = ?`, projectID)
 	_, _ = tx.ExecContext(ctx, `DELETE FROM nodes WHERE project_id = ?`, projectID)
 
@@ -1391,8 +1653,174 @@ func (s *Store) ClearProject(ctx context.Context, projectID, modelID string) (st
 		Nodes:   nodes,
 		Edges:   edges,
 		Chunks:  chunks,
-		Vectors: nodeVecs + chunkVecs,
+		Vectors: nodeVecs + chunkVecs + bareNodeVecs + bareChunkVecs,
 	}, nil
+}
+
+func (s *Store) LogAccess(ctx context.Context, projectID, nodeID, sessionID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO access_log (project_id, node_id, session_id) VALUES (?, ?, ?)`,
+		projectID, nodeID, sessionID)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(
+		ctx,
+		`UPDATE nodes SET access_count = access_count + 1, last_accessed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`,
+		nodeID,
+	)
+	return err
+}
+
+func (s *Store) RecentAccesses(ctx context.Context, projectID string, withinSec int) ([]string, error) {
+	query := `SELECT DISTINCT node_id FROM access_log WHERE`
+	var queryArgs []any
+	if projectID == "" {
+		query += ` 1=1`
+	} else {
+		query += ` project_id = ?`
+		queryArgs = append(queryArgs, projectID)
+	}
+	query += ` AND accessed_at >= datetime('now', ? || ' seconds') ORDER BY accessed_at DESC`
+	queryArgs = append(queryArgs, fmt.Sprintf("-%d", withinSec))
+	rows, err := s.db.QueryContext(ctx, query, queryArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: recent accesses: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+func (s *Store) GetSessionPairs(ctx context.Context, withinSec int, minSessions int) ([]store.AccessPair, error) {
+	query := `
+		SELECT a.node_id, b.node_id, COUNT(DISTINCT a.session_id) as cnt
+		FROM access_log a
+		JOIN access_log b ON a.session_id = b.session_id AND a.session_id != '' AND a.node_id < b.node_id
+		WHERE a.accessed_at >= datetime('now', ? || ' seconds')
+		GROUP BY a.node_id, b.node_id
+		HAVING cnt >= ?`
+	rows, err := s.db.QueryContext(ctx, query, fmt.Sprintf("-%d", withinSec), minSessions)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: session pairs: %w", err)
+	}
+	defer rows.Close()
+	var out []store.AccessPair
+	for rows.Next() {
+		var p store.AccessPair
+		if err := rows.Scan(&p.NodeA, &p.NodeB, &p.Count); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) AccessHistory(ctx context.Context, nodeID string, limit int) ([]store.Node, error) {
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT n.id, n.project_id, n.node_type, n.title, n.content, n.content_hash, n.status, n.source_adapter, n.source_path, n.importance, n.language, n.created_at, n.updated_at
+		FROM access_log a JOIN nodes n ON n.id = a.node_id
+		WHERE a.node_id = ?
+		ORDER BY a.accessed_at DESC LIMIT ?`,
+		nodeID,
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: access history: %w", err)
+	}
+	defer rows.Close()
+	var out []store.Node
+	for rows.Next() {
+		var n store.Node
+		if err := rows.Scan(&n.ID, &n.ProjectID, &n.NodeType, &n.Title, &n.Content, &n.ContentHash,
+			&n.Status, &n.SourceAdapter, &n.SourcePath, &n.Importance, &n.Language, &n.CreatedAt, &n.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetAccessStats(ctx context.Context, nodeID string) (int, string, error) {
+	var count int
+	var lastAt string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT access_count, last_accessed_at FROM nodes WHERE id = ?`, nodeID).Scan(&count, &lastAt)
+	if err != nil {
+		return 0, "", err
+	}
+	return count, lastAt, nil
+}
+
+func (s *Store) ListNodesByUpdatedAfter(ctx context.Context, projectID, after string, limit int) ([]store.Node, error) {
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT id, project_id, node_type, title, content, content_hash, status, source_adapter, source_path, importance, language, created_at, updated_at
+		FROM nodes WHERE project_id = ? AND updated_at > ? ORDER BY updated_at DESC LIMIT ?`,
+		projectID,
+		after,
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: list nodes by updated: %w", err)
+	}
+	defer rows.Close()
+	var out []store.Node
+	for rows.Next() {
+		var n store.Node
+		if err := rows.Scan(&n.ID, &n.ProjectID, &n.NodeType, &n.Title, &n.Content, &n.ContentHash,
+			&n.Status, &n.SourceAdapter, &n.SourcePath, &n.Importance, &n.Language, &n.CreatedAt, &n.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListProjectIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT project_id FROM nodes ORDER BY project_id`)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: list project ids: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("sqlite: scan project id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+func (s *Store) GetTopNodesByImportance(ctx context.Context, projectID string, limit int) ([]store.Node, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, project_id, node_type, title, content, content_hash, status, source_adapter, source_path, importance, language, created_at, updated_at
+		FROM nodes WHERE project_id = ? AND node_type IN ('code:function','code:type','code:method')
+		ORDER BY importance DESC LIMIT ?`, projectID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: get top nodes: %w", err)
+	}
+	defer rows.Close()
+	var out []store.Node
+	for rows.Next() {
+		var n store.Node
+		if err := rows.Scan(&n.ID, &n.ProjectID, &n.NodeType, &n.Title, &n.Content, &n.ContentHash,
+			&n.Status, &n.SourceAdapter, &n.SourcePath, &n.Importance, &n.Language, &n.CreatedAt, &n.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("sqlite: scan node: %w", err)
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) ListProjects(ctx context.Context) ([]store.ProjectInfo, error) {

@@ -2,9 +2,6 @@
 package mcp
 
 import (
-	sitter "github.com/tree-sitter/go-tree-sitter"
-
-	"github.com/mystaline-dev/tastastas/internal/chunker"
 	"github.com/mystaline-dev/tastastas/internal/store"
 )
 
@@ -26,15 +23,26 @@ type RememberInput struct {
 }
 
 type RememberOutput struct {
-	ID     string `json:"id"`
-	Status string `json:"status"`
+	ID      string `json:"id"`
+	Status  string `json:"status"`
+	Warning string `json:"warning,omitempty"` // set if the embedding vector was invalid and skipped (metadata still stored)
 }
 
 type RecallInput struct {
-	ProjectID     string  `json:"project_id,omitempty"`
-	Query         string  `json:"query"`
-	Limit         int     `json:"limit,omitempty"`
-	LinkThreshold float64 `json:"link_threshold,omitempty"` // override default 0.75
+	ProjectID     string   `json:"project_id,omitempty"`
+	ProjectIDs    []string `json:"project_ids,omitempty"`   // explicit multi-project filter
+	Query         string   `json:"query"`
+	Limit         int      `json:"limit,omitempty"`
+	LinkThreshold float64  `json:"link_threshold,omitempty"` // override default 0.75
+	AllProjects   bool     `json:"all_projects,omitempty"`   // search all projects
+}
+
+type LinkProjectsInput struct {
+	ProjectID string `json:"project_id"`
+}
+
+type LinkProjectsOutput struct {
+	EdgesCreated int `json:"edges_created"`
 }
 
 type RecallItem struct {
@@ -189,6 +197,7 @@ type OnboardOutput struct {
 
 type OnboardCheckInput struct {
 	ProjectID string `json:"project_id,omitempty"`
+	ModelID   string `json:"model_id,omitempty"` // filter vectors to this model (empty = all models)
 }
 
 type OnboardCheckOutput struct {
@@ -205,6 +214,41 @@ type OnboardCheckOutput struct {
 	EdgeTypeCounts map[string]int `json:"edge_type_counts,omitempty"`
 }
 
+type CheckRecentInput struct {
+	ProjectID string `json:"project_id,omitempty"`
+	Days      int    `json:"days,omitempty"` // default 7
+}
+
+type CheckRecentOutput struct {
+	Nodes []CheckRecentNode `json:"nodes"`
+}
+
+type CheckRecentNode struct {
+	ID        string `json:"id"`
+	Title     string `json:"title"`
+	NodeType  string `json:"node_type"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+type FindPathInput struct {
+	FromID    string   `json:"from_id"`
+	ToID      string   `json:"to_id"`
+	EdgeTypes []string `json:"edge_types,omitempty"` // nil = all types
+	MaxDepth  int      `json:"max_depth,omitempty"`  // default 10
+}
+
+type FindPathOutput struct {
+	Path []PathHop `json:"path,omitempty"`
+	Hops int       `json:"hops"`
+}
+
+type PathHop struct {
+	NodeID    string `json:"node_id"`
+	Title     string `json:"title"`
+	EdgeType  string `json:"edge_type,omitempty"`
+	Direction string `json:"direction,omitempty"`
+}
+
 type QueryGraphInput struct {
 	NodeID    string   `json:"node_id"`
 	EdgeTypes []string `json:"edge_types,omitempty"` // nil = all types
@@ -213,9 +257,11 @@ type QueryGraphInput struct {
 }
 
 type QueryGraphOutput struct {
-	NodeID string       `json:"node_id"`
-	Title  string       `json:"title"`
-	Edges  []EdgeResult `json:"edges"`
+	NodeID          string         `json:"node_id"`
+	Title           string         `json:"title"`
+	ContentExcerpt  string         `json:"content_excerpt,omitempty"`
+	NeighborCounts  map[string]int `json:"neighbor_counts,omitempty"`
+	Edges           []EdgeResult   `json:"edges"`
 }
 
 type EdgeResult struct {
@@ -228,9 +274,10 @@ type EdgeResult struct {
 }
 
 type ProjectGraphInput struct {
-	ProjectID string   `json:"project_id,omitempty"`
-	MaxEdges  int      `json:"max_edges,omitempty"`  // default 5000
-	EdgeTypes []string `json:"edge_types,omitempty"` // empty = all non-proposed types
+	ProjectID      string   `json:"project_id,omitempty"`
+	MaxEdges       int      `json:"max_edges,omitempty"`  // default 5000
+	EdgeTypes      []string `json:"edge_types,omitempty"` // empty = all non-proposed types
+	ConfidenceTiers []string `json:"confidence_tiers,omitempty"`
 }
 
 type ProjectGraphOutput struct {
@@ -258,8 +305,9 @@ type GraphEdge struct {
 
 type ClearProjectInput struct {
 	ProjectID string `json:"project_id"`
-	ModelID   string `json:"model_id,omitempty"`
+	ModelID   string `json:"model_id,omitempty"` // model to clear (default = current server model)
 	Confirm   bool   `json:"confirm"`
+	Purge     bool   `json:"purge"` // clear all models for this project
 }
 
 type ClearProjectOutput struct {
@@ -292,98 +340,4 @@ type JobStatusOutput struct {
 	Error           string `json:"error,omitempty"`
 	StartedAt       string `json:"started_at"`
 	EndedAt         string `json:"ended_at,omitempty"`
-}
-
-// chunkForNode splits a node's content into chunks suitable for embedding.
-// For Go code nodes, uses tree-sitter to split by function/type declarations.
-// For Markdown-like nodes, uses heading-based chunking.
-// All other types get a single chunk.
-func chunkForNode(
-	n store.Node,
-	cfg chunker.Config,
-	goLang, tsLang *sitter.Language,
-) []store.Chunk {
-	switch n.NodeType {
-	case "prd", "api-spec", "erd", "test-case", "generic-doc", "obsidian-note":
-		chunks, _ := chunker.ChunkMarkdown(n.ID, n.Content, cfg)
-		result := make([]store.Chunk, len(chunks))
-		for i, c := range chunks {
-			result[i] = store.Chunk{
-				ID:            c.ID,
-				ParentNodeID:  c.ParentNodeID,
-				ChunkIndex:    c.ChunkIndex,
-				Type:          string(c.Type),
-				HeadingPath:   c.HeadingPath,
-				Content:       c.Content,
-				Language:      c.Language,
-				SourceAdapter: n.SourceAdapter,
-			}
-		}
-		return result
-
-	case "go":
-		if goLang != nil {
-			chunks, err := chunker.ChunkGoCode(n.ID, n.Content, goLang, cfg)
-			if err == nil && len(chunks) > 0 {
-				return chunkSlice(chunks, n.SourceAdapter)
-			}
-		}
-		if chunks, err := chunker.ChunkCodeByPattern(n.ID, n.Content, "go", cfg); err == nil && len(chunks) > 0 {
-			return chunkSlice(chunks, n.SourceAdapter)
-		}
-		fallthrough
-
-	case "typescript", "javascript":
-		if tsLang != nil {
-			chunks, err := chunker.ChunkTypeScript(n.ID, n.Content, tsLang, cfg)
-			if err == nil && len(chunks) > 0 {
-				return chunkSlice(chunks, n.SourceAdapter)
-			}
-		}
-		if chunks, err := chunker.ChunkCodeByPattern(n.ID, n.Content, "typescript", cfg); err == nil && len(chunks) > 0 {
-			return chunkSlice(chunks, n.SourceAdapter)
-		}
-		fallthrough
-
-	default:
-		if n.Content == "" {
-			return nil
-		}
-		return []store.Chunk{{
-			ID:            n.ID + "/chunk/0",
-			ParentNodeID:  n.ID,
-			ChunkIndex:    0,
-			Type:          "conversation_fact",
-			HeadingPath:   []string{},
-			Content:       n.Content,
-			Language:      "text",
-			SourceAdapter: n.SourceAdapter,
-		}}
-	}
-}
-
-// chunkSlice converts chunker.Chunk slice to store.Chunk slice,
-// linking prev/next IDs along the way.
-func chunkSlice(chunks []chunker.Chunk, sourceAdapter string) []store.Chunk {
-	result := make([]store.Chunk, len(chunks))
-	for i, c := range chunks {
-		sc := store.Chunk{
-			ID:            c.ID,
-			ParentNodeID:  c.ParentNodeID,
-			ChunkIndex:    c.ChunkIndex,
-			Type:          string(c.Type),
-			HeadingPath:   c.HeadingPath,
-			Content:       c.Content,
-			Language:      c.Language,
-			SourceAdapter: sourceAdapter,
-		}
-		if i > 0 {
-			sc.PrevChunkID = result[i-1].ID
-		}
-		if i+1 < len(chunks) {
-			sc.NextChunkID = chunks[i+1].ID
-		}
-		result[i] = sc
-	}
-	return result
 }

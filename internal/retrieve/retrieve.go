@@ -265,7 +265,15 @@ func (r *Retriever) Recall(ctx context.Context, params RecallParams) (*RecallRes
 		}
 	}
 
-	// 8. Enrich scored nodes with excerpt + chunk preview + pagination
+	// 8a. Access boost: increase scores for frequently/recently accessed nodes
+	for i := range scored {
+		count, lastAt, err := r.store.GetAccessStats(ctx, scored[i].ID)
+		if err == nil {
+			scored[i].Score *= applyAccessBoost(count, lastAt)
+		}
+	}
+
+	// 8b. Enrich scored nodes with excerpt + chunk preview + pagination
 	for i := range scored {
 		r.enrichNode(ctx, &scored[i])
 	}
@@ -497,6 +505,24 @@ func (r *Retriever) recencyDecay(age time.Duration) float64 {
 		return 1.0
 	}
 	return math.Pow(2, -age.Seconds()/halfLife)
+}
+
+// applyAccessBoost adjusts recall scores upward for nodes that have been
+// accessed frequently or recently. score *= (1 + 0.2 * log2(1 + accessCount)).
+// Recent access (within 1 hour) adds an additional 30% boost.
+func applyAccessBoost(accessCount int, lastAccessedAt string) float64 {
+	if accessCount <= 0 {
+		return 1.0
+	}
+	boost := 1.0 + 0.2*math.Log2(1+float64(accessCount))
+	if lastAccessedAt != "" {
+		if t, err := time.Parse(time.RFC3339Nano, lastAccessedAt); err == nil {
+			if time.Since(t) < time.Hour {
+				boost *= 1.3 // session bias: recent access in same session
+			}
+		}
+	}
+	return boost
 }
 
 // excerpt truncates content to n runes, appending "..." if truncated.

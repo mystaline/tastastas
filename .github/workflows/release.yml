@@ -1,25 +1,69 @@
 name: release
 
-# Builds the ONNX sidecar (Rust) + tastastas binary (Go) for every
-# supported platform, then attaches them to a GitHub Release. Triggered
-# manually or by pushing a `v*` tag.
+# Covers all delivery methods from DEPLOYMENT.md:
+#   1. All-in-one binary (sidecar + frontend + Go) — matrix of 4 platforms
+#   2. Go+SPA binary (no sidecar) — wider matrix, CGO_ENABLED=0, pure-Go SQLite
+#   3. Docker image — push to ghcr.io with semver + latest tags
 #
-# Matrix mirrors what `ort` (onnxruntime bindings) ships prebuilt binaries
-# for via its download-binaries feature: linux x86_64/aarch64, macOS arm64,
-# windows x86_64. No Intel macOS — ort has no prebuilt binary for
-# x86_64-apple-darwin. No linux/arm or windows/arm64 — ort has no prebuilt
-# runtime for those, would need self-built onnxruntime.
+# Triggered by:
+#   - tag-release.yml (passes tag as input)
+#   - push v* tag (manual git tag && git push)
+#   - workflow_dispatch (dry-run, no uploads)
 
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build and release (set by tag-release workflow)
+        type: string
+        required: false
 
 env:
   GO_VERSION: "1.26"
+  NODE_VERSION: "22"
+  REGISTRY: ghcr.io
 
 jobs:
-  build:
+  test:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve-tag.outputs.value }}
+      is_release: ${{ steps.resolve-tag.outputs.is_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve tag
+        id: resolve-tag
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "value=$TAG" >> "$GITHUB_OUTPUT"
+          if echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: go test ./...
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Build frontend (validate SPA builds cleanly)
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+  # ── Delivery 1: all-in-one binary (sidecar + frontend + Go) ──────────
+  binary-with-sidecar:
+    needs: [test]
     permissions:
       contents: write
     strategy:
@@ -42,10 +86,11 @@ jobs:
             goos: windows
             goarch: amd64
             target: x86_64-pc-windows-msvc
-
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: actions/setup-go@v5
         with:
@@ -55,8 +100,6 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # Model + tokenizer are fetched once, baked into the sidecar binary
-      # via include_bytes! at compile time (zero runtime file deps).
       - name: Download embedding model
         shell: bash
         run: |
@@ -66,7 +109,7 @@ jobs:
           curl -sL -o sidecar/assets/tokenizer.json \
             "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/tokenizer.json"
 
-      - name: Build sidecar
+      - name: Build sidecar (Rust ONNX embedder)
         working-directory: sidecar
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -88,13 +131,117 @@ jobs:
           [ "${{ matrix.goos }}" = "windows" ] && out="${out}.exe"
           go build -trimpath -ldflags="-s -w" -o "dist/$out" ./cmd/tastastas
 
-      # Upload straight to the release as each platform finishes — no
-      # waiting on other matrix legs. softprops/action-gh-release appends
-      # to an existing release (same tag) instead of overwriting it, so
-      # concurrent uploads from parallel jobs are safe.
       - name: Upload to release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: needs.test.outputs.is_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.test.outputs.tag }}
           files: dist/*
           generate_release_notes: true
+
+  # ── Delivery 2: Go + SPA binary (no sidecar) ────────────────────────
+  go-spa-binary:
+    needs: [test]
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm
+            goarm: "7"
+          - os: ubuntu-latest
+            goos: linux
+            goarch: "386"
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+          - os: windows-latest
+            goos: windows
+            goarch: "386"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build tastastas binary (no sidecar)
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: "0"
+        run: |
+          suffix=""
+          [ "${{ matrix.goos }}" = "windows" ] && suffix=".exe"
+          out="tastastas-nosidecar-${{ matrix.goos }}-${{ matrix.goarch }}${suffix}"
+          go build -trimpath -ldflags="-s -w" -o "dist-nosidecar/$out" ./cmd/tastastas
+
+      - name: Upload to release
+        if: needs.test.outputs.is_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.test.outputs.tag }}
+          files: dist-nosidecar/*
+
+  # ── Delivery 3: Docker image ────────────────────────────────────────
+  docker-image:
+    needs: [test]
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare Docker tags
+        id: docker_tags
+        run: |
+          tag="${{ needs.test.outputs.tag }}"
+          delimiter="DOCKER_TAGS_EOF"
+          echo "tags<<$delimiter" >> "$GITHUB_OUTPUT"
+          echo "${{ env.REGISTRY }}/${{ github.repository }}:$tag" >> "$GITHUB_OUTPUT"
+          echo "${{ env.REGISTRY }}/${{ github.repository }}:latest" >> "$GITHUB_OUTPUT"
+          ver="${tag#v}"
+          major="${ver%%.*}"
+          rest="${ver#*.}"
+          minor="${rest%%.*}"
+          echo "${{ env.REGISTRY }}/${{ github.repository }}:$major.$minor" >> "$GITHUB_OUTPUT"
+          echo "$delimiter" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ needs.test.outputs.is_release == 'true' }}
+          tags: ${{ steps.docker_tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.test.outputs.tag }}

@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { SIM_DEFAULTS } from '../hooks/useForceSimulation'
 
 interface ControlsProps {
   onSearch: (q: string) => void
@@ -7,51 +8,44 @@ interface ControlsProps {
   onEdgeOpacity: (v: number) => void
   onHueOffset: (v: number) => void
   onDensity: (v: number) => void
+  initialShowEdges?: boolean
+  initialEdgeOpacity?: number
+  initialHueOffset?: number
+  initialDensity?: number
 }
 
-const sliderStyle = { width: '100%', accentColor: '#7ec8e3', cursor: 'pointer' }
-const rowStyle = { display: 'flex', flexDirection: 'column' as const, gap: 2 }
-
-export function Controls({ onSearch, onEdgesToggle, onProposedToggle, onEdgeOpacity, onHueOffset, onDensity }: ControlsProps) {
+export function Controls({
+  onSearch,
+  onEdgesToggle,
+  onProposedToggle,
+  onEdgeOpacity,
+  onHueOffset,
+  onDensity,
+  initialShowEdges = SIM_DEFAULTS.showEdges,
+  initialEdgeOpacity = SIM_DEFAULTS.edgeOpacity,
+  initialHueOffset = SIM_DEFAULTS.hueOffset,
+  initialDensity = SIM_DEFAULTS.density,
+}: ControlsProps) {
   const [query, setQuery] = useState('')
-  const [showEdges, setShowEdges] = useState(true)
+  const [showEdges, setShowEdges] = useState(initialShowEdges)
   const [showProposed, setShowProposed] = useState(false)
-  const [edgeOp, setEdgeOp] = useState(0.6)
-  const [hue, setHue] = useState(0)
-  const [dens, setDens] = useState(50)
+  const [edgeOp, setEdgeOp] = useState(initialEdgeOpacity)
+  const [hue, setHue] = useState(initialHueOffset)
+  const [dens, setDens] = useState(initialDensity)
 
   function handleEdgesToggle(checked: boolean) {
     setShowEdges(checked)
     onEdgesToggle(checked)
     if (!checked) {
+      setShowProposed(false)
       onProposedToggle(false)
     } else {
       onProposedToggle(showProposed)
     }
   }
 
-  function handleProposedToggle(checked: boolean) {
-    setShowProposed(checked)
-    onProposedToggle(checked)
-  }
-
   return (
-    <div
-      style={{
-        position: 'absolute',
-        top: 10,
-        right: 10,
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 8,
-        zIndex: 10,
-        pointerEvents: 'auto',
-        background: 'rgba(15,26,48,0.85)',
-        padding: 10,
-        borderRadius: 6,
-        minWidth: 180,
-      }}
-    >
+    <div className="fixed top-3 right-3 z-10 bg-slate-900/85 backdrop-blur p-3 rounded-lg min-w-[198px] flex flex-col gap-2 text-slate-200 text-sm">
       <input
         type="search"
         placeholder="Search nodes..."
@@ -60,55 +54,92 @@ export function Controls({ onSearch, onEdgesToggle, onProposedToggle, onEdgeOpac
           setQuery(e.target.value)
           onSearch(e.target.value)
         }}
-        style={{ background: '#16213e', color: '#fff', border: '1px solid #0f3460', borderRadius: 4, padding: '4px 6px' }}
+        className="bg-slate-800 text-white border border-slate-700 rounded px-1.5 py-1 text-xs outline-none focus:border-cyan-500"
       />
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-        <label style={{ color: '#e0e0e0', fontSize: 13, display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
-          <span style={{
-            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-            width: 14, height: 14, border: '1px solid #7ec8e3', borderRadius: 3,
-            background: showEdges ? '#7ec8e3' : 'transparent',
-            fontSize: 10, color: '#0f1a30', fontWeight: 'bold',
-          }}>
+      <div className="flex flex-col gap-1">
+        <label className="flex items-center gap-1.5 text-slate-200 text-xs cursor-pointer select-none">
+          <span
+            style={{
+              display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+              width: 14, height: 14, border: '1px solid #22d3ee',
+              borderRadius: 3, background: showEdges ? '#22d3ee' : 'transparent',
+              fontSize: 10, color: '#0f172a', fontWeight: 700,
+            }}
+          >
             {showEdges ? '✓' : ''}
           </span>
-          <input type="checkbox" checked={showEdges} onChange={e => handleEdgesToggle(e.target.checked)} style={{ display: 'none' }} />
+          <input
+            type="checkbox"
+            checked={showEdges}
+            onChange={e => handleEdgesToggle(e.target.checked)}
+            className="hidden"
+          />
           Edges
         </label>
-        <label style={{ color: '#e0e0e0', fontSize: 13, display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
-          <span style={{
-            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-            width: 14, height: 14, border: '1px solid #e8a33d', borderRadius: 3,
-            background: showProposed ? '#e8a33d' : 'transparent',
-            fontSize: 10, color: '#0f1a30', fontWeight: 'bold',
-          }}>
+
+        <label className="flex items-center gap-1.5 text-slate-200 text-xs cursor-pointer select-none">
+          <span
+            style={{
+              display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+              width: 14, height: 14, border: '1px solid #f59e0b',
+              borderRadius: 3, background: showProposed ? '#f59e0b' : 'transparent',
+              fontSize: 10, color: '#0f172a', fontWeight: 700,
+            }}
+          >
             {showProposed ? '✓' : ''}
           </span>
-          <input type="checkbox" checked={showProposed} onChange={e => handleProposedToggle(e.target.checked)} style={{ display: 'none' }} />
+          <input
+            type="checkbox"
+            checked={showProposed}
+            onChange={e => {
+              const v = e.target.checked
+              setShowProposed(v)
+              onProposedToggle(v)
+            }}
+            className="hidden"
+          />
           Weak links
         </label>
       </div>
 
-      <div style={rowStyle}>
-        <label style={{ color: '#aaa', fontSize: 11 }}>Edge opacity</label>
-        <input type="range" min={0} max={1} step={0.05} value={edgeOp}
+      <div className="flex flex-col gap-0.5">
+        <label className="text-slate-400 text-[11px]">Edge opacity</label>
+        <input
+          type="range"
+          min={0}
+          max={1}
+          step={0.05}
+          value={edgeOp}
           onChange={e => { const v = +e.target.value; setEdgeOp(v); onEdgeOpacity(v) }}
-          style={sliderStyle} />
+          className="w-full accent-cyan-400 cursor-pointer"
+        />
       </div>
 
-      <div style={rowStyle}>
-        <label style={{ color: '#aaa', fontSize: 11 }}>Hue offset</label>
-        <input type="range" min={0} max={360} step={1} value={hue}
+      <div className="flex flex-col gap-0.5">
+        <label className="text-slate-400 text-[11px]">Hue offset</label>
+        <input
+          type="range"
+          min={0}
+          max={360}
+          step={1}
+          value={hue}
           onChange={e => { const v = +e.target.value; setHue(v); onHueOffset(v) }}
-          style={sliderStyle} />
+          className="w-full accent-cyan-400 cursor-pointer"
+        />
       </div>
 
-      <div style={rowStyle}>
-        <label style={{ color: '#aaa', fontSize: 11 }}>Density</label>
-        <input type="range" min={0} max={100} step={1} value={dens}
+      <div className="flex flex-col gap-0.5">
+        <label className="text-slate-400 text-[11px]">Density</label>
+        <input
+          type="range"
+          min={0}
+          max={100}
+          step={1}
+          value={dens}
           onChange={e => { const v = +e.target.value; setDens(v); onDensity(v) }}
-          style={sliderStyle} />
+          className="w-full accent-cyan-400 cursor-pointer"
+        />
       </div>
     </div>
   )

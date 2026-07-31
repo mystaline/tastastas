@@ -186,6 +186,33 @@ func seedImpactGraph(t *testing.T, s *Store) {
 	}
 }
 
+func TestBlobToFloat32Slice(t *testing.T) {
+	tests := []struct {
+		name string
+		blob []byte
+		dim  int
+		want []float32
+	}{
+		{name: "empty", blob: nil, dim: 4, want: nil},
+		{name: "zero", blob: []byte{0, 0, 0, 0}, dim: 1, want: []float32{0}},
+		{name: "one", blob: []byte{0x00, 0x00, 0x80, 0x3F}, dim: 1, want: []float32{1.0}},
+		{name: "two floats", blob: []byte{0x00, 0x00, 0x80, 0x3F, 0xCD, 0xCC, 0xCC, 0x3D}, dim: 2, want: []float32{1.0, 0.10000000149011612}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := blobToFloat32Slice(tc.blob, tc.dim)
+			if len(got) != len(tc.want) {
+				t.Fatalf("len got %d, want %d", len(got), len(tc.want))
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("[%d] = %v, want %v", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestNeighbors(t *testing.T) {
 	s := openTest(t)
 	seedImpactGraph(t, s)
