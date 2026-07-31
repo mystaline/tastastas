@@ -8,8 +8,9 @@ import (
 // --- Input/Output types (Go types auto-generate MCP JSON schema) ---
 
 type InitOutput struct {
-	Help    string `json:"help"`
-	ModelID string `json:"model_id,omitempty"`
+	Help     string              `json:"help"`
+	ModelID  string              `json:"model_id,omitempty"`
+	Projects []store.ProjectInfo `json:"projects"`
 }
 
 type RememberInput struct {
@@ -130,6 +131,7 @@ type IngestInput struct {
 	CWD       string `json:"cwd,omitempty"` // project root to detect + ingest files from
 	ProjectID string `json:"project_id,omitempty"`
 	Scope     string `json:"scope,omitempty"` // "cwd" | "subtree"
+	Ref       string `json:"ref,omitempty"`
 }
 
 type IngestOutput struct {
@@ -141,6 +143,7 @@ type IngestOutput struct {
 	ConventionsInferred int    `json:"conventions_inferred,omitempty"`
 	AutoLinked          int    `json:"auto_linked,omitempty"`
 	ProposalsQueued     int    `json:"proposals_queued,omitempty"`
+	Ref                 string `json:"ref,omitempty"`
 }
 
 type ExtractAndRememberInput struct {
@@ -175,6 +178,7 @@ type OnboardInput struct {
 	CWD       string `json:"cwd,omitempty"`
 	ProjectID string `json:"project_id,omitempty"`
 	Scope     string `json:"scope,omitempty"` // "cwd" | "subtree"
+	Ref       string `json:"ref,omitempty"`
 }
 
 type OnboardOutput struct {
@@ -192,6 +196,7 @@ type OnboardOutput struct {
 	ProposalsQueued     int      `json:"proposals_queued"`
 	FilesWalked         int      `json:"files_walked"`
 	DurationMs          int64    `json:"duration_ms"`
+	Ref                 string   `json:"ref,omitempty"`
 }
 
 type OnboardCheckInput struct {

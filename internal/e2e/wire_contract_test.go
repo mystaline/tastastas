@@ -31,7 +31,7 @@ var expectedWireShapes = map[string][]string{
 	"check_impact":         {"stale_nodes"},
 	"onboard_check":        {"chunk_count", "edge_count", "edge_type_counts", "has_chunks", "has_conventions", "has_edges", "has_embeddings", "has_nodes", "node_count", "stale_count", "vec_count"},
 	"extract_and_remember": {"facts"},
-	"ingest":               {"auto_linked", "chunks_created", "conventions_inferred", "edges_created", "job_id", "nodes_ingested", "proposals_queued", "status"},
+	"ingest":               {"auto_linked", "chunks_created", "conventions_inferred", "edges_created", "job_id", "nodes_ingested", "proposals_queued", "ref", "status"},
 	"query_graph":          {"content_excerpt", "edges", "neighbor_counts", "node_id", "title"},
 	"clear_project":        {"deleted_chunks", "deleted_edges", "deleted_nodes", "deleted_vectors", "status"},
 	"list_projects":        {"projects"},

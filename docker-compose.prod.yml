@@ -8,9 +8,10 @@ services:
     cap_drop: [ALL]
     ports:
       - "${HTTP_PORT:-8080}:8080"
-      - "127.0.0.1:${GRAPH_PORT:-9292}:9292"
+      - "${GRAPH_PORT:-9292}:9292"
     volumes:
       - tastastas-data:/data
+      - /home/deploy/workspaces:/workspaces
     command:
       - "--serve"
       - ":8080"
@@ -29,6 +30,7 @@ services:
     environment:
       - TASTASTAS_AUTH_TOKEN=${TASTASTAS_AUTH_TOKEN:-}
       - TASTASTAS_OPENAI_KEY=${TASTASTAS_OPENAI_KEY:-}
+      - TASTASTAS_WORKSPACE=/workspaces
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
       interval: 30s

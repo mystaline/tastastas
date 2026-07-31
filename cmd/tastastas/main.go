@@ -223,6 +223,11 @@ func main() {
 		"",
 		"consolidation cron interval (e.g. '1h', '30m'). Empty = disabled",
 	)
+	workspaceDir := flag.String(
+		"workspace-dir",
+		"",
+		"workspace directory for git clones (empty = use $TASTASTAS_WORKSPACE or /tmp/tastastas-workspaces)",
+	)
 	embedMaxContent := flag.Int(
 		"embed-max-content",
 		0,
@@ -232,6 +237,12 @@ func main() {
 
 	if *spaDir == "" {
 		*spaDir = os.Getenv("TASTASTAS_SPA_DIR")
+	}
+	if *workspaceDir == "" {
+		*workspaceDir = os.Getenv("TASTASTAS_WORKSPACE")
+	}
+	if *workspaceDir == "" {
+		*workspaceDir = "/tmp/tastastas-workspaces"
 	}
 	if *spaDir != "" {
 		if info, err := os.Stat(*spaDir); err != nil || !info.IsDir() {
@@ -358,7 +369,7 @@ func main() {
 
 	if *serve != "" {
 		// HTTP server mode
-		err := mcpserver.ServeHTTP(ctx, db, embedder, *serve, *authToken, *batchSize, modelID, *spaDir)
+		err := mcpserver.ServeHTTP(ctx, db, embedder, *serve, *authToken, *batchSize, modelID, *spaDir, *workspaceDir)
 		cancel()
 		db.Close() // close before log.Fatalf below skips defers
 		closeEmbedder()
@@ -369,7 +380,7 @@ func main() {
 	}
 
 	// Stdio MCP server mode (default)
-	srv := mcpserver.NewServer(db, embedder, *batchSize, modelID)
+	srv := mcpserver.NewServer(db, embedder, *batchSize, modelID, *workspaceDir)
 	if err := srv.Run(ctx, &mcpsdk.StdioTransport{}); err != nil {
 		// stdio loop ended (client disconnect or signal) — stop jobs, wait
 		// for drain, then close the DB before exit.

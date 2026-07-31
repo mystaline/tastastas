@@ -30,6 +30,7 @@ func ServeHTTP(
 	batchSize int,
 	modelID string,
 	spaDir string,
+	workspaceDir string,
 ) error {
 	jobs := newJobStore(db)
 	SetJobContext(ctx)
@@ -39,7 +40,7 @@ func ServeHTTP(
 			Name:    "tastastas",
 			Version: Version,
 		}, nil)
-		registerTools(srv, db, embedder, batchSize, modelID)
+		registerTools(srv, db, embedder, batchSize, modelID, workspaceDir)
 		return srv
 	}, nil)
 
@@ -337,6 +338,7 @@ func handleRESTIngest(
 		var req struct {
 			Root      string `json:"root"`
 			ProjectID string `json:"project_id"`
+			Ref       string `json:"ref,omitempty"`
 		}
 		body, _ := io.ReadAll(r.Body)
 		if err := json.Unmarshal(body, &req); err != nil {
@@ -351,6 +353,9 @@ func handleRESTIngest(
 		if root == "" {
 			http.Error(w, `{"error":"root is required"}`, http.StatusBadRequest)
 			return
+		}
+		if req.Ref != "" {
+			log.Printf("ingest: project=%s ref=%s root=%s", projectID, req.Ref, root)
 		}
 
 		job := jobs.create(projectID)
