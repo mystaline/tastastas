@@ -16,13 +16,8 @@ import (
 	"sync"
 	"time"
 
-	sitter "github.com/tree-sitter/go-tree-sitter"
-	golang "github.com/tree-sitter/tree-sitter-go/bindings/go"
-	ts "github.com/tree-sitter/tree-sitter-typescript/bindings/go"
-
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/mystaline-dev/tastastas/internal/chunker"
 	"github.com/mystaline-dev/tastastas/internal/dedupe"
 	"github.com/mystaline-dev/tastastas/internal/embed"
 	"github.com/mystaline-dev/tastastas/internal/extract"
@@ -36,141 +31,6 @@ import (
 
 // Version is set at build time via -ldflags. Falls back to "dev".
 var Version = "dev"
-
-var goLanguage = sync.OnceValue(func() *sitter.Language {
-	return sitter.NewLanguage(golang.Language())
-})
-var tsLanguage = sync.OnceValue(func() *sitter.Language {
-	return sitter.NewLanguage(ts.LanguageTypescript())
-})
-
-// chunkAndEmbedNodes splits nodes into chunks, embeds any missing vectors,
-// and bulk-persists everything. progress reports (embedded, total) after
-// each embed batch; onPersisting fires once, right before the bulk DB
-// insert starts — that insert has no progress callback of its own (one
-// transaction, N sequential single-row INSERTs), so without this signal a
-// multi-minute persist phase on a large project is indistinguishable from
-// a hang to anyone polling job status. Both callbacks may be nil.
-func chunkAndEmbedNodes(
-	ctx context.Context,
-	db store.Store,
-	embedder embed.EmbedderBackend,
-	nodes []store.Node,
-	batchSize int,
-	modelID string,
-	progress func(embedded, total int),
-	onPersisting func(),
-) (int, error) {
-	if embedder == nil {
-		return 0, nil
-	}
-
-	// Collect chunks: unchanged nodes keep existing chunks (hash match);
-	// changed or new nodes get re-chunked. Delta-only — no full delete+re-insert.
-	var allChunks []store.Chunk
-	goLang := goLanguage()
-	tsLang := tsLanguage()
-	var chunkable []store.Node
-	for _, n := range nodes {
-		if n.ContentHash == "" {
-			chunkable = append(chunkable, n)
-			continue
-		}
-		existing, err := db.GetNode(ctx, n.ID)
-		if err == nil && existing.ContentHash == n.ContentHash {
-			// Same content — keep existing chunks and their embeddings.
-			chunks, cerr := db.GetChunksByParent(ctx, n.ID, 1000, 0)
-			if cerr == nil && len(chunks) > 0 {
-				allChunks = append(allChunks, chunks...)
-				continue
-			}
-		}
-		// Content changed (or first time) — delete stale chunks, re-chunk.
-		_ = db.DeleteChunksByParent(ctx, n.ID, modelID)
-		chunkable = append(chunkable, n)
-	}
-	if len(chunkable) > 0 {
-		type cr struct {
-			idx int
-			c   []store.Chunk
-		}
-		resCh := make(chan cr, len(chunkable))
-		for w := 0; w < 4; w++ {
-			go func(worker int) {
-				cfg := chunker.DefaultConfig()
-				for j := worker; j < len(chunkable); j += 4 {
-					resCh <- cr{idx: j, c: chunkForNode(chunkable[j], cfg, goLang, tsLang)}
-				}
-			}(w)
-		}
-		for range len(chunkable) {
-			r := <-resCh
-			if len(r.c) > 0 {
-				allChunks = append(allChunks, r.c...)
-			}
-		}
-	}
-	if len(allChunks) == 0 {
-		return 0, nil
-	}
-
-	// Only embed chunks without existing vectors — unchanged nodes keep
-	// their existing vectors, zero re-computation.
-	var needEmbed []store.Chunk
-	var needEmbedIdx []int
-	for i, c := range allChunks {
-		if len(c.Embedding) == 0 {
-			needEmbed = append(needEmbed, c)
-			needEmbedIdx = append(needEmbedIdx, i)
-		}
-	}
-	if len(needEmbed) == 0 {
-		return len(allChunks), nil
-	}
-	if batchSize <= 0 {
-		batchSize = 32
-	}
-	for i := 0; i < len(needEmbed); i += batchSize {
-		end := i + batchSize
-		if end > len(needEmbed) {
-			end = len(needEmbed)
-		}
-		batch := needEmbed[i:end]
-		texts := make([]string, len(batch))
-		for j, c := range batch {
-			texts[j] = c.Content
-		}
-		vecs, err := embedder.EmbedBatch(ctx, texts)
-		if err != nil {
-			log.Printf("chunkAndEmbedNodes: batch %d-%d failed (%v), skipping", i, end, err)
-			continue
-		}
-		for j := range batch {
-			allChunks[needEmbedIdx[i+j]].Embedding = vecs[j]
-		}
-		if progress != nil {
-			progress(end, len(needEmbed))
-		}
-	}
-	if onPersisting != nil {
-		onPersisting()
-	}
-	// Set modelID on all chunks for composite vec0 PK before persisting.
-	for i := range allChunks {
-		if allChunks[i].ModelID == "" {
-			allChunks[i].ModelID = modelID
-		}
-	}
-	if err := db.UpsertChunks(ctx, allChunks); err != nil {
-		if errors.Is(err, store.ErrVectorSkipped) {
-			// Chunk metadata + valid vectors persisted; only the corrupt
-			// ones were skipped. Not a failure — propagate as a warning.
-			return len(allChunks), err
-		}
-		return 0, err
-	}
-	return len(allChunks), nil
-}
 
 // safeGo runs fn in a goroutine with panic recovery. Logs panic + stack trace.
 func safeGo(fn func()) {
@@ -228,17 +88,25 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 	// Tool 1: init
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "init",
-		Description: "Initialize tastastas and get capability overview for your session.",
+		Description: "Initialize tastastas and get capability overview for your session. AI should call init first, then onboard_check to see project state, then onboard/ingest if needed.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct{}) (*mcp.CallToolResult, InitOutput, error) {
-		help := `Tastastas Memory Backend:
-- Typed graph + vector + lexical hybrid.
-- Tools: remember (store), recall (search), link (connect nodes), query_graph (trace), ingest (walk codebase).
-- Rules:
-  1. Always 'init' first.
-  2. Use 'recall' for initial search; if results are large, use 'recall_chunks' to fetch full paginated content (saves context).
-  3. Prefer 'link' (create edges) over 'remember' (store text or quick memorable notes) for complex relationships (ERD, PRD, API spec).
-  4. 'recall' returns ranked structural edges + inferred links; use 'query_graph' to inspect proposals.
-  5. Ingest is idempotent; run on every push.`
+		help := `Tastastas Memory Backend - Typed graph + vector + lexical hybrid.
+
+Workflow:
+  1. init                    — start here.
+  2. onboard_check           — check if project already has embeddings for the current model.
+  3a. onboard                — gated (skips if model already clean). Async. Produces nodes + edges + chunks + vectors.
+  3b. ingest cwd="..."       — ungated, always runs. Idempotent upsert. Same pipeline as onboard.
+  4. job_status              — poll async job progress (phase: walking → embedding → persisting → done).
+  5. recall / recall_chunks  — search memory.
+  6. remember / link         — store a single fact or create edges.
+  7. clear_project           — default: clears current model only. purge:true for full wipe.
+
+Rules:
+  - Always init first.
+  - Prefer recall over ad-hoc searches.
+  - Use link for complex relationships (ERD, PRD, API spec).
+  - Ingest is idempotent; run on every push.`
 		output := InitOutput{Help: help, ModelID: modelID}
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: help}}}, output, nil
 	})
@@ -262,11 +130,9 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			}
 		}
 
-		job := jobs.create()
+		job := jobs.create(projectID)
 		safeGo(func() {
-			bctx := context.Background()
-
-			// Per-model AlreadyOnboarded check before goroutine.
+			// Per-model AlreadyOnboarded guard.
 			if modelID != "" {
 				status, _ := db.GetEmbedModelStatus(ctx, projectID, modelID)
 				if status == "clean" {
@@ -275,64 +141,29 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 				}
 			}
 
-			if modelID != "" {
-				_ = db.SetEmbedModelDirty(bctx, projectID, modelID)
+			ingestMu.Lock()
+			result, err := onboard.Run(context.Background(), onboard.Config{
+				CWD:       cwd,
+				ProjectID: projectID,
+				Scope:     args.Scope,
+				ModelID:   modelID,
+				Embedder:  embedder,
+				Store:     db,
+				BatchSize: batchSize,
+				OnChunkProgress: func(embedded, total int) {
+					jobs.updatePhase(job.ID, "embedding")
+					jobs.updateChunksEmbedded(job.ID, embedded, total)
+				},
+				OnPersistChunks: func() { jobs.updatePhase(job.ID, "persisting") },
+			})
+			ingestMu.Unlock()
+
+			if err != nil {
+				jobs.finish(job.ID, 0, 0, 0, err)
+				return
 			}
-
-			runErr := func() error {
-				result, err := onboard.Run(
-					context.Background(),
-					onboard.Config{
-						CWD:       cwd,
-						ProjectID: projectID,
-						Scope:     args.Scope,
-						ModelID:   modelID,
-						Embedder:  embedder,
-						Store:     db,
-					},
-				)
-				if err != nil {
-					return err
-				}
-				if result.AlreadyOnboarded {
-					return nil
-				}
-				jobs.updateCounts(job.ID, result.FilesWalked, result.FilesSkipped)
-
-				jobs.updatePhase(job.ID, "waiting")
-				ingestMu.Lock()
-				jobs.updatePhase(job.ID, "chunking")
-
-				embedOnce := sync.OnceFunc(func() { jobs.updatePhase(job.ID, "embedding") })
-
-				chunkCount, err := chunkAndEmbedNodes(
-					context.Background(), db, embedder, result.AllNodes, batchSize, modelID,
-					func(embedded, total int) {
-						embedOnce()
-						jobs.updateChunksEmbedded(job.ID, embedded, total)
-					},
-					func() { jobs.updatePhase(job.ID, "persisting") },
-				)
-				ingestMu.Unlock()
-				if err != nil && !errors.Is(err, store.ErrVectorSkipped) {
-					return fmt.Errorf("chunk/embed: %w", err)
-				}
-				if err != nil {
-					log.Printf("onboard job %s: %v (job continues — metadata persisted)", job.ID, err)
-					jobs.addWarning(job.ID, err.Error())
-				}
-				_ = chunkCount
-				return nil
-			}()
-
-			if runErr != nil {
-				jobs.finish(job.ID, 0, 0, 0, runErr)
-			} else {
-				if modelID != "" {
-					_ = db.SetEmbedModelClean(bctx, projectID, modelID)
-				}
-				jobs.finish(job.ID, 0, 0, 0, nil)
-			}
+			jobs.finish(job.ID, len(result.AllNodes), result.CallGraphEdges, result.ChunkCount, nil,
+				result.ConventionsInferred, result.AutoLinked, result.ProposalsQueued)
 		})
 		// Report walk counts and transition phase to "embedding" — same as ingest path.
 
@@ -415,51 +246,38 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 				importance = 0.5
 			}
 
-			if modelID != "" {
-				_ = db.InitEmbedConfig(ctx, projectID, modelID)
-			}
-
 			n := store.Node{
 				ID: id, NodeType: nodeType, Title: args.Title, Content: args.Content,
 				ProjectID: projectID, Importance: importance, SourceAdapter: "mcp",
 				ModelID: modelID,
 			}
 
-			var warn string
-			if err := db.UpsertNode(ctx, n); err != nil {
-				if errors.Is(err, store.ErrVectorSkipped) {
-					warn = err.Error()
-				} else {
-					return errorResult(err), RememberOutput{}, nil
-				}
-			}
-
-			if _, err := chunkAndEmbedNodes(
-				ctx, db, embedder, []store.Node{n},
-				batchSize, modelID, nil, nil,
-			); err != nil {
-				if errors.Is(err, store.ErrVectorSkipped) {
-					if warn == "" {
-						warn = err.Error()
-					}
-				} else {
-					return errorResult(err), RememberOutput{}, nil
-				}
-			}
-
+			edges := make([]store.Edge, 0, len(args.Links))
 			for _, target := range args.Links {
-				_ = db.UpsertEdge(ctx, store.Edge{
-					FromID:     id,
-					ToID:       target,
-					EdgeType:   "references",
-					Confidence: 1.0,
+				edges = append(edges, store.Edge{
+					FromID: id, ToID: target,
+					EdgeType: "references", Confidence: 1.0,
 				})
 			}
 
+			if _, err := onboard.Run(ctx, onboard.Config{
+				Nodes:            []store.Node{n},
+				Edges:            edges,
+				SkipPostProcess:  true,
+				ProjectID:        projectID,
+				ModelID:          modelID,
+				Embedder:         embedder,
+				Store:            db,
+				BatchSize:        batchSize,
+			}); err != nil {
+				if !errors.Is(err, store.ErrVectorSkipped) {
+					return errorResult(err), RememberOutput{}, nil
+				}
+			}
+
 			output := RememberOutput{
-				ID:      id,
-				Status:  "stored",
-				Warning: warn,
+				ID:     id,
+				Status: "stored",
 			}
 
 			toolResult := &mcp.CallToolResult{
@@ -788,107 +606,30 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			}
 		}
 
-		job := jobs.create()
+		job := jobs.create(projectID)
 		safeGo(func() {
-			bctx := context.Background()
-
-			// Per-model AlreadyOnboarded check before goroutine.
-			if modelID != "" {
-				status, _ := db.GetEmbedModelStatus(ctx, projectID, modelID)
-				if status == "clean" {
-					jobs.finish(job.ID, 0, 0, 0, nil)
-					return
-				}
-			}
-
-			ingestDone := false
-			if modelID != "" {
-				_ = db.SetEmbedModelDirty(bctx, projectID, modelID)
-				defer func() {
-					if ingestDone {
-						_ = db.SetEmbedModelClean(bctx, projectID, modelID)
-					}
-				}()
-			}
-			nodes, edges, _, filesWalked, filesSkipped, err := onboard.AutoDetectAdapters(
-				context.Background(),
-				db,
-				cwd,
-				projectID,
-			)
-			if err != nil {
-				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("detect adapters: %w", err))
-				return
-			}
-			jobs.updateCounts(job.ID, filesWalked, filesSkipped)
-			for _, n := range nodes {
-				if err := db.UpsertNode(context.Background(), n); err != nil && !errors.Is(err, store.ErrVectorSkipped) {
-					jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert node: %w", err))
-					return
-				} else if err != nil {
-					log.Printf("ingest job %s: %v (node metadata persisted)", job.ID, err)
-				}
-			}
-			if err := db.UpsertEdges(context.Background(), edges); err != nil {
-				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert edges: %w", err))
-				return
-			}
-
-			jobs.updatePhase(job.ID, "waiting")
 			ingestMu.Lock()
-			jobs.updatePhase(job.ID, "chunking")
-
-			embedOnce := sync.OnceFunc(func() { jobs.updatePhase(job.ID, "embedding") })
-			chunkCount, err := chunkAndEmbedNodes(
-				context.Background(), db, embedder, nodes, batchSize, modelID,
-				func(embedded, total int) {
-					embedOnce()
+			result, err := onboard.Run(context.Background(), onboard.Config{
+				CWD:       cwd,
+				ProjectID: projectID,
+				ModelID:   modelID,
+				Embedder:  embedder,
+				Store:     db,
+				BatchSize: batchSize,
+				OnChunkProgress: func(embedded, total int) {
+					jobs.updatePhase(job.ID, "embedding")
 					jobs.updateChunksEmbedded(job.ID, embedded, total)
 				},
-				func() { jobs.updatePhase(job.ID, "persisting") },
-			)
-			if err != nil && !errors.Is(err, store.ErrVectorSkipped) {
-				ingestMu.Unlock()
-				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("chunk/embed: %w", err))
-				return
-			}
-			if err != nil {
-				log.Printf("ingest job %s: %v (chunks persisted)", job.ID, err)
-			}
-			if err := onboard.EmbedNodes(context.Background(), db, nodes, embedder, batchSize, modelID); err != nil {
-				ingestMu.Unlock()
-				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("embed nodes: %w", err))
-				return
-			}
+				OnPersistChunks: func() { jobs.updatePhase(job.ID, "persisting") },
+			})
 			ingestMu.Unlock()
 
-			jobs.updatePhase(job.ID, "linking")
-
-			convNodes := onboard.InferConventions(context.Background(), db, projectID, nodes)
-			for _, cn := range convNodes {
-				_ = db.UpsertNode(context.Background(), cn)
-			}
-			nodes = append(nodes, convNodes...)
-
-			hierNodes, hierEdges := onboard.BuildHierarchy(projectID, nodes)
-			for _, n := range hierNodes {
-				if err := db.UpsertNode(context.Background(), n); err != nil && !errors.Is(err, store.ErrVectorSkipped) {
-					jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert hierarchy node: %w", err))
-					return
-				} else if err != nil {
-					log.Printf("ingest job %s: %v (hierarchy node metadata persisted)", job.ID, err)
-					jobs.addWarning(job.ID, err.Error())
-				}
-			}
-			if err := db.UpsertEdges(context.Background(), hierEdges); err != nil {
-				jobs.finish(job.ID, 0, 0, 0, fmt.Errorf("upsert hierarchy edges: %w", err))
+			if err != nil {
+				jobs.finish(job.ID, 0, 0, 0, err)
 				return
 			}
-			nodes = append(nodes, hierNodes...)
-
-			auto, proposals := onboard.Tier2ScoreAndLink(context.Background(), db, projectID, nodes)
-			ingestDone = true
-			jobs.finish(job.ID, len(nodes), len(edges), chunkCount, nil, len(convNodes), auto, proposals)
+			jobs.finish(job.ID, len(result.AllNodes), result.CallGraphEdges, result.ChunkCount, nil,
+				result.ConventionsInferred, result.AutoLinked, result.ProposalsQueued)
 		})
 
 		output := IngestOutput{JobID: job.ID, Status: "running"}
@@ -943,58 +684,72 @@ func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBacke
 			projectID = "default"
 		}
 
-		job := jobs.create()
+		job := jobs.create(projectID)
 		safeGo(func() {
-			defer jobs.finish(job.ID, 0, 0, 0, func() error {
-				if modelID != "" {
-					_ = db.InitEmbedConfig(context.Background(), projectID, modelID)
-				}
-				if embedder == nil {
-					return fmt.Errorf("extract_and_remember requires a configured embedder")
-				}
-				facts, err := extractor.Extract(context.Background(), args.Conversation)
-				if err != nil {
-					return fmt.Errorf("extract: %w", err)
-				}
+			var err error
+			defer func() {
+				jobs.finish(job.ID, 0, 0, 0, err)
+			}()
 
-				var storedNodes []store.Node
-				for _, f := range facts {
-					vec, err := embedder.Embed(context.Background(), f.Content)
-					if err != nil {
-						return fmt.Errorf("embed: %w", err)
-					}
+			if embedder == nil {
+				err = fmt.Errorf("extract_and_remember requires a configured embedder")
+				return
+			}
+			facts, xerr := extractor.Extract(context.Background(), args.Conversation)
+			if xerr != nil {
+				err = fmt.Errorf("extract: %w", xerr)
+				return
+			}
 
-					candidates, err := db.SearchVector(context.Background(), projectID, vec, 5, modelID)
-					if err != nil {
-						log.Printf("extract_and_remember: search: %v", err)
-						continue
-					}
-
-					id := fmt.Sprintf("%s/%s/%s", projectID, f.Kind, genULID())
-
-					for _, c := range candidates {
-						if c.NodeType == f.Kind && c.Score >= dedupe.DefaultThreshold {
-							id = c.ID
-							break
-						}
-					}
-
-					node := store.Node{
-						ID: id, ProjectID: projectID, NodeType: f.Kind,
-						Title: f.Title, Content: f.Content, Importance: f.Importance,
-						SourceAdapter: "extract_and_remember", Embedding: vec,
-						ModelID: modelID,
-					}
-
-					if err := db.UpsertNode(context.Background(), node); err != nil {
-						return fmt.Errorf("upsert %s: %w", id, err)
-					}
-					storedNodes = append(storedNodes, node)
+			var storedNodes []store.Node
+			for _, f := range facts {
+				vec, verr := embedder.Embed(context.Background(), f.Content)
+				if verr != nil {
+					err = fmt.Errorf("embed: %w", verr)
+					return
 				}
 
-				chunkAndEmbedNodes(context.Background(), db, embedder, storedNodes, batchSize, modelID, nil, nil)
-				return nil
-			}())
+				candidates, cerr := db.SearchVector(context.Background(), projectID, vec, 5, modelID)
+				if cerr != nil {
+					log.Printf("extract_and_remember: search: %v", cerr)
+					continue
+				}
+
+				id := fmt.Sprintf("%s/%s/%s", projectID, f.Kind, genULID())
+
+				for _, c := range candidates {
+					if c.NodeType == f.Kind && c.Score >= dedupe.DefaultThreshold {
+						id = c.ID
+						break
+					}
+				}
+
+				storedNodes = append(storedNodes, store.Node{
+					ID: id, ProjectID: projectID, NodeType: f.Kind,
+					Title: f.Title, Content: f.Content, Importance: f.Importance,
+					SourceAdapter: "extract_and_remember", Embedding: vec,
+					ModelID: modelID,
+				})
+			}
+
+			if len(storedNodes) == 0 {
+				return
+			}
+
+			_, runErr := onboard.Run(context.Background(), onboard.Config{
+				Nodes:              storedNodes,
+				Edges:              nil,
+				SkipNodeEmbedding:  true,
+				SkipPostProcess:    true,
+				ProjectID:          projectID,
+				ModelID:            modelID,
+				Embedder:           embedder,
+				Store:              db,
+				BatchSize:          batchSize,
+			})
+			if runErr != nil {
+				err = runErr
+			}
 		})
 
 		output := ExtractAndRememberOutput{

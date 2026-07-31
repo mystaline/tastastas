@@ -16,6 +16,11 @@ import (
 	"sync"
 	"time"
 
+	sitter "github.com/tree-sitter/go-tree-sitter"
+	golang "github.com/tree-sitter/tree-sitter-go/bindings/go"
+	ts "github.com/tree-sitter/tree-sitter-typescript/bindings/go"
+
+	"github.com/mystaline-dev/tastastas/internal/chunker"
 	"github.com/mystaline-dev/tastastas/internal/embed"
 	"github.com/mystaline-dev/tastastas/internal/ingest/codeast"
 	"github.com/mystaline-dev/tastastas/internal/ingest/codeast/treesitter"
@@ -41,12 +46,23 @@ type Config struct {
 	Embedder  embed.EmbedderBackend
 	Store     store.Store // injected from caller, not opened internally
 	BatchSize int         // 0 = default 32
+
+	// Pre-built nodes (skip AutoDetectAdapters)
+	Nodes []store.Node
+	Edges []store.Edge
+
+	// Section control
+	SkipNodeEmbedding bool
+	SkipPostProcess   bool
+
+	// Progress callbacks (nil = no progress)
+	OnChunkProgress func(embedded, total int)
+	OnPersistChunks func()
 }
 
 type Result struct {
 	CWD                 string
 	ProjectID           string
-	AlreadyOnboarded    bool // true if project already has nodes, skip re-ingest
 	DetectedAdapters    []string
 	CodeSymbols         int
 	CallGraphEdges      int
@@ -59,6 +75,7 @@ type Result struct {
 	FilesWalked         int
 	FilesSkipped        int
 	DurationMs          int64
+	ChunkCount          int
 	AllNodes            []store.Node // all nodes ingested during this run
 }
 
@@ -80,44 +97,35 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 
 	db := cfg.Store
 
-	// Per-model AlreadyOnboarded check. If modelID is set, check config
-	// status for that specific model. Otherwise fall back to project-level
-	// check (nodes + chunks exist).
+	var success bool
+	// SECTION 0: Dirty/clean
 	if cfg.ModelID != "" {
-		status, _ := db.GetEmbedModelStatus(ctx, cfg.ProjectID, cfg.ModelID)
-		if status == "clean" {
-			elapsed := time.Since(start).Milliseconds()
-			return Result{
-				CWD:              cfg.CWD,
-				ProjectID:        cfg.ProjectID,
-				AlreadyOnboarded: true,
-				DurationMs:       elapsed,
-			}, nil
-		}
-	} else {
-		stats, err := db.Stats(ctx, cfg.ProjectID)
-		if err == nil && stats.NodeCount > 0 && stats.ChunkCount > 0 {
-			elapsed := time.Since(start).Milliseconds()
-			detected := []string{}
-			if stats.ConventionCnt > 0 {
-				detected = append(detected, "already-onboarded")
+		_ = db.SetEmbedModelDirty(ctx, cfg.ProjectID, cfg.ModelID)
+		defer func() {
+			if success == true {
+				_ = db.SetEmbedModelClean(ctx, cfg.ProjectID, cfg.ModelID)
 			}
-			return Result{
-				CWD:              cfg.CWD,
-				ProjectID:        cfg.ProjectID,
-				AlreadyOnboarded: true,
-				DetectedAdapters: detected,
-				DurationMs:       elapsed,
-			}, nil
+		}()
+	}
+
+	// SECTION 1: Node source
+	var allNodes []store.Node
+	var allEdges []store.Edge
+	var detectedAdapters []string
+	var filesWalked, filesSkipped int
+	var err error
+
+	if cfg.Nodes != nil {
+		allNodes = cfg.Nodes
+		allEdges = cfg.Edges
+	} else {
+		allNodes, allEdges, detectedAdapters, filesWalked, filesSkipped, err = AutoDetectAdapters(ctx, db, cfg.CWD, cfg.ProjectID)
+		if err != nil {
+			return Result{}, err
 		}
 	}
 
-	allNodes, allEdges, detectedAdapters, filesWalked, filesSkipped, err := AutoDetectAdapters(ctx, db, cfg.CWD, cfg.ProjectID)
-	if err != nil {
-		return Result{}, err
-	}
-
-	// Persist base nodes/edges
+	// SECTION 2: Persist
 	for _, n := range allNodes {
 		if err := db.UpsertNode(ctx, n); err != nil {
 			if !errors.Is(err, store.ErrVectorSkipped) {
@@ -126,75 +134,140 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 			log.Printf("onboard: %v (node metadata persisted, continuing)", err)
 		}
 	}
+
 	if err := db.UpsertEdges(ctx, allEdges); err != nil {
 		return Result{}, fmt.Errorf("upsert edges: %w", err)
 	}
 
-	// Embedding
-	embedBatchSize := cfg.BatchSize
-	if embedBatchSize <= 0 {
-		embedBatchSize = 32
-	}
-	if cfg.Embedder != nil {
-		if err := EmbedNodes(ctx, db, allNodes, cfg.Embedder, embedBatchSize, cfg.ModelID); err != nil {
+	var chunkCount int
+
+	// SECTION 5: Post-process (conventions, hierarchy, tier 2).
+	// Chunking + node embedding run inside this block so convention and
+	// hierarchy nodes created by InferConventions/BuildHierarchy also get
+	// chunks and vectors.
+	var embedBatchSize int
+
+	if !cfg.SkipPostProcess {
+		convNodes := InferConventions(ctx, db, cfg.ProjectID, allNodes)
+		for _, n := range convNodes {
+			if err := db.UpsertNode(ctx, n); err != nil && !errors.Is(err, store.ErrVectorSkipped) {
+				return Result{}, err
+			}
+		}
+		allNodes = append(allNodes, convNodes...)
+
+		hierNodes, hierEdges := BuildHierarchy(cfg.ProjectID, allNodes)
+		for _, n := range hierNodes {
+			if err := db.UpsertNode(ctx, n); err != nil && !errors.Is(err, store.ErrVectorSkipped) {
+				return Result{}, err
+			}
+		}
+		if err := db.UpsertEdges(ctx, hierEdges); err != nil {
 			return Result{}, err
+		}
+		allNodes = append(allNodes, hierNodes...)
+
+		if cfg.Embedder != nil {
+			chunkCount, err = chunkAndEmbedNodes(
+				ctx, db, cfg.Embedder, allNodes,
+				cfg.BatchSize, cfg.ModelID,
+				cfg.OnChunkProgress, cfg.OnPersistChunks,
+			)
+			if err != nil && !errors.Is(err, store.ErrVectorSkipped) {
+				return Result{}, fmt.Errorf("chunk/embed: %w", err)
+			}
+			if err != nil {
+				log.Printf("onboard: %v (chunks persisted, continuing)", err)
+			}
+		}
+
+		if !cfg.SkipNodeEmbedding && cfg.Embedder != nil {
+			embedBatchSize = cfg.BatchSize
+			if embedBatchSize <= 0 {
+				embedBatchSize = 32
+			}
+			if err := EmbedNodes(ctx, db, allNodes, cfg.Embedder, embedBatchSize, cfg.ModelID); err != nil {
+				return Result{}, err
+			}
+		}
+
+		auto, queued := Tier2ScoreAndLink(ctx, db, cfg.ProjectID, allNodes)
+
+		if xpEdges, xpErr := CrossProjectLink(ctx, db, cfg.ProjectID, allNodes); xpErr == nil && len(xpEdges) > 0 {
+			_ = db.UpsertEdges(ctx, xpEdges)
+		}
+
+		success = true
+		return Result{
+			CWD:                 cfg.CWD,
+			ProjectID:           cfg.ProjectID,
+			DetectedAdapters:    detectedAdapters,
+			CodeSymbols:         countCodeSymbols(allNodes),
+			CallGraphEdges:      countCallEdges(allEdges),
+			ImportEdges:         countImportEdges(allEdges),
+			GenericDocs:         countGenericDocs(allNodes),
+			ConventionsInferred: len(convNodes),
+			HierarchyNodes:      len(hierNodes),
+			AutoLinked:          auto,
+			ProposalsQueued:     queued,
+			FilesWalked:         filesWalked,
+			FilesSkipped:        filesSkipped,
+			DurationMs:          time.Since(start).Milliseconds(),
+			ChunkCount:          chunkCount,
+			AllNodes:            allNodes,
+		}, nil
+	}
+
+	if !cfg.SkipPostProcess || cfg.Embedder != nil {
+		if cfg.Embedder != nil {
+			chunkCount, err = chunkAndEmbedNodes(
+				ctx, db, cfg.Embedder, allNodes,
+				cfg.BatchSize, cfg.ModelID,
+				cfg.OnChunkProgress, cfg.OnPersistChunks,
+			)
+			if err != nil && !errors.Is(err, store.ErrVectorSkipped) {
+				return Result{}, fmt.Errorf("chunk/embed: %w", err)
+			}
+			if err != nil {
+				log.Printf("onboard: %v (chunks persisted, continuing)", err)
+			}
+		}
+		if !cfg.SkipNodeEmbedding && cfg.Embedder != nil {
+			embedBatchSize = cfg.BatchSize
+			if embedBatchSize <= 0 {
+				embedBatchSize = 32
+			}
+			if err := EmbedNodes(ctx, db, allNodes, cfg.Embedder, embedBatchSize, cfg.ModelID); err != nil {
+				return Result{}, err
+			}
 		}
 	}
 
-	// InferConventions
-	convNodes := InferConventions(ctx, db, cfg.ProjectID, allNodes)
-	for _, n := range convNodes {
-		if err := db.UpsertNode(ctx, n); err != nil && !errors.Is(err, store.ErrVectorSkipped) {
-			return Result{}, err
-		}
-	}
-	allNodes = append(allNodes, convNodes...)
-
-	// Directory hierarchy backbone: synthetic nodes connecting every real
-	// node up to a single repo-root node via "contains" edges. Purely
-	// additive, derived from SourcePath only — see hierarchy.go.
-	hierNodes, hierEdges := BuildHierarchy(cfg.ProjectID, allNodes)
-	for _, n := range hierNodes {
-		if err := db.UpsertNode(ctx, n); err != nil && !errors.Is(err, store.ErrVectorSkipped) {
-			return Result{}, err
-		}
-	}
-	if err := db.UpsertEdges(ctx, hierEdges); err != nil {
-		return Result{}, err
-	}
-	allNodes = append(allNodes, hierNodes...)
-
-	// Tier 2 inline linking
-	auto, queued := Tier2ScoreAndLink(ctx, db, cfg.ProjectID, allNodes)
-
-	// Cross-project linking (P2h) — link new project's code symbols to
-	// matching symbols in all other known projects.
-	if xpEdges, xpErr := CrossProjectLink(ctx, db, cfg.ProjectID, allNodes); xpErr == nil && len(xpEdges) > 0 {
-		_ = db.UpsertEdges(ctx, xpEdges)
-	}
-
+	success = true
 	return Result{
-		CWD:                 cfg.CWD,
-		ProjectID:           cfg.ProjectID,
-		DetectedAdapters:    detectedAdapters,
-		CodeSymbols:         countCodeSymbols(allNodes),
-		CallGraphEdges:      countCallEdges(allEdges),
-		ImportEdges:         countImportEdges(allEdges),
-		GenericDocs:         countGenericDocs(allNodes),
-		ConventionsInferred: len(convNodes),
-		HierarchyNodes:      len(hierNodes),
-		AutoLinked:          auto,
-		ProposalsQueued:     queued,
-		FilesWalked:         filesWalked,
-		FilesSkipped:        filesSkipped,
-		AllNodes:            allNodes,
+		CWD:              cfg.CWD,
+		ProjectID:        cfg.ProjectID,
+		DetectedAdapters: detectedAdapters,
+		CodeSymbols:      countCodeSymbols(allNodes),
+		CallGraphEdges:   countCallEdges(allEdges),
+		ImportEdges:      countImportEdges(allEdges),
+		GenericDocs:      countGenericDocs(allNodes),
+		FilesWalked:      filesWalked,
+		FilesSkipped:     filesSkipped,
+		DurationMs:       time.Since(start).Milliseconds(),
+		ChunkCount:       chunkCount,
+		AllNodes:         allNodes,
 	}, nil
 }
 
 // AutoDetectAdapters runs all matching adapters concurrently against root,
 // returns merged nodes, edges, detected adapter names, and file count.
 // Used by both onboard.Run() and the MCP ingest tool.
-func AutoDetectAdapters(ctx context.Context, db store.Store, root, projectID string) (nodes []store.Node, edges []store.Edge, adapters []string, filesWalked, filesSkipped int, err error) {
+func AutoDetectAdapters(
+	ctx context.Context,
+	db store.Store,
+	root, projectID string,
+) (nodes []store.Node, edges []store.Edge, adapters []string, filesWalked, filesSkipped int, err error) {
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
@@ -1064,4 +1137,255 @@ func extSet(langs []string) map[string]bool {
 		}
 	}
 	return m
+}
+
+var goLanguage = sync.OnceValue(func() *sitter.Language {
+	return sitter.NewLanguage(golang.Language())
+})
+var tsLanguage = sync.OnceValue(func() *sitter.Language {
+	return sitter.NewLanguage(ts.LanguageTypescript())
+})
+
+// chunkAndEmbedNodes splits nodes into chunks, embeds any missing vectors,
+// and bulk-persists everything. progress reports (embedded, total) after
+// each embed batch; onPersisting fires once, right before the bulk DB
+// insert starts. Both callbacks may be nil.
+func chunkAndEmbedNodes(
+	ctx context.Context,
+	db store.Store,
+	embedder embed.EmbedderBackend,
+	nodes []store.Node,
+	batchSize int,
+	modelID string,
+	progress func(embedded, total int),
+	onPersisting func(),
+) (int, error) {
+	if embedder == nil {
+		return 0, nil
+	}
+
+	var allChunks []store.Chunk
+	goLang := goLanguage()
+	tsLang := tsLanguage()
+	var chunkable []store.Node
+	for _, n := range nodes {
+		if n.ContentHash == "" {
+			chunkable = append(chunkable, n)
+			continue
+		}
+		existing, err := db.GetNode(ctx, n.ID)
+		if err == nil && existing.ContentHash == n.ContentHash {
+			chunks, cerr := db.GetChunksByParent(ctx, n.ID, 1000, 0)
+			if cerr == nil && len(chunks) > 0 {
+				allChunks = append(allChunks, chunks...)
+				continue
+			}
+		}
+		_ = db.DeleteChunksByParent(ctx, n.ID, modelID)
+		chunkable = append(chunkable, n)
+	}
+	if len(chunkable) > 0 {
+		type cr struct {
+			idx int
+			c   []store.Chunk
+		}
+		resCh := make(chan cr, len(chunkable))
+		maxChunkSize := computeMaxChunkSize(embedder)
+		for w := range 4 {
+			go func(worker int) {
+				cfg := chunker.DefaultConfig()
+				cfg.MaxChunkSize = maxChunkSize
+				for j := worker; j < len(chunkable); j += 4 {
+					resCh <- cr{idx: j, c: chunkForNode(chunkable[j], cfg, goLang, tsLang)}
+				}
+			}(w)
+		}
+		for range len(chunkable) {
+			r := <-resCh
+			if len(r.c) > 0 {
+				allChunks = append(allChunks, r.c...)
+			}
+		}
+	}
+	if len(allChunks) == 0 {
+		return 0, nil
+	}
+
+	var needEmbed []store.Chunk
+	var needEmbedIdx []int
+	for i, c := range allChunks {
+		if len(c.Embedding) == 0 {
+			needEmbed = append(needEmbed, c)
+			needEmbedIdx = append(needEmbedIdx, i)
+		}
+	}
+	if len(needEmbed) == 0 {
+		return len(allChunks), nil
+	}
+	if batchSize <= 0 {
+		batchSize = 32
+	}
+	for i := 0; i < len(needEmbed); i += batchSize {
+		end := i + batchSize
+		if end > len(needEmbed) {
+			end = len(needEmbed)
+		}
+		batch := needEmbed[i:end]
+		texts := make([]string, len(batch))
+		for j, c := range batch {
+			texts[j] = c.Content
+		}
+		vecs, err := embedder.EmbedBatch(ctx, texts)
+		if err != nil {
+			log.Printf("chunkAndEmbedNodes: batch %d-%d failed (%v), skipping", i, end, err)
+			continue
+		}
+		for j := range batch {
+			allChunks[needEmbedIdx[i+j]].Embedding = vecs[j]
+		}
+		if progress != nil {
+			progress(end, len(needEmbed))
+		}
+	}
+	if onPersisting != nil {
+		onPersisting()
+	}
+	for i := range allChunks {
+		if allChunks[i].ModelID == "" {
+			allChunks[i].ModelID = modelID
+		}
+	}
+	if err := db.UpsertChunks(ctx, allChunks); err != nil {
+		if errors.Is(err, store.ErrVectorSkipped) {
+			return len(allChunks), err
+		}
+		return 0, err
+	}
+	return len(allChunks), nil
+}
+
+func computeMaxChunkSize(embedder embed.EmbedderBackend) int {
+	// Derive MaxChunkSize from embedder's model limit:
+	// floor 1200 (proven default), scale to MaxContentBytes/4, cap at 4096.
+	maxBytes := 0
+	if embedder != nil {
+		maxBytes = embedder.MaxContentBytes()
+	}
+	if maxBytes <= 0 {
+		maxBytes = 8192
+	}
+	maxChunkSize := maxBytes / 4
+	if maxChunkSize < 1200 {
+		maxChunkSize = 1200
+	}
+	if maxChunkSize > 4096 {
+		maxChunkSize = 4096
+	}
+
+	return maxChunkSize
+}
+
+// chunkForNode splits a node's content into chunks suitable for embedding.
+func chunkForNode(
+	n store.Node,
+	cfg chunker.Config,
+	goLang, tsLang *sitter.Language,
+) []store.Chunk {
+	switch n.NodeType {
+	case "prd", "api-spec", "erd", "test-case", "generic-doc", "obsidian-note":
+		chunks, _ := chunker.ChunkMarkdown(n.ID, n.Content, cfg)
+		result := make([]store.Chunk, len(chunks))
+		for i, c := range chunks {
+			result[i] = store.Chunk{
+				ID:            c.ID,
+				ParentNodeID:  c.ParentNodeID,
+				ChunkIndex:    c.ChunkIndex,
+				Type:          string(c.Type),
+				HeadingPath:   c.HeadingPath,
+				Content:       c.Content,
+				Language:      c.Language,
+				SourceAdapter: n.SourceAdapter,
+			}
+		}
+		return result
+
+	case "code:function", "code:type", "code:package", "code:file":
+		switch n.Language {
+		case "go":
+			if goLang != nil {
+				chunks, err := chunker.ChunkGoCode(n.ID, n.Content, goLang, cfg)
+				if err == nil && len(chunks) > 0 {
+					return chunkSlice(chunks, n.SourceAdapter)
+				}
+			}
+			if chunks, err := chunker.ChunkCodeByPattern(n.ID, n.Content, "go", cfg); err == nil && len(chunks) > 0 {
+				return chunkSlice(chunks, n.SourceAdapter)
+			}
+		case "typescript", "javascript":
+			if tsLang != nil {
+				chunks, err := chunker.ChunkTypeScript(n.ID, n.Content, tsLang, cfg)
+				if err == nil && len(chunks) > 0 {
+					return chunkSlice(chunks, n.SourceAdapter)
+				}
+			}
+			if chunks, err := chunker.ChunkCodeByPattern(n.ID, n.Content, "typescript", cfg); err == nil &&
+				len(chunks) > 0 {
+				return chunkSlice(chunks, n.SourceAdapter)
+			}
+		default:
+			if chunks, err := chunker.ChunkCodeByPattern(n.ID, n.Content, n.Language, cfg); err == nil && len(chunks) > 0 {
+				return chunkSlice(chunks, n.SourceAdapter)
+			}
+		}
+		fallthrough
+
+	default:
+		// For oversized content, use ChunkCodeByPattern as fallback
+		// which includes splitOversizedChunks for paragraph-level splitting.
+		if len(n.Content) > cfg.MaxChunkSize {
+			if chunks, err := chunker.ChunkCodeByPattern(n.ID, n.Content, n.Language, cfg); err == nil &&
+				len(chunks) > 0 {
+				return chunkSlice(chunks, n.SourceAdapter)
+			}
+		}
+		if n.Content == "" {
+			return nil
+		}
+		return []store.Chunk{{
+			ID:            n.ID + "/chunk/0",
+			ParentNodeID:  n.ID,
+			ChunkIndex:    0,
+			Type:          "conversation_fact",
+			HeadingPath:   []string{},
+			Content:       n.Content,
+			Language:      "text",
+			SourceAdapter: n.SourceAdapter,
+		}}
+	}
+}
+
+// chunkSlice converts chunker.Chunk slice to store.Chunk slice,
+// linking prev/next IDs along the way.
+func chunkSlice(chunks []chunker.Chunk, sourceAdapter string) []store.Chunk {
+	result := make([]store.Chunk, len(chunks))
+	for i, c := range chunks {
+		sc := store.Chunk{
+			ID:            c.ID,
+			ParentNodeID:  c.ParentNodeID,
+			ChunkIndex:    c.ChunkIndex,
+			Type:          string(c.Type),
+			HeadingPath:   c.HeadingPath,
+			Content:       c.Content,
+			Language:      c.Language,
+			SourceAdapter: sourceAdapter,
+		}
+		if i > 0 {
+			sc.PrevChunkID = result[i-1].ID
+		}
+		if i+1 < len(chunks) {
+			sc.NextChunkID = chunks[i+1].ID
+		}
+		result[i] = sc
+	}
+	return result
 }

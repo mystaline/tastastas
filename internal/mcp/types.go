@@ -2,9 +2,6 @@
 package mcp
 
 import (
-	sitter "github.com/tree-sitter/go-tree-sitter"
-
-	"github.com/mystaline-dev/tastastas/internal/chunker"
 	"github.com/mystaline-dev/tastastas/internal/store"
 )
 
@@ -341,98 +338,4 @@ type JobStatusOutput struct {
 	Error           string `json:"error,omitempty"`
 	StartedAt       string `json:"started_at"`
 	EndedAt         string `json:"ended_at,omitempty"`
-}
-
-// chunkForNode splits a node's content into chunks suitable for embedding.
-// For Go code nodes, uses tree-sitter to split by function/type declarations.
-// For Markdown-like nodes, uses heading-based chunking.
-// All other types get a single chunk.
-func chunkForNode(
-	n store.Node,
-	cfg chunker.Config,
-	goLang, tsLang *sitter.Language,
-) []store.Chunk {
-	switch n.NodeType {
-	case "prd", "api-spec", "erd", "test-case", "generic-doc", "obsidian-note":
-		chunks, _ := chunker.ChunkMarkdown(n.ID, n.Content, cfg)
-		result := make([]store.Chunk, len(chunks))
-		for i, c := range chunks {
-			result[i] = store.Chunk{
-				ID:            c.ID,
-				ParentNodeID:  c.ParentNodeID,
-				ChunkIndex:    c.ChunkIndex,
-				Type:          string(c.Type),
-				HeadingPath:   c.HeadingPath,
-				Content:       c.Content,
-				Language:      c.Language,
-				SourceAdapter: n.SourceAdapter,
-			}
-		}
-		return result
-
-	case "go":
-		if goLang != nil {
-			chunks, err := chunker.ChunkGoCode(n.ID, n.Content, goLang, cfg)
-			if err == nil && len(chunks) > 0 {
-				return chunkSlice(chunks, n.SourceAdapter)
-			}
-		}
-		if chunks, err := chunker.ChunkCodeByPattern(n.ID, n.Content, "go", cfg); err == nil && len(chunks) > 0 {
-			return chunkSlice(chunks, n.SourceAdapter)
-		}
-		fallthrough
-
-	case "typescript", "javascript":
-		if tsLang != nil {
-			chunks, err := chunker.ChunkTypeScript(n.ID, n.Content, tsLang, cfg)
-			if err == nil && len(chunks) > 0 {
-				return chunkSlice(chunks, n.SourceAdapter)
-			}
-		}
-		if chunks, err := chunker.ChunkCodeByPattern(n.ID, n.Content, "typescript", cfg); err == nil && len(chunks) > 0 {
-			return chunkSlice(chunks, n.SourceAdapter)
-		}
-		fallthrough
-
-	default:
-		if n.Content == "" {
-			return nil
-		}
-		return []store.Chunk{{
-			ID:            n.ID + "/chunk/0",
-			ParentNodeID:  n.ID,
-			ChunkIndex:    0,
-			Type:          "conversation_fact",
-			HeadingPath:   []string{},
-			Content:       n.Content,
-			Language:      "text",
-			SourceAdapter: n.SourceAdapter,
-		}}
-	}
-}
-
-// chunkSlice converts chunker.Chunk slice to store.Chunk slice,
-// linking prev/next IDs along the way.
-func chunkSlice(chunks []chunker.Chunk, sourceAdapter string) []store.Chunk {
-	result := make([]store.Chunk, len(chunks))
-	for i, c := range chunks {
-		sc := store.Chunk{
-			ID:            c.ID,
-			ParentNodeID:  c.ParentNodeID,
-			ChunkIndex:    c.ChunkIndex,
-			Type:          string(c.Type),
-			HeadingPath:   c.HeadingPath,
-			Content:       c.Content,
-			Language:      c.Language,
-			SourceAdapter: sourceAdapter,
-		}
-		if i > 0 {
-			sc.PrevChunkID = result[i-1].ID
-		}
-		if i+1 < len(chunks) {
-			sc.NextChunkID = chunks[i+1].ID
-		}
-		result[i] = sc
-	}
-	return result
 }

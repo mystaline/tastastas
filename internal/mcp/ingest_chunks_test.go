@@ -11,13 +11,14 @@ import (
 
 	"github.com/mystaline-dev/tastastas/internal/embed"
 	"github.com/mystaline-dev/tastastas/internal/ingest/docwalk"
+	"github.com/mystaline-dev/tastastas/internal/onboard"
 	sqlitestore "github.com/mystaline-dev/tastastas/internal/store/sqlite"
 )
 
 // TestDocwalkChunksAndEmbeds proves docwalk-ingested nodes get chunked and
-// embedded via chunkAndEmbedNodes — the same helper both the MCP "ingest"
-// tool and the HTTP POST /ingest/{adapter} handler call. Uses the real
-// ONNX sidecar so this is a genuine embedding pipeline test, not a mock.
+// embedded via onboard.Run — the same entry point both the MCP "ingest"
+// tool and the HTTP POST /ingest handler call. Uses the real ONNX sidecar
+// so this is a genuine embedding pipeline test, not a mock.
 // Skips gracefully if no baked sidecar binary exists for this platform.
 func TestDocwalkChunksAndEmbeds(t *testing.T) {
 	sc, err := embed.NewSidecar()
@@ -48,18 +49,21 @@ func TestDocwalkChunksAndEmbeds(t *testing.T) {
 	if len(nodes) == 0 {
 		t.Fatal("expected >=1 node from docwalk.Ingest, got 0")
 	}
-	for i := range nodes {
-		if err := db.UpsertNode(ctx, nodes[i]); err != nil {
-			t.Fatalf("UpsertNode: %v", err)
-		}
-	}
 
-	chunkCount, err := chunkAndEmbedNodes(ctx, db, sc, nodes, 32, "", nil, nil)
+	result, err := onboard.Run(ctx, onboard.Config{
+		Nodes:            nodes,
+		Edges:            nil,
+		SkipPostProcess:  true,
+		SkipNodeEmbedding: false,
+		ProjectID:        "docwalk-chunk-test",
+		Embedder:         sc,
+		Store:            db,
+	})
 	if err != nil {
-		t.Fatalf("chunkAndEmbedNodes: %v", err)
+		t.Fatalf("onboard.Run: %v", err)
 	}
-	if chunkCount == 0 {
-		t.Fatal("expected chunkAndEmbedNodes to produce >=1 chunk, got 0")
+	if result.ChunkCount == 0 {
+		t.Fatal("expected onboard.Run to produce >=1 chunk, got 0")
 	}
 
 	// Confirm the chunks are actually retrievable via vector search — not

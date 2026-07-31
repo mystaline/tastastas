@@ -1,11 +1,17 @@
 package onboard
 
 import (
+	"context"
 	"math"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	_ "modernc.org/sqlite/vec"
+
+	"github.com/mystaline-dev/tastastas/internal/chunker"
 	"github.com/mystaline-dev/tastastas/internal/store"
+	sqlitestore "github.com/mystaline-dev/tastastas/internal/store/sqlite"
 )
 
 func TestNamePrefix(t *testing.T) {
@@ -185,4 +191,132 @@ func stringSliceEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestRunWithPreBuiltNodes verifies Run() accepts pre-built nodes via Config.Nodes,
+// skips AutoDetectAdapters when Nodes is set, and respects SkipPostProcess.
+func TestRunWithPreBuiltNodes(t *testing.T) {
+	ctx := context.Background()
+	db, err := sqlitestore.Open(ctx, ":memory:", 384)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+
+	nodes := []store.Node{
+		{
+			ID: "test/code:function/testpkg.Foo",
+			ProjectID: "test",
+			NodeType: "code:function",
+			Title:    "Foo",
+			Content:  "func Foo() { return 1 }",
+		},
+	}
+
+	result, err := Run(ctx, Config{
+		Nodes:            nodes,
+		SkipPostProcess:  true,
+		ProjectID:        "test",
+		Store:            db,
+	})
+	if err != nil {
+		t.Fatalf("Run() with Nodes: %v", err)
+	}
+	if len(result.AllNodes) != 1 {
+		t.Errorf("expected 1 node in result (no post-process), got %d", len(result.AllNodes))
+	}
+	if result.DetectedAdapters != nil {
+		t.Errorf("expected no adapters (Nodes were pre-built), got %v", result.DetectedAdapters)
+	}
+
+	// Verify the node was persisted in the DB
+	got, err := db.GetNode(ctx, "test/code:function/testpkg.Foo")
+	if err != nil {
+		t.Fatalf("GetNode after Run(): %v", err)
+	}
+	if got.Content != "func Foo() { return 1 }" {
+		t.Errorf("expected persisted content, got %q", got.Content)
+	}
+
+	// With no embedder, no chunks are created — verify ChunkCount is 0
+	if result.ChunkCount != 0 {
+		t.Errorf("expected 0 chunks (no embedder), got %d", result.ChunkCount)
+	}
+}
+
+// TestChunkForNodeLargeGoFunction verifies a large code:function node with Go
+// language is routed through ChunkCodeByPattern and splitOversizedChunks,
+// producing multiple chunks.
+func TestChunkForNodeLargeGoFunction(t *testing.T) {
+	// Build a function body large enough to trigger splitOversizedChunks
+	var body strings.Builder
+	body.WriteString("func LargeFunction() {\n")
+	for i := 0; i < 100; i++ {
+		body.WriteString("// Step ")
+		body.WriteByte(byte('A' + i%26))
+		body.WriteString("\nif x == ")
+		body.WriteByte(byte('0' + i%10))
+		body.WriteString(" { doSomething() }\n")
+	}
+	body.WriteString("}\n")
+	source := body.String()
+
+	n := store.Node{
+		ID:        "test/code:function/mypkg.LargeFunction",
+		ProjectID: "test",
+		NodeType:  "code:function",
+		Title:     "LargeFunction",
+		Content:   source,
+		Language:  "go",
+	}
+
+	cfg := chunker.DefaultConfig()
+	cfg.MaxChunkSize = computeMaxChunkSize(nil)
+	goLang := goLanguage()
+	tsLang := tsLanguage()
+
+	chunks := chunkForNode(n, cfg, goLang, tsLang)
+	if len(chunks) == 0 {
+		t.Fatal("chunkForNode returned 0 chunks for large Go function")
+	}
+	if len(chunks) < 2 {
+		t.Errorf("expected at least 2 chunks (splitOversizedChunks), got %d", len(chunks))
+	}
+	for i, c := range chunks {
+		if len(c.Content) > cfg.MaxChunkSize && len(c.Content) < 200 {
+			t.Errorf("chunk[%d] content (%d bytes) exceeds MaxChunkSize %d", i, len(c.Content), cfg.MaxChunkSize)
+		}
+		if c.Language != "text" && c.Language != "go" {
+			t.Errorf("chunk[%d] unexpected Language %q", i, c.Language)
+		}
+	}
+	if chunks[0].ParentNodeID != n.ID {
+		t.Errorf("first chunk ParentNodeID = %q, want %q", chunks[0].ParentNodeID, n.ID)
+	}
+}
+
+// TestChunkForNodeSmallGoFunction verifies a small Go function produces exactly
+// one chunk (no oversized splitting needed).
+func TestChunkForNodeSmallGoFunction(t *testing.T) {
+	n := store.Node{
+		ID:        "test/code:function/mypkg.Small",
+		ProjectID: "test",
+		NodeType:  "code:function",
+		Title:     "Small",
+		Content:   "func Small() string { return \"ok\" }",
+		Language:  "go",
+	}
+
+	cfg := chunker.DefaultConfig()
+	cfg.MaxChunkSize = computeMaxChunkSize(nil)
+	goLang := goLanguage()
+	tsLang := tsLanguage()
+
+	chunks := chunkForNode(n, cfg, goLang, tsLang)
+	if len(chunks) != 1 {
+		t.Fatalf("expected 1 chunk for small function, got %d", len(chunks))
+	}
+	if !strings.Contains(chunks[0].Content, "func Small") {
+		t.Errorf("chunk content should contain the function signature, got %q", chunks[0].Content)
+	}
 }
