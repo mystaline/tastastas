@@ -467,7 +467,14 @@ func hasMD(root string) bool {
 
 // EmbedNodes batch-embeds node content. Sets ModelID on each node for
 // composite vec0 PK before upserting.
-func EmbedNodes(ctx context.Context, db store.Store, nodes []store.Node, emb embed.EmbedderBackend, batchSize int, modelID string) error {
+func EmbedNodes(
+	ctx context.Context,
+	db store.Store,
+	nodes []store.Node,
+	emb embed.EmbedderBackend,
+	batchSize int,
+	modelID string,
+) error {
 	if batchSize <= 0 {
 		batchSize = 32
 	}
@@ -483,7 +490,15 @@ func EmbedNodes(ctx context.Context, db store.Store, nodes []store.Node, emb emb
 		var idx []int
 		for j := range batch {
 			if batch[j].Content != "" && batch[j].NodeType != "directory" {
-				texts = append(texts, batch[j].Content)
+				c := batch[j].Content
+				maxBytes := emb.MaxContentBytes()
+				if maxBytes <= 0 {
+					maxBytes = 8192
+				}
+				if len(c) > maxBytes {
+					c = c[:maxBytes]
+				}
+				texts = append(texts, c)
 				idx = append(idx, j)
 			}
 		}

@@ -14,8 +14,8 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
-	"time"
 	"syscall"
+	"time"
 
 	_ "github.com/tursodatabase/libsql-client-go/libsql"
 	_ "modernc.org/sqlite"
@@ -23,10 +23,10 @@ import (
 	_ "turso.tech/database/tursogo"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/mystaline-dev/tastastas/internal/consolidate"
 	"github.com/mystaline-dev/tastastas/internal/embed"
 	mcpserver "github.com/mystaline-dev/tastastas/internal/mcp"
 	_ "github.com/mystaline-dev/tastastas/internal/onboard"
-	"github.com/mystaline-dev/tastastas/internal/consolidate"
 	"github.com/mystaline-dev/tastastas/internal/store"
 	libsqlstore "github.com/mystaline-dev/tastastas/internal/store/libsql"
 	sqlitestore "github.com/mystaline-dev/tastastas/internal/store/sqlite"
@@ -42,7 +42,7 @@ import (
 func newEmbedder(backend string, sidecarWorkers, sidecarIntraThreads, batchSize int,
 	ollamaURL, ollamaModel string,
 	openaiKey, openaiModel, openaiBaseURL string,
-	embedDim int) embed.EmbedderBackend {
+	embedDim int, maxContentBytes int) embed.EmbedderBackend {
 	sc := embed.SidecarConfig{
 		IntraThreads: sidecarIntraThreads,
 		MaxBatchSize: batchSize,
@@ -69,9 +69,14 @@ func newEmbedder(backend string, sidecarWorkers, sidecarIntraThreads, batchSize 
 		if openaiKey == "" {
 			log.Fatal("embed: --openai-api-key or $TASTASTAS_OPENAI_KEY required for --embed-backend=openai")
 		}
-		return embed.NewOpenAI(openaiKey, openaiModel, openaiBaseURL, embedDim, batchSize)
+		return embed.NewOpenAI(openaiKey, openaiModel, openaiBaseURL, embedDim, batchSize, maxContentBytes)
 	default:
-		return embed.New(embed.Config{OllamaURL: ollamaURL, Model: ollamaModel, MaxBatchSize: batchSize})
+		return embed.New(embed.Config{
+			OllamaURL:      ollamaURL,
+			Model:          ollamaModel,
+			MaxBatchSize:   batchSize,
+			MaxContentBytes: maxContentBytes,
+		})
 	}
 }
 
@@ -208,11 +213,20 @@ func main() {
 	)
 	batchSize := flag.Int("batch-size", 32, "max texts per embed batch (16 saves ~50% peak RAM, 32=throughput)")
 	authToken := flag.String("auth-token", "", "bearer token for HTTP server mode (empty = no auth)")
-	spaDir := flag.String("spa-dir", "", "path to built React SPA directory (empty = use embedded frontend) — also read from $TASTASTAS_SPA_DIR")
+	spaDir := flag.String(
+		"spa-dir",
+		"",
+		"path to built React SPA directory (empty = use embedded frontend) — also read from $TASTASTAS_SPA_DIR",
+	)
 	consolidateInterval := flag.String(
 		"consolidate-interval",
 		"",
 		"consolidation cron interval (e.g. '1h', '30m'). Empty = disabled",
+	)
+	embedMaxContent := flag.Int(
+		"embed-max-content",
+		0,
+		"max bytes per input text for the embedding model (0 = auto-detect: 8192 for unknown models, larger for known models like Nemotron)",
 	)
 	flag.Parse()
 
@@ -221,7 +235,10 @@ func main() {
 	}
 	if *spaDir != "" {
 		if info, err := os.Stat(*spaDir); err != nil || !info.IsDir() {
-			log.Printf("warning: --spa-dir %s not found — SPA graph page unavailable (legacy ?v=legacy still works)", *spaDir)
+			log.Printf(
+				"warning: --spa-dir %s not found — SPA graph page unavailable (legacy ?v=legacy still works)",
+				*spaDir,
+			)
 		}
 	}
 
@@ -295,7 +312,7 @@ func main() {
 
 	embedder := newEmbedder(*embedBackend, *sidecarWorkers, *sidecarIntraThreads, *batchSize,
 		*ollamaURL, *ollamaModel,
-		*openaiKey, *openaiModel, *openaiBaseURL, *embedDim)
+		*openaiKey, *openaiModel, *openaiBaseURL, *embedDim, *embedMaxContent)
 
 	modelID := ""
 	switch *embedBackend {

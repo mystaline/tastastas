@@ -20,6 +20,7 @@ import (
 type EmbedderBackend interface {
 	Embed(ctx context.Context, text string) ([]float32, error)
 	EmbedBatch(ctx context.Context, texts []string) ([][]float32, error)
+	MaxContentBytes() int // max bytes per single input (0 = unknown, caller uses default)
 }
 
 // Config holds embedder settings.
@@ -27,6 +28,7 @@ type Config struct {
 	OllamaURL    string // e.g. "http://localhost:11434"
 	Model        string // e.g. "nomic-embed-text"
 	MaxBatchSize int    // 0 = default 32
+	MaxContentBytes int  // per-text input limit, 0 = use default (8192)
 }
 
 func (c Config) maxBatch() int {
@@ -157,4 +159,8 @@ func (e *Embedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32,
 		}
 	}
 	return out.Embeddings, nil
+}
+
+func (e *Embedder) MaxContentBytes() int {
+	return e.cfg.MaxContentBytes
 }

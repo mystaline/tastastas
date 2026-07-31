@@ -152,6 +152,8 @@ func (s *SidecarEmbedder) Close() error {
 	return err
 }
 
+func (s *SidecarEmbedder) MaxContentBytes() int { return 0 }
+
 // Embed returns the embedding vector for a single text.
 func (s *SidecarEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
 	vecs, err := s.EmbedBatch(ctx, []string{text})

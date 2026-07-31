@@ -15,18 +15,20 @@ import (
 )
 
 type OpenAIEmbedder struct {
-	apiKey   string
-	model    string
-	baseURL  string
-	dim      int
-	client   *http.Client
-	maxBatch int
+	apiKey     string
+	model      string
+	baseURL    string
+	dim        int
+	client     *http.Client
+	maxBatch   int
+	maxContent int
 }
 
 type openaiEmbedRequest struct {
 	Model      string   `json:"model"`
 	Input      []string `json:"input"`
 	Dimensions int      `json:"dimensions,omitempty"`
+	Truncate   string   `json:"truncate,omitempty"`
 }
 
 type openaiEmbedData struct {
@@ -83,7 +85,7 @@ func ProbeOpenAIDim(apiKey, model, baseURL string) (int, error) {
 	return len(out.Data[0].Embedding), nil
 }
 
-func NewOpenAI(apiKey, model, baseURL string, dim, maxBatchSize int) *OpenAIEmbedder {
+func NewOpenAI(apiKey, model, baseURL string, dim, maxBatchSize, maxContentBytes int) *OpenAIEmbedder {
 	if baseURL == "" {
 		baseURL = "https://api.openai.com/v1"
 	}
@@ -97,12 +99,13 @@ func NewOpenAI(apiKey, model, baseURL string, dim, maxBatchSize int) *OpenAIEmbe
 		maxBatchSize = 2048
 	}
 	return &OpenAIEmbedder{
-		apiKey:   apiKey,
-		model:    model,
-		baseURL:  strings.TrimRight(baseURL, "/"),
-		dim:      dim,
-		maxBatch: maxBatchSize,
-		client:   &http.Client{Timeout: 30 * time.Second},
+		apiKey:     apiKey,
+		model:      model,
+		baseURL:    strings.TrimRight(baseURL, "/"),
+		dim:        dim,
+		maxBatch:   maxBatchSize,
+		maxContent: maxContentBytes,
+		client:     &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
@@ -129,6 +132,7 @@ func (o *OpenAIEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 		Model:      o.model,
 		Input:      texts,
 		Dimensions: o.dim,
+		Truncate:   "END",
 	})
 	if err != nil {
 		return nil, fmt.Errorf("openai: marshal: %w", err)
@@ -189,6 +193,23 @@ func (o *OpenAIEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 }
 
 func (o *OpenAIEmbedder) Close() error { return nil }
+
+func (o *OpenAIEmbedder) MaxContentBytes() int {
+	if o.maxContent > 0 {
+		return o.maxContent
+	}
+	// Known model token limits, converted at ~3 chars/token (code is denser
+	// than prose, but 3× is a safe conservative estimate for the cutoff).
+	known := map[string]int{
+		"text-embedding-3-small":     24573,
+		"text-embedding-3-large":     24573,
+		"text-embedding-ada-002":     24573,
+	}
+	if limit, ok := known[o.model]; ok {
+		return limit
+	}
+	return 0
+}
 
 // firstNonFinite returns the index of the first NaN/Inf value in emb, or -1
 // if all values are finite. A provider returning corrupt floats must never

@@ -7,7 +7,7 @@ import (
 )
 
 func TestOpenAIDefaults(t *testing.T) {
-	o := NewOpenAI("sk-test", "", "", 0, 0)
+	o := NewOpenAI("sk-test", "", "", 0, 0, 0)
 	if o.model != "text-embedding-3-small" {
 		t.Errorf("expected default model text-embedding-3-small, got %q", o.model)
 	}
@@ -47,7 +47,7 @@ func TestOpenAIEmbedRequestMarshal(t *testing.T) {
 }
 
 func TestOpenAIEmbedBatchRejectsOversized(t *testing.T) {
-	o := NewOpenAI("sk-test", "", "", 0, 2048)
+	o := NewOpenAI("sk-test", "", "", 0, 2048, 0)
 	texts := make([]string, 2049)
 	_, err := o.EmbedBatch(nil, texts)
 	if err == nil {
@@ -59,7 +59,7 @@ func TestOpenAIEmbedBatchRejectsOversized(t *testing.T) {
 }
 
 func TestOpenAIEmbedBatchEmpty(t *testing.T) {
-	o := NewOpenAI("sk-test", "", "", 0, 0)
+	o := NewOpenAI("sk-test", "", "", 0, 0, 0)
 	vecs, err := o.EmbedBatch(nil, nil)
 	if err != nil {
 		t.Fatalf("expected no error for nil input, got %v", err)
