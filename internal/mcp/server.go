@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime/debug"
 	"sort"
@@ -47,7 +48,28 @@ func safeGo(fn func()) {
 	}()
 }
 
-func NewServer(db store.Store, embedder embed.EmbedderBackend, batchSize int, modelID string) *mcp.Server {
+// resolveRef resolves the git ref for a working directory.
+// If explicitRef is non-empty, returns it directly.
+// If cwd is non-empty, attempts auto-detection via `git rev-parse --abbrev-ref HEAD`.
+// Returns error if ref cannot be determined.
+func resolveRef(cwd, explicitRef string) (string, error) {
+	if explicitRef != "" {
+		return explicitRef, nil
+	}
+	if cwd == "" {
+		return "", fmt.Errorf("ref required")
+	}
+	cmd := exec.Command("git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD")
+	cmd.Stderr = nil
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("could not detect git ref from cwd: %w (specify ref explicitly)", err)
+	}
+	ref := strings.TrimSpace(string(out))
+	return ref, nil
+}
+
+func NewServer(db store.Store, embedder embed.EmbedderBackend, batchSize int, modelID string, workspaceDir string) *mcp.Server {
 	srv := mcp.NewServer(
 		&mcp.Implementation{
 			Name:    "tastastas",
@@ -56,7 +78,7 @@ func NewServer(db store.Store, embedder embed.EmbedderBackend, batchSize int, mo
 		nil,
 	)
 
-	registerTools(srv, db, embedder, batchSize, modelID)
+	registerTools(srv, db, embedder, batchSize, modelID, workspaceDir)
 	return srv
 }
 
@@ -83,7 +105,7 @@ func modelWarning(ctx context.Context, db store.Store, projectID, modelID string
 	return ""
 }
 
-func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBackend, batchSize int, modelID string) {
+func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBackend, batchSize int, modelID string, workspaceDir string) {
 	retriever := retrieve.New(db, retrieve.DefaultConfig())
 	extractor := extract.New(extract.Config{})
 	jobs := newJobStore(db)
@@ -110,7 +132,8 @@ Rules:
   - Prefer recall over ad-hoc searches.
   - Use link for complex relationships (ERD, PRD, API spec).
   - Ingest is idempotent; run on every push.`
-		output := InitOutput{Help: help, ModelID: modelID}
+		projects, _ := db.ListProjects(ctx)
+		output := InitOutput{Help: help, ModelID: modelID, Projects: projects}
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: help}}}, output, nil
 	})
 
@@ -131,6 +154,14 @@ Rules:
 			if err != nil {
 				return errorResult(err), OnboardOutput{}, nil
 			}
+		}
+
+		ref, refErr := resolveRef(cwd, args.Ref)
+		if refErr != nil {
+			return errorResult(refErr), OnboardOutput{}, nil
+		}
+		if ref != "" && ref != "HEAD" && !strings.Contains(projectID, ref) {
+			log.Printf("WARNING: ref %q not found in project_id %q — consider using %s-%s", ref, projectID, projectID, ref)
 		}
 
 		job := jobs.create(projectID)
@@ -170,7 +201,7 @@ Rules:
 		})
 		// Report walk counts and transition phase to "embedding" — same as ingest path.
 
-		output := OnboardOutput{ProjectID: projectID, JobID: job.ID, Status: "running"}
+		output := OnboardOutput{ProjectID: projectID, JobID: job.ID, Status: "running", Ref: ref}
 
 		toolResult := &mcp.CallToolResult{
 			Content: []mcp.Content{
@@ -446,6 +477,15 @@ Rules:
 				allItems[i] = itemMap[si.id]
 			}
 
+			// Fuzzy match: if no results and a single project_id was queried, suggest alternatives.
+			if len(allItems) == 0 && len(args.ProjectIDs) == 0 && args.ProjectID != "" {
+				projects, _ := db.ListProjects(ctx)
+				if suggestions := fuzzyMatchProjects(args.ProjectID, projects); len(suggestions) > 0 {
+					warn = fmt.Sprintf("project_id '%s' not found. Did you mean: %s?",
+						args.ProjectID, strings.Join(suggestions, ", "))
+				}
+			}
+
 			// Aggregate links from all results (simplified — last project only)
 			var links []ImplicitMCPLink
 			recallOut := RecallOutput{Results: allItems, Links: links, Warning: warn}
@@ -613,6 +653,14 @@ Rules:
 			}
 		}
 
+		ref, refErr := resolveRef(cwd, args.Ref)
+		if refErr != nil {
+			return errorResult(refErr), IngestOutput{}, nil
+		}
+		if ref != "" && ref != "HEAD" && !strings.Contains(projectID, ref) {
+			log.Printf("WARNING: ref %q not found in project_id %q — consider using %s-%s", ref, projectID, projectID, ref)
+		}
+
 		job := jobs.create(projectID)
 		safeGo(func() {
 			ingestMu.Lock()
@@ -639,7 +687,7 @@ Rules:
 				result.ConventionsInferred, result.AutoLinked, result.ProposalsQueued)
 		})
 
-		output := IngestOutput{JobID: job.ID, Status: "running"}
+		output := IngestOutput{JobID: job.ID, Status: "running", Ref: ref}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(output)}},
 		}, output, nil
