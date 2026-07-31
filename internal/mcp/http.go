@@ -32,6 +32,7 @@ func ServeHTTP(
 	spaDir string,
 ) error {
 	jobs := newJobStore(db)
+	SetJobContext(ctx)
 
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
 		srv := mcp.NewServer(&mcp.Implementation{
@@ -76,10 +77,20 @@ func ServeHTTP(
 	server := &http.Server{Addr: addr, Handler: handler}
 	go func() {
 		<-ctx.Done()
-		server.Close()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer shutdownCancel()
+		server.Shutdown(shutdownCtx)
 	}()
 
-	return server.ListenAndServe()
+	err := server.ListenAndServe()
+
+	// Server loop ended (signal or error) — cancel in-flight jobs and wait
+	// for them so the caller can close the DB without racing job goroutines.
+	CancelJobs()
+	if !WaitForJobs(30 * time.Second) {
+		log.Printf("http: jobs still running after 30s shutdown wait; closing DB anyway")
+	}
+	return err
 }
 
 func withBearerAuth(token string) func(http.Handler) http.Handler {
@@ -345,7 +356,7 @@ func handleRESTIngest(
 		job := jobs.create(projectID)
 		safeGo(func() {
 			ingestMu.Lock()
-			result, err := onboard.Run(context.Background(), onboard.Config{
+			result, err := onboard.Run(jobCtx, onboard.Config{
 				CWD:       root,
 				ProjectID: projectID,
 				ModelID:   modelID,

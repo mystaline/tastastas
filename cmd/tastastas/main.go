@@ -294,12 +294,18 @@ func main() {
 		log.Fatalf("open store: %v", err)
 	}
 
+	// Root context — SIGINT/SIGTERM cancels in both modes, draining servers,
+	// stopping the consolidator, and canceling in-flight ingest jobs.
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+	mcpserver.SetJobContext(ctx)
+
 	if *consolidateInterval != "" {
 		dur, err := time.ParseDuration(*consolidateInterval)
 		if err != nil {
 			log.Fatalf("consolidate: invalid interval %q: %v", *consolidateInterval, err)
 		}
-		go consolidate.RunPeriodic(context.Background(), db, dur)
+		go consolidate.RunPeriodic(ctx, db, dur)
 		log.Printf("consolidate: cron started at %v interval", dur)
 	}
 
@@ -331,26 +337,32 @@ func main() {
 	}
 	// Start graph HTTP server if requested (works alongside stdio MCP or HTTP mode).
 	if *graphAddr != "" {
+		mux := http.NewServeMux()
+		mux.HandleFunc("GET /graph/{project}", mcpserver.HandleGraphData(db))
+		mux.HandleFunc("GET /api/graph/{project}", mcpserver.HandleGraphData(db))
+		mux.HandleFunc("GET /graph/{project}/", mcpserver.HandleGraphSPA(*spaDir))
+		graphServer := &http.Server{Addr: *graphAddr, Handler: mux}
 		go func() {
-			mux := http.NewServeMux()
-			mux.HandleFunc("GET /graph/{project}", mcpserver.HandleGraphData(db))
-			mux.HandleFunc("GET /api/graph/{project}", mcpserver.HandleGraphData(db)) // SPA fetches from /api/graph/, no reverse proxy to strip prefix
-			mux.HandleFunc("GET /graph/{project}/", mcpserver.HandleGraphSPA(*spaDir))
 			log.Printf("graph server listening on %s", *graphAddr)
-			if err := http.ListenAndServe(*graphAddr, mux); err != nil {
+			if err := graphServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("graph server: %v", err)
 			}
+		}()
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			graphServer.Shutdown(shutdownCtx)
 		}()
 	}
 
 	if *serve != "" {
 		// HTTP server mode
-		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		err := mcpserver.ServeHTTP(ctx, db, embedder, *serve, *authToken, *batchSize, modelID, *spaDir)
 		cancel()
-		db.Close() // close before exit: log.Fatalf below skips defers
+		db.Close() // close before log.Fatalf below skips defers
 		closeEmbedder()
-		if err != nil && !errors.Is(err, context.Canceled) {
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("HTTP server: %v", err)
 		}
 		return
@@ -358,12 +370,18 @@ func main() {
 
 	// Stdio MCP server mode (default)
 	srv := mcpserver.NewServer(db, embedder, *batchSize, modelID)
-	if err := srv.Run(context.Background(), &mcpsdk.StdioTransport{}); err != nil {
+	if err := srv.Run(ctx, &mcpsdk.StdioTransport{}); err != nil {
+		// stdio loop ended (client disconnect or signal) — stop jobs, wait
+		// for drain, then close the DB before exit.
+		mcpserver.CancelJobs()
+		mcpserver.WaitForJobs(30 * time.Second)
 		db.Close() // close before os.Exit
 		closeEmbedder()
 		log.Printf("server exited: %v", err)
 		os.Exit(1)
 	}
+	mcpserver.CancelJobs()
+	mcpserver.WaitForJobs(30 * time.Second)
 	db.Close() // clean shutdown — close before main returns
 	closeEmbedder()
 }

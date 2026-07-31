@@ -33,8 +33,11 @@ import (
 var Version = "dev"
 
 // safeGo runs fn in a goroutine with panic recovery. Logs panic + stack trace.
+// Each call is tracked in jobWG so shutdown can wait for in-flight jobs.
 func safeGo(fn func()) {
+	jobWG.Add(1)
 	go func() {
+		defer jobWG.Done()
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("PANIC: %v\n%s", r, debug.Stack())
@@ -142,7 +145,7 @@ Rules:
 			}
 
 			ingestMu.Lock()
-			result, err := onboard.Run(context.Background(), onboard.Config{
+			result, err := onboard.Run(jobCtx, onboard.Config{
 				CWD:       cwd,
 				ProjectID: projectID,
 				Scope:     args.Scope,
@@ -613,7 +616,7 @@ Rules:
 		job := jobs.create(projectID)
 		safeGo(func() {
 			ingestMu.Lock()
-			result, err := onboard.Run(context.Background(), onboard.Config{
+			result, err := onboard.Run(jobCtx, onboard.Config{
 				CWD:       cwd,
 				ProjectID: projectID,
 				ModelID:   modelID,
@@ -699,7 +702,7 @@ Rules:
 				err = fmt.Errorf("extract_and_remember requires a configured embedder")
 				return
 			}
-			facts, xerr := extractor.Extract(context.Background(), args.Conversation)
+			facts, xerr := extractor.Extract(jobCtx, args.Conversation)
 			if xerr != nil {
 				err = fmt.Errorf("extract: %w", xerr)
 				return
@@ -707,13 +710,13 @@ Rules:
 
 			var storedNodes []store.Node
 			for _, f := range facts {
-				vec, verr := embedder.Embed(context.Background(), f.Content)
+				vec, verr := embedder.Embed(jobCtx, f.Content)
 				if verr != nil {
 					err = fmt.Errorf("embed: %w", verr)
 					return
 				}
 
-				candidates, cerr := db.SearchVector(context.Background(), projectID, vec, 5, modelID)
+				candidates, cerr := db.SearchVector(jobCtx, projectID, vec, 5, modelID)
 				if cerr != nil {
 					log.Printf("extract_and_remember: search: %v", cerr)
 					continue
@@ -740,7 +743,7 @@ Rules:
 				return
 			}
 
-			_, runErr := onboard.Run(context.Background(), onboard.Config{
+			_, runErr := onboard.Run(jobCtx, onboard.Config{
 				Nodes:              storedNodes,
 				Edges:              nil,
 				SkipNodeEmbedding:  true,

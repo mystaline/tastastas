@@ -14,6 +14,45 @@ import (
 // to "waiting" so callers see the queue position.
 var ingestMu sync.Mutex
 
+// jobWG tracks in-flight async jobs so shutdown can wait for them before
+// closing the DB. Jobs are spawned via safeGo; WaitForJobs must only be
+// called once no new jobs can be spawned (server loop exited).
+var jobWG sync.WaitGroup
+
+// jobCtx is the context async jobs run under. Derived from the server's
+// context via SetJobContext so a signal cancels long-running ingests
+// instead of letting them race db.Close at shutdown.
+var (
+	jobCtx    = context.Background()
+	jobCancel = func() {}
+)
+
+// SetJobContext sets the context async ingest jobs run under. Call once at
+// startup with the process's root (signal-aware) context.
+func SetJobContext(ctx context.Context) {
+	jobCancel()
+	jobCtx, jobCancel = context.WithCancel(ctx)
+}
+
+// CancelJobs cancels the context all async jobs run under.
+func CancelJobs() { jobCancel() }
+
+// WaitForJobs blocks until all in-flight jobs finish or the timeout elapses.
+// Returns true if every job completed.
+func WaitForJobs(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		jobWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 // ingestJob tracks one async ingest run. Big-directory ingests (docwalk over
 // a whole workspace) can take minutes — long enough to blow past any client
 // or reverse-proxy HTTP timeout. Rather than hold the request open, POST
