@@ -30,7 +30,6 @@ func ServeHTTP(
 	batchSize int,
 	modelID string,
 	spaDir string,
-	workspaceDir string,
 ) error {
 	jobs := newJobStore(db)
 	SetJobContext(ctx)
@@ -40,7 +39,7 @@ func ServeHTTP(
 			Name:    "tastastas",
 			Version: Version,
 		}, nil)
-		registerTools(srv, db, embedder, batchSize, modelID, workspaceDir)
+		registerTools(srv, db, embedder, batchSize, modelID)
 		return srv
 	}, nil)
 

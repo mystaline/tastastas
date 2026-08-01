@@ -11,7 +11,7 @@ services:
       - "${GRAPH_PORT:-9292}:9292"
     volumes:
       - tastastas-data:/data
-      - /home/deploy/workspaces:/workspaces
+      - ${HOST_WORKSPACE_DIR:-/home/mystaline-dev/Workspace}:/workspaces
     command:
       - "--serve"
       - ":8080"
@@ -30,7 +30,7 @@ services:
     environment:
       - TASTASTAS_AUTH_TOKEN=${TASTASTAS_AUTH_TOKEN:-}
       - TASTASTAS_OPENAI_KEY=${TASTASTAS_OPENAI_KEY:-}
-      - TASTASTAS_WORKSPACE=/workspaces
+      - HOST_WORKSPACE_DIR=${HOST_WORKSPACE_DIR:-}
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
       interval: 30s

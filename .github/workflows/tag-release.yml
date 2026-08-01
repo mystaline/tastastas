@@ -6,6 +6,11 @@ name: tag-release
 # Usage:
 #   gh workflow run tag-release.yml --field bump=patch
 #   gh workflow run tag-release.yml --field version=v1.2.3
+#   gh workflow run tag-release.yml --ref feat/feature-x --field bump=patch
+#
+# Branch awareness: releasing from any branch other than main appends
+# -alpha to the tag (v1.2.3-alpha). Consumers pull pre-release builds via
+# the :alpha docker tag; :latest is reserved for stable main releases.
 
 on:
   workflow_dispatch:
@@ -35,24 +40,32 @@ jobs:
       - name: Determine tag
         id: tag
         run: |
+          branch="${GITHUB_REF_NAME}"
           if [ -n "${{ inputs.version }}" ]; then
-            echo "value=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+            base="${{ inputs.version }}"
           else
             latest=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
             ver=${latest#v}
+            ver=${ver%-alpha}
             IFS=. read -r major minor patch <<< "$ver"
             case "${{ inputs.bump }}" in
-              major) echo "value=v$((major + 1)).0.0"       >> "$GITHUB_OUTPUT" ;;
-              minor) echo "value=v$major.$((minor + 1)).0"   >> "$GITHUB_OUTPUT" ;;
-              patch) echo "value=v$major.$minor.$((patch + 1))" >> "$GITHUB_OUTPUT" ;;
+              major) base="v$((major + 1)).0.0"              ;;
+              minor) base="v$major.$((minor + 1)).0"          ;;
+              patch) base="v$major.$minor.$((patch + 1))"     ;;
             esac
           fi
+          base=${base%-alpha}
+          if [ "$branch" != "main" ]; then
+            base="${base}-alpha"
+          fi
+          echo "value=$base" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
 
       - name: Validate tag format
         run: |
           tag="${{ steps.tag.outputs.value }}"
-          if ! echo "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "invalid tag: $tag (must be vMAJOR.MINOR.PATCH)"
+          if ! echo "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-alpha)?$'; then
+            echo "invalid tag: $tag (must be vMAJOR.MINOR.PATCH, optional -alpha)"
             exit 1
           fi
 
