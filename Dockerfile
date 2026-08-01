@@ -19,8 +19,8 @@ RUN apk add --no-cache ca-certificates git && \
     adduser -D -h /app appuser
 WORKDIR /app
 COPY --from=builder /build/tastastas .
-RUN mkdir /data && chown appuser:appuser /data
-VOLUME /data
+RUN mkdir /data /workspaces && chown appuser:appuser /data /workspaces
+VOLUME /data /workspaces
 USER appuser
 EXPOSE 8080 9292
 ENTRYPOINT ["./tastastas"]

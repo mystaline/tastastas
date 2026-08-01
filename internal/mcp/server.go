@@ -69,10 +69,12 @@ func resolveRef(cwd, explicitRef string) (string, error) {
 	return ref, nil
 }
 
-// normalizePath expands a leading ~/ or ~\ to the user's home directory.
-// MCP clients pass paths verbatim (no shell), so tilde wouldn't resolve.
+// normalizePath expands a leading ~/ or ~\ to the user's home directory and
+// normalizes Windows backslashes to forward slashes. MCP clients pass paths
+// verbatim (no shell), so tilde wouldn't resolve.
 func normalizePath(p string) string {
-	if strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) {
+	p = strings.ReplaceAll(p, `\`, "/")
+	if strings.HasPrefix(p, "~/") {
 		if home, err := os.UserHomeDir(); err == nil && home != "" {
 			return filepath.Join(home, p[2:])
 		}
@@ -80,7 +82,45 @@ func normalizePath(p string) string {
 	return p
 }
 
-func NewServer(db store.Store, embedder embed.EmbedderBackend, batchSize int, modelID string, workspaceDir string) *mcp.Server {
+// remapRoot maps a host-side path to the docker-visible path using the
+// HOST_WORKSPACE_DIR prefix mapping. The docker side is fixed at workspaceRoot
+// (the image-declared /workspaces volume); the host side varies per machine
+// and is configured via env. Unset host prefix → path returned unchanged.
+// Case-insensitive comparison handles Windows drive letters (D:/Kerja ↔ d:/Kerja).
+// A path outside the host prefix is an error — the client must pass a path
+// under HOST_WORKSPACE_DIR.
+func remapRoot(hostPath string) (string, error) {
+	hostPrefix := os.Getenv("HOST_WORKSPACE_DIR")
+	if hostPrefix == "" {
+		return hostPath, nil
+	}
+	cleaned := filepath.ToSlash(filepath.Clean(hostPath))
+	prefix := filepath.ToSlash(filepath.Clean(hostPrefix))
+	lowerCleaned := strings.ToLower(cleaned)
+	lowerPrefix := strings.ToLower(prefix)
+	if strings.HasPrefix(lowerCleaned, lowerPrefix+"/") || strings.EqualFold(cleaned, prefix) {
+		return filepath.ToSlash(filepath.Clean(workspaceRoot)) + cleaned[len(prefix):], nil
+	}
+	return "", fmt.Errorf(
+		"path %q is outside HOST_WORKSPACE_DIR %q — pass only paths under the workspace dir",
+		hostPath, hostPrefix,
+	)
+}
+
+// walkRootPreflight fails fast when the walk root is missing or not a
+// directory, instead of letting the async ingest silently walk nothing.
+func walkRootPreflight(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("walk root %s: %w", path, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("walk root %s: not a directory", path)
+	}
+	return nil
+}
+
+func NewServer(db store.Store, embedder embed.EmbedderBackend, batchSize int, modelID string) *mcp.Server {
 	srv := mcp.NewServer(
 		&mcp.Implementation{
 			Name:    "tastastas",
@@ -89,9 +129,14 @@ func NewServer(db store.Store, embedder embed.EmbedderBackend, batchSize int, mo
 		nil,
 	)
 
-	registerTools(srv, db, embedder, batchSize, modelID, workspaceDir)
+	registerTools(srv, db, embedder, batchSize, modelID)
 	return srv
 }
+
+// workspaceRoot is the canonical workspace mount point declared by the image
+// (VOLUME /workspaces). File walks and future git clones target this path
+// regardless of host-side origin.
+const workspaceRoot = "/workspaces"
 
 // modelWarning returns a warning string if the model's data is dirty or
 // missing. Returns "" if everything is fine. Never blocks tool execution.
@@ -116,7 +161,7 @@ func modelWarning(ctx context.Context, db store.Store, projectID, modelID string
 	return ""
 }
 
-func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBackend, batchSize int, modelID string, workspaceDir string) {
+func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBackend, batchSize int, modelID string) {
 	retriever := retrieve.New(db, retrieve.DefaultConfig())
 	extractor := extract.New(extract.Config{})
 	jobs := newJobStore(db)
@@ -160,15 +205,18 @@ Rules:
 
 		cwd := args.CWD
 		if cwd == "" {
-			var err error
-			cwd, err = os.Getwd()
-			if err != nil {
-				return errorResult(err), OnboardOutput{}, nil
-			}
+			cwd = workspaceRoot
 		}
 		cwd = normalizePath(cwd)
+		walkCwd, err := remapRoot(cwd)
+		if err != nil {
+			return errorResult(err), OnboardOutput{}, nil
+		}
+		if err := walkRootPreflight(walkCwd); err != nil {
+			return errorResult(err), OnboardOutput{}, nil
+		}
 
-		ref, refErr := resolveRef(cwd, args.Ref)
+		ref, refErr := resolveRef(walkCwd, args.Ref)
 		if refErr != nil {
 			return errorResult(refErr), OnboardOutput{}, nil
 		}
@@ -189,7 +237,7 @@ Rules:
 
 			ingestMu.Lock()
 			result, err := onboard.Run(jobCtx, onboard.Config{
-				CWD:       cwd,
+				CWD:       walkCwd,
 				ProjectID: projectID,
 				Scope:     args.Scope,
 				ModelID:   modelID,
@@ -648,17 +696,20 @@ Rules:
 		projectID := args.ProjectID
 		cwd := args.CWD
 		if cwd == "" {
-			var err error
-			cwd, err = os.Getwd()
-			if err != nil {
-				return errorResult(err), IngestOutput{}, nil
-			}
+			cwd = workspaceRoot
 		}
 		cwd = normalizePath(cwd)
+		walkCwd, err := remapRoot(cwd)
+		if err != nil {
+			return errorResult(err), IngestOutput{}, nil
+		}
+		if err := walkRootPreflight(walkCwd); err != nil {
+			return errorResult(err), IngestOutput{}, nil
+		}
 
 		if projectID == "" {
 			// Fallback to .memoryrc.yaml project_id if available
-			cfg, err := docwalk.LoadConfig(filepath.Join(cwd, ".memoryrc.yaml"))
+			cfg, err := docwalk.LoadConfig(filepath.Join(walkCwd, ".memoryrc.yaml"))
 			if err == nil && cfg.ProjectID != "" {
 				projectID = cfg.ProjectID
 			} else {
@@ -666,7 +717,7 @@ Rules:
 			}
 		}
 
-		ref, refErr := resolveRef(cwd, args.Ref)
+		ref, refErr := resolveRef(walkCwd, args.Ref)
 		if refErr != nil {
 			return errorResult(refErr), IngestOutput{}, nil
 		}
@@ -678,7 +729,7 @@ Rules:
 		safeGo(func() {
 			ingestMu.Lock()
 			result, err := onboard.Run(jobCtx, onboard.Config{
-				CWD:       cwd,
+				CWD:       walkCwd,
 				ProjectID: projectID,
 				ModelID:   modelID,
 				Embedder:  embedder,
