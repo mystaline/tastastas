@@ -31,6 +31,7 @@ services:
       - TASTASTAS_AUTH_TOKEN=${TASTASTAS_AUTH_TOKEN:-}
       - TASTASTAS_OPENAI_KEY=${TASTASTAS_OPENAI_KEY:-}
       - HOST_WORKSPACE_DIR=${HOST_WORKSPACE_DIR:-}
+      - GOPRIVATE=${GOPRIVATE:-}
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
       interval: 30s
