@@ -482,7 +482,9 @@ func detectModuleRoots(ctx context.Context, root string) []ModuleEntry {
 		if path != root {
 			rel, _ := filepath.Rel(root, path)
 			depth := len(strings.Split(filepath.ToSlash(rel), "/"))
-			if depth > 3 {
+			// Monorepos nest go.mod under services/{svc}/internal/modules/...;
+			// depth 3 missed those, so 6 covers services/*/internal/modules/*.
+			if depth > 6 {
 				return filepath.SkipDir
 			}
 			// Only prune subdirectories. The root entry itself is never

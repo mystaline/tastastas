@@ -50,7 +50,14 @@ export function nodeColor(
   hueOffset: number = 0,
 ): string {
   if (isRoot(d, rootId)) return 'hsl(45, 90%, 55%)'
-  const hue = ((groupHues.get(d.group) ?? 220) + hueOffset) % 360
+  let hue = (groupHues.get(d.group) ?? 220) + hueOffset
+  // Shift hue per project so sidecar/cross-project nodes read as distinct
+  // from the primary project without losing group-based structure.
+  if (d.project_id) {
+    let h = 0
+    for (const ch of d.project_id) h = (h * 31 + ch.charCodeAt(0)) % 360
+    hue = (hue + h * 0.35) % 360
+  }
   const lit = typeLightness[d.type] !== undefined ? typeLightness[d.type] : 48
   return `hsl(${hue}, 75%, ${lit}%)`
 }

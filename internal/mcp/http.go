@@ -52,6 +52,8 @@ func ServeHTTP(
 	// SPA fetches from /api/graph/{project}, no reverse proxy in front to strip the prefix.
 	mux.HandleFunc("GET /graph/{project}", HandleGraphData(db))
 	mux.HandleFunc("GET /api/graph/{project}", HandleGraphData(db))
+	mux.HandleFunc("GET /graph/{project}/linked", HandleLinkedProjects(db))
+	mux.HandleFunc("GET /api/graph/{project}/linked", HandleLinkedProjects(db))
 	mux.HandleFunc("GET /graph/{project}/", HandleGraphSPA(spaDir))
 
 	// REST ingest — POST /ingest auto-detects adapters, same pipeline as MCP ingest tool.
@@ -129,6 +131,19 @@ func bearerMatches(r *http.Request, token string) bool {
 	return ok == len(token) && len(token) > 0
 }
 
+// crossProjectEdgeTypes are the edge types that can link nodes across projects.
+var crossProjectEdgeTypes = []string{"cross-project-call", "depends_on", "auto-linked"}
+
+// extractGroup derives the first path segment of a node ID after its project
+// prefix, e.g. "proj/code:file/services/iam/app.go" → "code:file".
+func extractGroup(id, projectID string) string {
+	trimmed := strings.TrimPrefix(id, projectID+"/")
+	if i := strings.Index(trimmed, "/"); i >= 0 {
+		return trimmed[:i]
+	}
+	return ""
+}
+
 func HandleGraphData(db store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		projectID := r.PathValue("project")
@@ -145,6 +160,8 @@ func HandleGraphData(db store.Store) http.HandlerFunc {
 			"imports",
 			"convention-member",
 			"auto-linked",
+			"cross-project-call",
+			"depends_on",
 			"proposed",
 			"references",
 			"contains",
@@ -162,15 +179,15 @@ func HandleGraphData(db store.Store) http.HandlerFunc {
 		}
 
 		nodeMap := map[string]*struct {
-			id, title, ntype, group string
-			weight, size            int
+			id, title, ntype, group, projectID string
+			weight, size                        int
 		}{}
-		addNode := func(id, title, ntype, group string, size int) {
+		addNode := func(id, title, ntype, group, pid string, size int) {
 			if _, ok := nodeMap[id]; !ok {
 				nodeMap[id] = &struct {
-					id, title, ntype, group string
-					weight, size            int
-				}{id: id, title: title, ntype: ntype, group: group, size: size}
+					id, title, ntype, group, projectID string
+					weight, size                        int
+				}{id: id, title: title, ntype: ntype, group: group, projectID: pid, size: size}
 			}
 			nodeMap[id].weight++
 		}
@@ -194,8 +211,8 @@ func HandleGraphData(db store.Store) http.HandlerFunc {
 		structuralEdges := []graphEdge{}
 		proposedEdges := []graphEdge{}
 		for _, r := range results {
-			addNode(r.FromID, r.FromTitle, r.FromType, r.FromGroup, r.FromSize)
-			addNode(r.ToID, r.ToTitle, r.ToType, r.ToGroup, r.ToSize)
+			addNode(r.FromID, r.FromTitle, r.FromType, r.FromGroup, r.FromProjectID, r.FromSize)
+			addNode(r.ToID, r.ToTitle, r.ToType, r.ToGroup, r.ToProjectID, r.ToSize)
 			edge := graphEdge{
 				Source: r.FromID, Target: r.ToID,
 				EdgeType: r.EdgeType, Confidence: r.Confidence,
@@ -206,11 +223,46 @@ func HandleGraphData(db store.Store) http.HandlerFunc {
 				structuralEdges = append(structuralEdges, edge)
 			}
 		}
+
+		// Sidecar projects: pull in top nodes from other projects so the
+		// graph shows the broader surface of linked shared libraries, not
+		// just nodes already touching an edge endpoint.
+		sidecarProjectID := func(id string) string {
+			if strings.Contains(id, "/") {
+				return strings.SplitN(id, "/", 2)[0]
+			}
+			return id
+		}
+		sidecars := map[string]bool{}
+		for _, p := range strings.Split(r.URL.Query().Get("sidecars"), ",") {
+			p = strings.TrimSpace(p)
+			if p != "" && p != projectID {
+				sidecars[p] = true
+			}
+		}
+		for sc := range sidecars {
+			sn, err := db.GetTopNodesByImportance(r.Context(), sc, 200)
+			if err != nil {
+				continue
+			}
+			for _, n := range sn {
+				if _, ok := nodeMap[n.ID]; !ok {
+					nodeMap[n.ID] = &struct {
+						id, title, ntype, group, projectID string
+						weight, size                        int
+					}{id: n.ID, title: n.Title, ntype: n.NodeType,
+						group: extractGroup(n.ID, sc), projectID: sidecarProjectID(n.ProjectID),
+						size: len(n.Content)}
+				}
+				nodeMap[n.ID].weight++
+			}
+		}
+
 		for _, n := range nodeMap {
 			nodes = append(nodes, graphNode{
 				ID: n.id, Title: n.title, Type: n.ntype, Group: n.group,
 				Size: n.size, Weight: n.weight,
-				ProjectID: projectID,
+				ProjectID: n.projectID,
 			})
 		}
 
@@ -256,6 +308,39 @@ func HandleGraphData(db store.Store) http.HandlerFunc {
 			redirectURL += "?" + r.URL.RawQuery
 		}
 		http.Redirect(w, r, redirectURL, http.StatusFound)
+	}
+}
+
+// HandleLinkedProjects returns the list of projects linked to the given
+// project via cross-project edges (auto-discovered, not manually configured).
+func HandleLinkedProjects(db store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		projectID := r.PathValue("project")
+		if projectID == "" {
+			projectID = "default"
+		}
+		results, _, err := db.ListEdgesByProject(r.Context(), projectID, crossProjectEdgeTypes, 10000, 0)
+		if err != nil {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+			return
+		}
+		seen := map[string]bool{}
+		linked := []string{}
+		for _, res := range results {
+			if res.FromProjectID != "" && res.FromProjectID != projectID && !seen[res.FromProjectID] {
+				seen[res.FromProjectID] = true
+				linked = append(linked, res.FromProjectID)
+			}
+			if res.ToProjectID != "" && res.ToProjectID != projectID && !seen[res.ToProjectID] {
+				seen[res.ToProjectID] = true
+				linked = append(linked, res.ToProjectID)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(struct {
+			ProjectID      string   `json:"project_id"`
+			LinkedProjects []string `json:"linked_projects"`
+		}{ProjectID: projectID, LinkedProjects: linked})
 	}
 }
 

@@ -24,6 +24,7 @@ export function GraphCanvas({ svgRef, onResize }: GraphCanvasProps) {
     }
 
     window.addEventListener('resize', resize)
+    resize()
     return () => {
       window.removeEventListener('resize', resize)
       if (debounceRef.current) clearTimeout(debounceRef.current)

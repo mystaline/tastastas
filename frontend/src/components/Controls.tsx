@@ -12,6 +12,9 @@ interface ControlsProps {
   initialEdgeOpacity?: number
   initialHueOffset?: number
   initialDensity?: number
+  linkedProjects?: string[]
+  selectedSidecars?: string[]
+  onToggleSidecar?: (p: string) => void
 }
 
 export function Controls({
@@ -25,6 +28,9 @@ export function Controls({
   initialEdgeOpacity = SIM_DEFAULTS.edgeOpacity,
   initialHueOffset = SIM_DEFAULTS.hueOffset,
   initialDensity = SIM_DEFAULTS.density,
+  linkedProjects = [],
+  selectedSidecars = [],
+  onToggleSidecar,
 }: ControlsProps) {
   const [query, setQuery] = useState('')
   const [showEdges, setShowEdges] = useState(initialShowEdges)
@@ -102,6 +108,36 @@ export function Controls({
           Weak links
         </label>
       </div>
+
+      {linkedProjects.length > 0 && (
+        <div className="flex flex-col gap-1 border-t border-slate-700 pt-2">
+          <label className="text-slate-400 text-[11px]">Linked projects</label>
+          {linkedProjects.map(p => {
+            const checked = selectedSidecars.includes(p)
+            return (
+              <label key={p} className="flex items-center gap-1.5 text-slate-200 text-xs cursor-pointer select-none">
+                <span
+                  style={{
+                    display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                    width: 14, height: 14, border: '1px solid #a78bfa',
+                    borderRadius: 3, background: checked ? '#a78bfa' : 'transparent',
+                    fontSize: 10, color: '#0f172a', fontWeight: 700,
+                  }}
+                >
+                  {checked ? '✓' : ''}
+                </span>
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  onChange={() => onToggleSidecar?.(p)}
+                  className="hidden"
+                />
+                <span className="truncate">{p}</span>
+              </label>
+            )
+          })}
+        </div>
+      )}
 
       <div className="flex flex-col gap-0.5">
         <label className="text-slate-400 text-[11px]">Edge opacity</label>

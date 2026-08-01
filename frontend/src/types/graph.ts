@@ -39,4 +39,5 @@ export interface SimLink extends d3.SimulationLinkDatum<SimNode> {
   edge_type: string
   confidence: number
   _key?: string
+  _crossProject?: boolean
 }

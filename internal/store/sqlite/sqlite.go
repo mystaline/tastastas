@@ -1260,7 +1260,15 @@ func (s *Store) ListNodesByType(
 	limit, offset int,
 ) ([]store.Node, error) {
 	if len(types) == 0 {
-		return nil, nil
+		// nil/empty types = all node types
+		q := `SELECT id, project_id, node_type, title, content, content_hash, status, source_adapter, source_path, importance, language, created_at, updated_at
+		FROM nodes WHERE project_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`
+		rows, err := s.db.QueryContext(ctx, q, projectID, limit, offset)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		return scanNodeRows(rows)
 	}
 
 	placeholders := make([]string, len(types))
@@ -1285,7 +1293,10 @@ func (s *Store) ListNodesByType(
 	}
 
 	defer rows.Close()
+	return scanNodeRows(rows)
+}
 
+func scanNodeRows(rows *sql.Rows) ([]store.Node, error) {
 	var out []store.Node
 	for rows.Next() {
 		var n store.Node
@@ -1340,13 +1351,19 @@ func (s *Store) ListEdgesByProject(
 	limit, offset int,
 ) ([]store.EdgeResult, int, error) {
 	// Use COUNT(*) OVER() windowed to get total count in same query.
-	q := `SELECT e.from_id, fn.title, fn.node_type, LENGTH(fn.content), e.to_id, tn.title, tn.node_type, LENGTH(tn.content), e.edge_type, e.confidence, e.confidence_tier,
+	// Match edges where EITHER endpoint belongs to the project so
+	// cross-project edges (auto-linked, cross-project-call, depends_on)
+	// are visible from both sides. SELECT DISTINCT because an edge whose
+	// endpoints are both in the project matches the OR twice.
+	q := `SELECT DISTINCT e.from_id, fn.title, fn.node_type, LENGTH(fn.content), fn.project_id,
+	       e.to_id, tn.title, tn.node_type, LENGTH(tn.content), tn.project_id,
+	       e.edge_type, e.confidence, e.confidence_tier,
 	       COUNT(*) OVER() AS total
 		FROM edges e
 		JOIN nodes fn ON fn.id = e.from_id
 		JOIN nodes tn ON tn.id = e.to_id
-		WHERE fn.project_id = ?`
-	args := []any{projectID}
+		WHERE (fn.project_id = ? OR tn.project_id = ?)`
+	args := []any{projectID, projectID}
 
 	if len(edgeTypes) > 0 {
 		placeholders := make([]string, len(edgeTypes))
@@ -1371,7 +1388,9 @@ func (s *Store) ListEdgesByProject(
 		var er store.EdgeResult
 		var fromTitle, fromType, toTitle, toType string
 		var totalRow int
-		if err := rows.Scan(&er.FromID, &fromTitle, &fromType, &er.FromSize, &er.ToID, &toTitle, &toType, &er.ToSize, &er.EdgeType, &er.Confidence, &er.ConfidenceTier, &totalRow); err != nil {
+		if err := rows.Scan(&er.FromID, &fromTitle, &fromType, &er.FromSize, &er.FromProjectID,
+			&er.ToID, &toTitle, &toType, &er.ToSize, &er.ToProjectID,
+			&er.EdgeType, &er.Confidence, &er.ConfidenceTier, &totalRow); err != nil {
 			return nil, 0, fmt.Errorf("sqlite: scan edge result: %w", err)
 		}
 		total = totalRow
@@ -1379,8 +1398,8 @@ func (s *Store) ListEdgesByProject(
 		er.FromType = fromType
 		er.ToTitle = toTitle
 		er.ToType = toType
-		er.FromGroup = extractGroup(er.FromID, projectID)
-		er.ToGroup = extractGroup(er.ToID, projectID)
+		er.FromGroup = extractGroup(er.FromID, er.FromProjectID)
+		er.ToGroup = extractGroup(er.ToID, er.ToProjectID)
 		out = append(out, er)
 	}
 	if err := rows.Err(); err != nil {

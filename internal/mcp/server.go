@@ -1024,7 +1024,7 @@ Rules:
 		}
 		edgeTypes := args.EdgeTypes
 
-		// Default: structural + auto-linked (exclude proposed).
+		// Default: structural + auto-linked + cross-project (exclude proposed).
 		if len(edgeTypes) == 0 {
 			edgeTypes = []string{
 				"specifies",
@@ -1035,6 +1035,8 @@ Rules:
 				"imports",
 				"convention-member",
 				"auto-linked",
+				"cross-project-call",
+				"depends_on",
 				"references",
 			}
 		}
