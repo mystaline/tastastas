@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -292,7 +293,7 @@ func AutoDetectAdapters(
 
 	// ---- detection + dispatch ----
 
-	modules := detectModuleRoots(root)
+	modules := detectModuleRoots(ctx, root)
 
 	var workspaceModules []string
 	var allLangs []string
@@ -325,7 +326,11 @@ func AutoDetectAdapters(
 				WorkspaceModules: workspaceModules,
 			})
 			n, e, _, caErr := ca.IngestWithCalls(ctx)
-			return n, e, nil, countFiles(modRoot, []string{"go"}), caErr
+			w, wErr := countFiles(ctx, modRoot, []string{"go"})
+			if wErr != nil {
+				return nil, nil, nil, 0, wErr
+			}
+			return n, e, nil, w, caErr
 		})
 	}
 
@@ -344,13 +349,21 @@ func AutoDetectAdapters(
 				WorkspaceModules: workspaceModules,
 			})
 			n, e, rc, caErr := ca.IngestWithCalls(ctx)
-			return n, e, rc, countFiles(root, nonGoLangs), caErr
+			w, wErr := countFiles(ctx, root, nonGoLangs)
+			if wErr != nil {
+				return nil, nil, nil, 0, wErr
+			}
+			return n, e, rc, w, caErr
 		})
 	}
-	if hasFile(root, "MEMORY.md") {
+	if hasFile(ctx, root, "MEMORY.md") {
 		startAdapter("gitrepo", func() ([]store.Node, []store.Edge, []treesitter.RawCall, int, error) {
 			n, gitErr := gitrepo.Ingest(gitrepo.Config{Root: root, ProjectID: projectID})
-			return n, nil, nil, countMEMORYFiles(root), gitErr
+			w, wErr := countMEMORYFiles(ctx, root)
+			if wErr != nil {
+				return nil, nil, nil, 0, wErr
+			}
+			return n, nil, nil, w, gitErr
 		})
 	}
 	if exists(filepath.Join(root, ".memoryrc.yaml")) {
@@ -366,7 +379,11 @@ func AutoDetectAdapters(
 	if exists(filepath.Join(root, ".obsidian")) {
 		startAdapter("obsidian", func() ([]store.Node, []store.Edge, []treesitter.RawCall, int, error) {
 			n, e, obErr := obsidian.Ingest(obsidian.Config{Root: root, ProjectID: projectID})
-			return n, e, nil, countFiles(root, nil), obErr
+			w, wErr := countFiles(ctx, root, nil)
+			if wErr != nil {
+				return nil, nil, nil, 0, wErr
+			}
+			return n, e, nil, w, obErr
 		})
 	}
 	// markdown-glob is docwalk's untyped fallback: skip it when .memoryrc.yaml
@@ -375,10 +392,14 @@ func AutoDetectAdapters(
 	// the same paths — same node ID, different node_type — and whichever
 	// finishes last wins the UpsertNode ON CONFLICT, silently discarding the
 	// configured type.
-	if hasMD(root) && !exists(filepath.Join(root, ".memoryrc.yaml")) {
+	if hasMD(ctx, root) && !exists(filepath.Join(root, ".memoryrc.yaml")) {
 		startAdapter("markdown-glob", func() ([]store.Node, []store.Edge, []treesitter.RawCall, int, error) {
 			n, mdErr := markdownglob.Ingest(markdownglob.Config{Root: root, ProjectID: projectID})
-			return n, nil, nil, countFiles(root, nil), mdErr
+			w, wErr := countFiles(ctx, root, nil)
+			if wErr != nil {
+				return nil, nil, nil, 0, wErr
+			}
+			return n, nil, nil, w, mdErr
 		})
 	}
 
@@ -386,25 +407,35 @@ func AutoDetectAdapters(
 	var allRawCalls []treesitter.RawCall
 	go func() { wg.Wait(); close(ch) }()
 
-	for r := range ch {
-		mu.Lock()
-		adapters = append(adapters, r.name)
-		filesWalked += r.walked
-		if r.err != nil {
-			if strings.HasPrefix(r.name, "codeast-go-") {
-				log.Printf("orchestrator: skipping failed adapter %s: %v — continuing", r.name, r.err)
-				mu.Unlock()
-				continue
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, nil, nil, 0, 0, ctx.Err()
+		case r, ok := <-ch:
+			if !ok {
+				// All adapters finished — fall through to cross-file passes.
+				goto collected
 			}
-			err = r.err
+			mu.Lock()
+			adapters = append(adapters, r.name)
+			filesWalked += r.walked
+			if r.err != nil {
+				if strings.HasPrefix(r.name, "codeast-go-") {
+					log.Printf("orchestrator: skipping failed adapter %s: %v — continuing", r.name, r.err)
+					mu.Unlock()
+					continue
+				}
+				err = r.err
+				mu.Unlock()
+				return nil, nil, nil, 0, 0, err // first adapter error fails fast
+			}
+			nodes = append(nodes, r.nodes...)
+			edges = append(edges, r.edges...)
+			allRawCalls = append(allRawCalls, r.rawCalls...)
 			mu.Unlock()
-			return // first adapter error fails fast
 		}
-		nodes = append(nodes, r.nodes...)
-		edges = append(edges, r.edges...)
-		allRawCalls = append(allRawCalls, r.rawCalls...)
-		mu.Unlock()
 	}
+collected:
 	// Cross-file linker pass (P2d) — resolves raw_calls using global label index
 	if len(allRawCalls) > 0 && len(nodes) > 0 {
 		linkEdges := ResolveCrossFileCalls(nodes, allRawCalls, edges)
@@ -416,7 +447,7 @@ func AutoDetectAdapters(
 	for _, n := range nodes {
 		nodeSet[n.ID] = true
 	}
-	if len(nodeSet) > 0 && (hasMD(root) || exists(filepath.Join(root, ".memoryrc.yaml"))) {
+	if len(nodeSet) > 0 && (hasMD(ctx, root) || exists(filepath.Join(root, ".memoryrc.yaml"))) {
 		docLinkEdges := docwalk.ExtractMarkdownLinks(root, projectID, nodeSet)
 		edges = append(edges, docLinkEdges...)
 	}
@@ -434,11 +465,17 @@ func hasCodeast(root string) bool {
 
 // detectModuleRoots walks root up to depth 3 and finds all module config files.
 // Returns one ModuleEntry per detected root (go.mod, package.json, pyproject.toml, Cargo.toml).
-func detectModuleRoots(root string) []ModuleEntry {
+// Stops early if ctx is cancelled; the caller's collect loop reports ctx.Err().
+func detectModuleRoots(ctx context.Context, root string) []ModuleEntry {
 	var entries []ModuleEntry
 	seen := map[string]bool{}
 
 	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		if err != nil || !d.IsDir() {
 			return nil
 		}
@@ -513,9 +550,14 @@ func detectLanguages(root string) []string {
 	return langs
 }
 
-func hasFile(root, name string) bool {
+func hasFile(ctx context.Context, root, name string) bool {
 	found := false
 	filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		if err == nil && d.Name() == name {
 			found = true
 			return filepath.SkipDir
@@ -530,9 +572,14 @@ func exists(path string) bool {
 	return err == nil
 }
 
-func hasMD(root string) bool {
+func hasMD(ctx context.Context, root string) bool {
 	found := false
 	filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		if err == nil && !d.IsDir() && strings.HasSuffix(d.Name(), ".md") {
 			found = true
 			return filepath.SkipDir
@@ -626,6 +673,31 @@ func truncateText(s string, n int) string {
 	return string(runes[:n]) + ".."
 }
 
+// sortedKeys iterates a map[string][]T in sorted key order, yielding
+// (key, members) pairs. Used to make cluster ID assignment (and any
+// downstream map-iteration-derived output) deterministic across runs.
+func sortedKeys(m map[string][]string) []struct {
+	key     string
+	members []string
+} {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]struct {
+		key     string
+		members []string
+	}, 0, len(m))
+	for _, k := range keys {
+		out = append(out, struct {
+			key     string
+			members []string
+		}{k, m[k]})
+	}
+	return out
+}
+
 func InferConventions(ctx context.Context, db store.Store, projectID string, nodes []store.Node) []store.Node {
 	// Collect code:function and code:type nodes
 	type codeSym struct {
@@ -661,7 +733,8 @@ func InferConventions(ctx context.Context, db store.Store, projectID string, nod
 		key := fmt.Sprintf("%s/%s", f.pkg, p)
 		prefixes[key] = append(prefixes[key], f.node.ID)
 	}
-	for key, members := range prefixes {
+	for _, entry := range sortedKeys(prefixes) {
+		key, members := entry.key, entry.members
 		if len(members) < 2 {
 			continue
 		}
@@ -711,7 +784,8 @@ func InferConventions(ctx context.Context, db store.Store, projectID string, nod
 		key := f.pkg + "." + recv
 		recvGroups[key] = append(recvGroups[key], f.node.ID)
 	}
-	for key, members := range recvGroups {
+	for _, entry := range sortedKeys(recvGroups) {
+		key, members := entry.key, entry.members
 		if len(members) < 2 {
 			continue
 		}
@@ -1073,11 +1147,16 @@ func countGenericDocs(nodes []store.Node) int {
 	return c
 }
 
-func countFiles(root string, langs []string) int {
+func countFiles(ctx context.Context, root string, langs []string) (int, error) {
 	exts := extSet(langs)
 	n := 0
 
-	filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		if err != nil {
 			return nil
 		}
@@ -1094,8 +1173,11 @@ func countFiles(root string, langs []string) int {
 		}
 		return nil
 	})
+	if err != nil {
+		return 0, err
+	}
 
-	return n
+	return n, nil
 }
 
 // ponytail: skipDirs list. Add more if projects use other conventions.
@@ -1109,15 +1191,23 @@ func shouldSkipDir(name string) bool {
 	return strings.HasPrefix(name, ".")
 }
 
-func countMEMORYFiles(root string) int {
+func countMEMORYFiles(ctx context.Context, root string) (int, error) {
 	n := 0
-	filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		if err == nil && !d.IsDir() && d.Name() == "MEMORY.md" {
 			n++
 		}
 		return nil
 	})
-	return n
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // ponytail: extSet maps language names to file extensions for countFiles.
@@ -1337,7 +1427,8 @@ func chunkForNode(
 				return chunkSlice(chunks, n.SourceAdapter)
 			}
 		default:
-			if chunks, err := chunker.ChunkCodeByPattern(n.ID, n.Content, n.Language, cfg); err == nil && len(chunks) > 0 {
+			if chunks, err := chunker.ChunkCodeByPattern(n.ID, n.Content, n.Language, cfg); err == nil &&
+				len(chunks) > 0 {
 				return chunkSlice(chunks, n.SourceAdapter)
 			}
 		}

@@ -332,7 +332,7 @@ type JobStatusInput struct {
 
 type JobStatusOutput struct {
 	ID              string `json:"id"`
-	Status          string `json:"status"`          // "running" | "done" | "error"
+	Status          string `json:"status"`          // "running" | "done" | "error" | "aborted"
 	Phase           string `json:"phase,omitempty"` // "walking" | "syncing" | "waiting" | "chunking" | "embedding" | "persisting" | "linking" | "" (done/error)
 	Nodes           int    `json:"nodes_ingested,omitempty"`
 	Edges           int    `json:"edges_created,omitempty"`
@@ -344,4 +344,13 @@ type JobStatusOutput struct {
 	Error           string `json:"error,omitempty"`
 	StartedAt       string `json:"started_at"`
 	EndedAt         string `json:"ended_at,omitempty"`
+}
+
+type AbortInput struct {
+	ProjectID string `json:"project_id,omitempty"` // empty = cancel all running jobs
+}
+
+type AbortOutput struct {
+	Cancelled int    `json:"cancelled"`
+	ProjectID string `json:"project_id,omitempty"`
 }

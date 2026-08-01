@@ -19,9 +19,23 @@ RUN apk add --no-cache ca-certificates git && \
     adduser -D -h /app appuser
 WORKDIR /app
 COPY --from=builder /build/tastastas .
+# Go toolchain copied from builder — needed at runtime for go/packages.Load
+# during code ingestion (primary Go path; tree-sitter fallback covers failures).
+COPY --from=builder /usr/local/go /usr/local/go
+ENV PATH=/usr/local/go/bin:$PATH \
+    GOCACHE=/tmp/go-build \
+    GOPATH=/tmp/go \
+    GOMODCACHE=/tmp/go/pkg/mod \
+    GOPROXY=${GOPROXY:-https://proxy.golang.org,direct}
 RUN mkdir /data /workspaces && chown appuser:appuser /data /workspaces
+# Bake the builder's Go module cache so runtime ingest (go/packages.Load)
+# doesn't re-download every container start. /tmp is tmpfs in prod, so the
+# entrypoint copies it into GOMODCACHE at start.
+COPY --from=builder /go/pkg/mod /go-mod-cache
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh && chown appuser:appuser /app/docker-entrypoint.sh
 VOLUME /data /workspaces
 USER appuser
 EXPOSE 8080 9292
-ENTRYPOINT ["./tastastas"]
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["--serve", ":8080", "--db", "/data/memory.db", "--graph-addr", ":9292"]

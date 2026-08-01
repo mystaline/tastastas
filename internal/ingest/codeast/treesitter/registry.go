@@ -99,6 +99,7 @@ func Extract(projectID, sourcePath string, source []byte, langName string, ext E
 			}
 
 			var symName string
+			var recvName string
 			var declNode *sitter.Node
 			var grammarName string
 
@@ -110,10 +111,18 @@ func Extract(projectID, sourcePath string, source []byte, langName string, ext E
 				switch capNames[idx] {
 				case "name":
 					symName = cap.Node.Utf8Text(source)
+				case "recv":
+					// Receiver capture (Go methods): prefix the name so
+					// same-named methods on different receivers get distinct
+					// node IDs. "Close" on DB and Conn → "DB.Close", "Conn.Close".
+					recvName = cap.Node.Utf8Text(source)
 				case "node":
 					declNode = &cap.Node
 					grammarName = cap.Node.GrammarName()
 				}
+			}
+			if recvName != "" && symName != "" {
+				symName = recvName + "." + symName
 			}
 			if symName == "" || declNode == nil {
 				continue
@@ -216,6 +225,10 @@ func Extract(projectID, sourcePath string, source []byte, langName string, ext E
 					if isPrimitiveRust(typeName) {
 						continue
 					}
+				case "go":
+					if isPrimitiveGo(typeName) {
+						continue
+					}
 				}
 				if symID, ok := symMap[typeName]; ok {
 					// Same-file type reference: resolve immediately
@@ -306,6 +319,8 @@ func NewForLang(lang string) Extractor {
 		return &PyExt{}
 	case "rust", "rs":
 		return &RsExt{}
+	case "go":
+		return &GoExt{}
 	default:
 		return nil
 	}
@@ -322,6 +337,8 @@ func FileExts(lang string) []string {
 		return []string{".py"}
 	case "rust", "rs":
 		return []string{".rs"}
+	case "go":
+		return []string{".go"}
 	default:
 		return nil
 	}

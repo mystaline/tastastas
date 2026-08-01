@@ -99,7 +99,14 @@ func BuildHierarchy(projectID string, nodes []store.Node) ([]store.Node, []store
 	changed := true
 	for changed {
 		changed = false
-		for prefix, d := range dirs {
+		// Sort keys for deterministic collapse order across runs.
+		prefixes := make([]string, 0, len(dirs))
+		for prefix := range dirs {
+			prefixes = append(prefixes, prefix)
+		}
+		sort.Strings(prefixes)
+		for _, prefix := range prefixes {
+			d := dirs[prefix]
 			if prefix == "" || collapsed[prefix] {
 				continue
 			}
@@ -109,10 +116,12 @@ func BuildHierarchy(projectID string, nodes []store.Node) ([]store.Node, []store
 			if len(d.childDirs) != 1 {
 				continue
 			}
-			var onlyChild string
+			children := make([]string, 0, len(d.childDirs))
 			for c := range d.childDirs {
-				onlyChild = c
+				children = append(children, c)
 			}
+			sort.Strings(children)
+			onlyChild := children[0]
 			if !d.hasParent {
 				continue
 			}
@@ -172,7 +181,12 @@ func BuildHierarchy(projectID string, nodes []store.Node) ([]store.Node, []store
 		// childDirs to skip collapsed prefixes as soon as they collapse, so
 		// by convergence no remaining dirNode's childDirs references a
 		// collapsed prefix — safe to emit directly.
+		children := make([]string, 0, len(d.childDirs))
 		for child := range d.childDirs {
+			children = append(children, child)
+		}
+		sort.Strings(children)
+		for _, child := range children {
 			hierEdges = append(hierEdges, store.Edge{
 				FromID:     dirNodeID(prefix),
 				ToID:       dirNodeID(child),
