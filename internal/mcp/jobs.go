@@ -99,8 +99,6 @@ func (js *jobStore) create(projectID string) *ingestJob {
 	defer js.mu.Unlock()
 
 	id := fmt.Sprintf("job-%d", time.Now().UnixNano())
-	ctx, cancel := context.WithCancel(context.Background())
-	_ = ctx // used by cancel
 
 	j := &ingestJob{
 		ID:        id,
@@ -108,15 +106,67 @@ func (js *jobStore) create(projectID string) *ingestJob {
 		Status:    "running",
 		Phase:     "walking",
 		StartedAt: time.Now(),
-		cancel:    cancel,
 	}
 	js.jobs[id] = j
 
-	// Record interrupted-run marker. Cleared by finish().
+	// Record interrupted-run marker. Cleared by finish()/abort().
 	if js.store != nil {
 		_ = js.store.SetJobMarker(context.Background())
 	}
 	return j
+}
+
+// setCancel stores the per-job cancel func under the lock so abort() can
+// cancel the job's context without racing the goroutine that owns it.
+// Must be called before the job's work goroutine starts.
+func (js *jobStore) setCancel(id string, cancel context.CancelFunc) {
+	js.mu.Lock()
+	defer js.mu.Unlock()
+
+	if j, ok := js.jobs[id]; ok {
+		j.cancel = cancel
+	}
+}
+
+// abort cancels all running jobs, optionally filtered by project_id
+// (empty = all). Returns the number of jobs cancelled. Sets status to
+// "aborted"; finish() will not overwrite it. Clears the interrupted-run
+// marker when no running jobs remain.
+func (js *jobStore) abort(projectID string) int {
+	js.mu.Lock()
+	defer js.mu.Unlock()
+
+	var count int
+	for _, j := range js.jobs {
+		if j.Status != "running" {
+			continue
+		}
+		if projectID != "" && j.ProjectID != projectID {
+			continue
+		}
+		if j.cancel != nil {
+			j.cancel()
+		}
+		j.Status = "aborted"
+		j.Phase = ""
+		count++
+	}
+
+	// Clear marker only if zero running jobs remain.
+	if count > 0 && js.store != nil {
+		running := false
+		for _, j := range js.jobs {
+			if j.Status == "running" {
+				running = true
+				break
+			}
+		}
+		if !running {
+			_ = js.store.ClearJobMarker(context.Background())
+		}
+	}
+
+	return count
 }
 
 func (js *jobStore) get(id string) (ingestJob, bool) {
@@ -176,6 +226,11 @@ func (js *jobStore) finish(
 
 	j, ok := js.jobs[id]
 	if !ok {
+		return
+	}
+	// Don't overwrite an aborted job — abort() already set the status and
+	// handled the job marker.
+	if j.Status == "aborted" {
 		return
 	}
 	j.EndedAt = time.Now()

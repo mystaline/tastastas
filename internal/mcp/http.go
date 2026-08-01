@@ -359,9 +359,11 @@ func handleRESTIngest(
 		}
 
 		job := jobs.create(projectID)
+		runCtx, cancel := context.WithCancel(jobCtx)
+		jobs.setCancel(job.ID, cancel)
 		safeGo(func() {
 			ingestMu.Lock()
-			result, err := onboard.Run(jobCtx, onboard.Config{
+			result, err := onboard.Run(runCtx, onboard.Config{
 				CWD:       root,
 				ProjectID: projectID,
 				ModelID:   modelID,

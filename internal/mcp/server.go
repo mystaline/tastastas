@@ -153,7 +153,10 @@ func modelWarning(ctx context.Context, db store.Store, projectID, modelID string
 		return ""
 	}
 	if status == "dirty" {
-		return fmt.Sprintf("data for model %q may be incomplete (previous ingest crashed). Run 'onboard' again.", modelID)
+		return fmt.Sprintf(
+			"data for model %q may be incomplete (previous ingest crashed). Run 'onboard' again.",
+			modelID,
+		)
 	}
 	if status == "" {
 		return fmt.Sprintf("no data found for model %q. Run 'onboard' or 'ingest' first.", modelID)
@@ -221,10 +224,18 @@ Rules:
 			return errorResult(refErr), OnboardOutput{}, nil
 		}
 		if ref != "" && ref != "HEAD" && !strings.Contains(projectID, ref) {
-			log.Printf("WARNING: ref %q not found in project_id %q — consider using %s-%s", ref, projectID, projectID, ref)
+			log.Printf(
+				"WARNING: ref %q not found in project_id %q — consider using %s-%s",
+				ref,
+				projectID,
+				projectID,
+				ref,
+			)
 		}
 
 		job := jobs.create(projectID)
+		runCtx, cancel := context.WithCancel(jobCtx)
+		jobs.setCancel(job.ID, cancel)
 		safeGo(func() {
 			// Per-model AlreadyOnboarded guard.
 			if modelID != "" {
@@ -236,7 +247,7 @@ Rules:
 			}
 
 			ingestMu.Lock()
-			result, err := onboard.Run(jobCtx, onboard.Config{
+			result, err := onboard.Run(runCtx, onboard.Config{
 				CWD:       walkCwd,
 				ProjectID: projectID,
 				Scope:     args.Scope,
@@ -722,13 +733,21 @@ Rules:
 			return errorResult(refErr), IngestOutput{}, nil
 		}
 		if ref != "" && ref != "HEAD" && !strings.Contains(projectID, ref) {
-			log.Printf("WARNING: ref %q not found in project_id %q — consider using %s-%s", ref, projectID, projectID, ref)
+			log.Printf(
+				"WARNING: ref %q not found in project_id %q — consider using %s-%s",
+				ref,
+				projectID,
+				projectID,
+				ref,
+			)
 		}
 
 		job := jobs.create(projectID)
+		runCtx, cancel := context.WithCancel(jobCtx)
+		jobs.setCancel(job.ID, cancel)
 		safeGo(func() {
 			ingestMu.Lock()
-			result, err := onboard.Run(jobCtx, onboard.Config{
+			result, err := onboard.Run(runCtx, onboard.Config{
 				CWD:       walkCwd,
 				ProjectID: projectID,
 				ModelID:   modelID,
@@ -978,7 +997,13 @@ Rules:
 
 		results := append(outgoingResults, incomingResults...)
 
-		output := QueryGraphOutput{NodeID: args.NodeID, Title: srcTitle, ContentExcerpt: contentExcerpt, NeighborCounts: neighborCounts, Edges: results}
+		output := QueryGraphOutput{
+			NodeID:         args.NodeID,
+			Title:          srcTitle,
+			ContentExcerpt: contentExcerpt,
+			NeighborCounts: neighborCounts,
+			Edges:          results,
+		}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(output)}},
 		}, output, nil
@@ -1232,7 +1257,10 @@ Rules:
 				if !visited[e.ToID] {
 					visited[e.ToID] = true
 					parent[e.ToID] = bfsNode{id: cur.id, edgeType: e.EdgeType}
-					queue = append(queue, bfsNode{id: e.ToID, parentID: cur.id, edgeType: e.EdgeType, depth: cur.depth + 1})
+					queue = append(
+						queue,
+						bfsNode{id: e.ToID, parentID: cur.id, edgeType: e.EdgeType, depth: cur.depth + 1},
+					)
 				}
 			}
 		}
@@ -1295,6 +1323,18 @@ Rules:
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
 		}, out, nil
+	})
+
+	// Tool 20: abort_ingestion
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "abort_ingestion",
+		Description: "Cancel running ingest/onboard jobs. No project_id = cancel all. Partial data is left in place; re-run ingest to converge (idempotent upsert).",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args AbortInput) (*mcp.CallToolResult, AbortOutput, error) {
+		count := jobs.abort(args.ProjectID)
+		output := AbortOutput{Cancelled: count, ProjectID: args.ProjectID}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(output)}},
+		}, output, nil
 	})
 }
 
