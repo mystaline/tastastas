@@ -74,7 +74,7 @@ services:
       - "9292:9292"
     volumes:
       - tastastas-data:/data
-      - ${HOST_WORKSPACE_DIR:-/home/deploy/workspaces}:/workspaces
+      - ${WORKSPACE_MOUNT:-/home/deploy/workspaces}:/workspaces
     command:
       - "--serve"
       - ":8080"
@@ -86,7 +86,7 @@ services:
       - "1h"
     environment:
       - TASTASTAS_OPENAI_KEY=${TASTASTAS_OPENAI_KEY:?required}
-      - HOST_WORKSPACE_DIR=${HOST_WORKSPACE_DIR:-}
+      - SERVER_WORKSPACE_ROOT=/workspaces
 
 volumes:
   tastastas-data:
@@ -214,30 +214,73 @@ Heavy only during **ingest** (ONNX embedding saturates CPU, RAM spikes). Recall 
 
 ### Env variables
 
-| Variable | Equivalent flag |
-|----------|---------------|
-| `TASTASTAS_DB` | `--db` |
-| `TASTASTAS_OPENAI_KEY` | `--openai-api-key` |
-| `TASTASTAS_SPA_DIR` | `--spa-dir` |
-| `TASTASTAS_AUTH_TOKEN` | `--auth-token` |
-| `TASTASTAS_EMBED` | `--embed-backend` (docker-compose override) |
-| `HOST_WORKSPACE_DIR` | — (see [Workspace paths](#workspace-paths-docker)) |
+Precedence per variable: **explicit flag wins → env var → default**. Flags and env vars are interchangeable for these:
+
+| Variable | Flag | Notes |
+|----------|------|-------|
+| `TASTASTAS_DB` | `--db` | Env checked first, then XDG default |
+| `TASTASTAS_OPENAI_KEY` | `--openai-api-key` | Env used when flag empty |
+| `TASTASTAS_SPA_DIR` | `--spa-dir` | Env used when flag empty |
+| `TASTASTAS_AUTH_TOKEN` | `--auth-token` | Env used when flag empty |
+| `TASTASTAS_EMBED` | `--embed-backend` | Default `sidecar` |
+| `TASTASTAS_OPENAI_MODEL` | `--openai-model` | Default `text-embedding-3-small` |
+| `TASTASTAS_OPENAI_BASE_URL` | `--openai-base-url` | Default `https://api.openai.com/v1` |
+| `TASTASTAS_CONSOLIDATE` | `--consolidate-interval` | Empty = disabled |
+
+Env-only (no flag equivalent — read directly by the app):
+
+| Variable | Notes |
+|----------|-------|
+| `SERVER_WORKSPACE_ROOT` | Server-visible repository root; Docker default `/workspaces` |
+
+Compose-only interpolation (read by docker-compose, never by the app):
+
+| Variable | Used for |
+|----------|----------|
+| `WORKSPACE_MOUNT` | Host directory bind-mounted at `/workspaces` |
+| `HTTP_PORT` / `GRAPH_PORT` | Published ports |
+| `TASTASTAS_IMAGE` | Prod image tag |
+| `GOPRIVATE` | Go toolchain private-module list (codeast/gitrepo ingest) |
+
+Rule of thumb: **bare binary** → flags (or the four `TASTASTAS_*` env vars above); **docker-compose** → set variables in `.env`, compose maps them into the `command`; anything else in the compose env block is interpolation only.
 
 ---
 
-## Workspace paths (Docker)
+## Workspace paths
 
-The container declares a fixed workspace volume at `/workspaces`. The host side is configurable via `HOST_WORKSPACE_DIR`:
+`SERVER_WORKSPACE_ROOT` is the path tastastas can read. It is not a client path. The server never maps or stores client filesystem paths.
 
-- Set `HOST_WORKSPACE_DIR` (e.g. `/home/user/Workspace`, `D:/Kerja`) to the host directory mounted at `/workspaces`.
-- Client (MCP/HTTP) paths under that prefix are remapped to `/workspaces/...` for file walks — send host paths, no need to know container paths.
-- Paths outside the prefix fail fast with a clear error: pass only paths under the workspace dir.
-- Matching is case-insensitive (`d:/Kerja` ≡ `D:/Kerja`) and Windows backslashes are normalized.
-- Stored data keeps relative paths — host origin naming is preserved; docker paths never persist.
+### Docker with shared `/workspaces`
 
-**Why it's required for smooth Docker usage:** the client and the server see different filesystems — the client knows host paths (`/home/user/...`, `D:/...`), the server only sees what is mounted in the container. Without `HOST_WORKSPACE_DIR`, the server cannot translate the path you hand it, so it fails or walks an empty tree. With it set, you keep using your normal paths and never touch container-internal ones.
+```yaml
+volumes:
+  - ${WORKSPACE_MOUNT:-/home/deploy/workspaces}:/workspaces
+environment:
+  - SERVER_WORKSPACE_ROOT=/workspaces
+```
 
-Unset or empty `HOST_WORKSPACE_DIR` → no remapping; the given path is used as-is (valid for bare-binary / non-Docker runs, where client and server share the same filesystem).
+Send `/workspaces/repo-a` as `cwd`, or pass `repository_url` and let the server resolve it.
+
+### On-prem server
+
+Set root to actual server-visible repository directory:
+
+```bash
+SERVER_WORKSPACE_ROOT=/home/user/workspaces
+```
+
+For client-only paths, include `repository_url` in `onboard` or `ingest`:
+
+```json
+{
+  "cwd": "/home/mystaline-dev/Workspace/repo-a",
+  "repository_url": "https://gitea.example/org/repo-a.git"
+}
+```
+
+`cwd` is used as-is only when it exists on the server. Remote clients send `repository_url`; the server searches direct child Git repositories under `SERVER_WORKSPACE_ROOT`. Matching remote resolves to canonical server path. Duplicate matches return an error. No arbitrary filesystem scan occurs.
+
+URL matching normalizes HTTPS, SSH, and scp-style remotes. Repository index refreshes when repository directories or `.git/config` timestamps change. Stored `SourcePath` values remain relative.
 
 ---
 

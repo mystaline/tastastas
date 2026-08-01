@@ -7,7 +7,7 @@ services:
       - "${GRAPH_PORT:-9292}:9292"
     volumes:
       - tastastas-data:/data
-      - ${HOST_WORKSPACE_DIR:-/home/mystaline-dev/Workspace}:/workspaces
+      - ${WORKSPACE_MOUNT:-/home/mystaline-dev/Workspace}:/workspaces
     # Uncomment below to override embedded frontend with local build:
     # run `cd frontend && npm ci && npm run build` first
     #   - ./frontend/dist:/app/spa
@@ -33,7 +33,7 @@ services:
     environment:
       - TASTASTAS_AUTH_TOKEN=${TASTASTAS_AUTH_TOKEN:-}
       - TASTASTAS_OPENAI_KEY=${TASTASTAS_OPENAI_KEY:-}
-      - HOST_WORKSPACE_DIR=${HOST_WORKSPACE_DIR:-}
+      - SERVER_WORKSPACE_ROOT=/workspaces
       - GOPRIVATE=${GOPRIVATE:-}
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
