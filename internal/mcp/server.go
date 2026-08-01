@@ -83,13 +83,6 @@ func normalizePath(p string) string {
 	return p
 }
 
-// remapRoot maps a host-side path to the docker-visible path using the
-// HOST_WORKSPACE_DIR prefix mapping. The docker side is fixed at workspaceRoot
-// (the image-declared /workspaces volume); the host side varies per machine
-// and is configured via env. Unset host prefix → path returned unchanged.
-// Case-insensitive comparison handles Windows drive letters (D:/Kerja ↔ d:/Kerja).
-// A path outside the host prefix is an error — the client must pass a path
-// under HOST_WORKSPACE_DIR.
 func serverWorkspaceRoot() string {
 	if root := os.Getenv("SERVER_WORKSPACE_ROOT"); root != "" {
 		return filepath.Clean(root)
@@ -266,28 +259,6 @@ func repositoryRoot(cwd, repositoryURL string) (string, error) {
 	return "", fmt.Errorf("cwd is not visible to server; provide repository_url")
 }
 
-func remapRoot(hostPath string) (string, error) {
-	hostPrefix := os.Getenv("HOST_WORKSPACE_DIR")
-	if hostPrefix == "" {
-		return hostPath, nil
-	}
-	cleaned := filepath.ToSlash(filepath.Clean(hostPath))
-	prefix := filepath.ToSlash(filepath.Clean(hostPrefix))
-	lowerCleaned := strings.ToLower(cleaned)
-	lowerPrefix := strings.ToLower(prefix)
-	if strings.HasPrefix(lowerCleaned, lowerPrefix+"/") || strings.EqualFold(cleaned, prefix) {
-		target := serverWorkspaceRoot()
-		if target == "" {
-			target = os.Getenv("DOCKER_WORKSPACE_DIR")
-		}
-		if target == "" {
-			target = "/workspaces"
-		}
-		return filepath.ToSlash(filepath.Clean(target)) + cleaned[len(prefix):], nil
-	}
-	return "", fmt.Errorf("path %q is outside HOST_WORKSPACE_DIR %q — pass only paths under the workspace dir", hostPath, hostPrefix)
-}
-
 // walkRootPreflight fails fast when the walk root is missing or not a
 // directory, instead of letting the async ingest silently walk nothing.
 func walkRootPreflight(path string) error {
@@ -383,13 +354,6 @@ Rules:
 		}
 
 		cwd := normalizePath(args.CWD)
-		var err error
-		if cwd != "" {
-			cwd, err = remapRoot(cwd)
-			if err != nil {
-				return errorResult(err), OnboardOutput{}, nil
-			}
-		}
 		walkCwd, err := repositoryRoot(cwd, args.RepositoryURL)
 		if err != nil {
 			return errorResult(err), OnboardOutput{}, nil
@@ -882,13 +846,6 @@ Rules:
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args IngestInput) (*mcp.CallToolResult, IngestOutput, error) {
 		projectID := args.ProjectID
 		cwd := normalizePath(args.CWD)
-		var err error
-		if cwd != "" {
-			cwd, err = remapRoot(cwd)
-			if err != nil {
-				return errorResult(err), IngestOutput{}, nil
-			}
-		}
 		walkCwd, err := repositoryRoot(cwd, args.RepositoryURL)
 		if err != nil {
 			return errorResult(err), IngestOutput{}, nil
