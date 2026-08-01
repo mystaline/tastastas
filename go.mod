@@ -14,7 +14,7 @@ require (
 	github.com/tree-sitter/tree-sitter-typescript v0.23.2
 	github.com/tursodatabase/libsql-client-go v0.0.0-20260528064733-9d5d30a29a60
 	golang.org/x/tools v0.48.0
-	modernc.org/sqlite v1.54.0
+	modernc.org/sqlite v1.55.0
 	turso.tech/database/tursogo v0.7.1
 )
 
