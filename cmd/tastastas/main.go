@@ -152,8 +152,8 @@ func main() {
 	)
 	embedBackend := flag.String(
 		"embed-backend",
-		"sidecar",
-		"embedder backend: sidecar (baked ONNX, zero deps, 384-dim), ollama (HTTP, 768-dim), openai (cloud API, 1536-dim), or none (lexical only)",
+		"",
+		"embedder backend: sidecar (baked ONNX, zero deps, 384-dim), ollama (HTTP, 768-dim), openai (cloud API, 1536-dim), or none (lexical only). Default sidecar; also $TASTASTAS_EMBED",
 	)
 	ollamaURL := flag.String(
 		"ollama-url",
@@ -173,13 +173,13 @@ func main() {
 	openaiKey := flag.String("openai-api-key", "", "OpenAI API key (prefer $TASTASTAS_OPENAI_KEY env var)")
 	openaiModel := flag.String(
 		"openai-model",
-		"text-embedding-3-small",
-		"OpenAI model ID (used when --embed-backend=openai)",
+		"",
+		"OpenAI model ID (used when --embed-backend=openai). Default text-embedding-3-small; also $TASTASTAS_OPENAI_MODEL",
 	)
 	openaiBaseURL := flag.String(
 		"openai-base-url",
-		"https://api.openai.com/v1",
-		"OpenAI API base URL (used when --embed-backend=openai)",
+		"",
+		"OpenAI API base URL (used when --embed-backend=openai). Default https://api.openai.com/v1; also $TASTASTAS_OPENAI_BASE_URL",
 	)
 	sidecarIntraThreads := flag.Int(
 		"sidecar-intra-threads",
@@ -220,6 +220,35 @@ func main() {
 
 	if *openaiKey == "" {
 		*openaiKey = os.Getenv("TASTASTAS_OPENAI_KEY")
+	}
+
+	if *authToken == "" {
+		*authToken = os.Getenv("TASTASTAS_AUTH_TOKEN")
+	}
+
+	if *embedBackend == "" {
+		*embedBackend = os.Getenv("TASTASTAS_EMBED")
+	}
+	if *embedBackend == "" {
+		*embedBackend = "sidecar"
+	}
+
+	if *openaiModel == "" {
+		*openaiModel = os.Getenv("TASTASTAS_OPENAI_MODEL")
+	}
+	if *openaiModel == "" {
+		*openaiModel = "text-embedding-3-small"
+	}
+
+	if *openaiBaseURL == "" {
+		*openaiBaseURL = os.Getenv("TASTASTAS_OPENAI_BASE_URL")
+	}
+	if *openaiBaseURL == "" {
+		*openaiBaseURL = "https://api.openai.com/v1"
+	}
+
+	if *consolidateInterval == "" {
+		*consolidateInterval = os.Getenv("TASTASTAS_CONSOLIDATE")
 	}
 
 	// Expand ~ in dbPath — MCP clients spawn without shell, so tilde
