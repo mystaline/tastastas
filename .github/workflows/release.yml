@@ -31,6 +31,7 @@ jobs:
     outputs:
       tag: ${{ steps.resolve-tag.outputs.value }}
       is_release: ${{ steps.resolve-tag.outputs.is_release }}
+      is_alpha: ${{ steps.resolve-tag.outputs.is_alpha }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -41,10 +42,16 @@ jobs:
         run: |
           TAG="${{ inputs.tag || github.ref_name }}"
           echo "value=$TAG" >> "$GITHUB_OUTPUT"
-          if echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+          if echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-alpha)?$'; then
             echo "is_release=true" >> "$GITHUB_OUTPUT"
+            if echo "$TAG" | grep -qE -- '-alpha$'; then
+              echo "is_alpha=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "is_alpha=false" >> "$GITHUB_OUTPUT"
+            fi
           else
             echo "is_release=false" >> "$GITHUB_OUTPUT"
+            echo "is_alpha=false" >> "$GITHUB_OUTPUT"
           fi
 
       - uses: actions/setup-go@v7
@@ -261,7 +268,14 @@ jobs:
           img="${{ env.REGISTRY }}/${{ github.repository }}"
           ver="${{ needs.test.outputs.tag }}"; ver="${ver#v}"
           major="${ver%%.*}"; rest="${ver#*.}"; minor="${rest%%.*}"
-          for t in "${{ needs.test.outputs.tag }}" latest "$major.$minor"; do
-            docker tag "$img:scan" "$img:$t"
-            docker push "$img:$t"
-          done
+          docker tag "$img:scan" "$img:${{ needs.test.outputs.tag }}"
+          docker push "$img:${{ needs.test.outputs.tag }}"
+          if [ "${{ needs.test.outputs.is_alpha }}" = "true" ]; then
+            docker tag "$img:scan" "$img:alpha"
+            docker push "$img:alpha"
+          else
+            docker tag "$img:scan" "$img:latest"
+            docker push "$img:latest"
+            docker tag "$img:scan" "$img:$major.$minor"
+            docker push "$img:$major.$minor"
+          fi
