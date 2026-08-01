@@ -62,17 +62,19 @@ docker tag tastastas ghcr.io/mystaline/tastastas:latest
 docker push ghcr.io/mystaline/tastastas:latest
 ```
 
+Stable (main) releases publish `:latest`; pre-release (non-main branch) releases publish `:alpha`. See [RELEASING.md](./RELEASING.md#branch-awareness).
+
 ```yaml
 # target — docker-compose.yml
 services:
   tastastas:
-    image: ghcr.io/mystaline/tastastas
+    image: ghcr.io/mystaline/tastastas:latest   # or :alpha for pre-release
     ports:
       - "8080:8080"
       - "9292:9292"
     volumes:
       - tastastas-data:/data
-      - /home/deploy/workspaces:/workspaces
+      - ${HOST_WORKSPACE_DIR:-/home/deploy/workspaces}:/workspaces
     command:
       - "--serve"
       - ":8080"
@@ -84,7 +86,7 @@ services:
       - "1h"
     environment:
       - TASTASTAS_OPENAI_KEY=${TASTASTAS_OPENAI_KEY:?required}
-      - TASTASTAS_WORKSPACE=/workspaces
+      - HOST_WORKSPACE_DIR=${HOST_WORKSPACE_DIR:-}
 
 volumes:
   tastastas-data:
@@ -173,7 +175,6 @@ Heavy only during **ingest** (ONNX embedding saturates CPU, RAM spikes). Recall 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--db` | `~/.local/share/tastastas/memory.db` | SQLite path. Also `$TASTASTAS_DB`. |
-| `--workspace-dir` | `/tmp/tastastas-workspaces` | Workspace directory for git clones. Also `$TASTASTAS_WORKSPACE`. |
 
 ### Embed — general
 | Flag | Default | Description |
@@ -220,7 +221,23 @@ Heavy only during **ingest** (ONNX embedding saturates CPU, RAM spikes). Recall 
 | `TASTASTAS_SPA_DIR` | `--spa-dir` |
 | `TASTASTAS_AUTH_TOKEN` | `--auth-token` |
 | `TASTASTAS_EMBED` | `--embed-backend` (docker-compose override) |
-| `TASTASTAS_WORKSPACE` | `--workspace-dir` |
+| `HOST_WORKSPACE_DIR` | — (see [Workspace paths](#workspace-paths-docker)) |
+
+---
+
+## Workspace paths (Docker)
+
+The container declares a fixed workspace volume at `/workspaces`. The host side is configurable via `HOST_WORKSPACE_DIR`:
+
+- Set `HOST_WORKSPACE_DIR` (e.g. `/home/user/Workspace`, `D:/Kerja`) to the host directory mounted at `/workspaces`.
+- Client (MCP/HTTP) paths under that prefix are remapped to `/workspaces/...` for file walks — send host paths, no need to know container paths.
+- Paths outside the prefix fail fast with a clear error: pass only paths under the workspace dir.
+- Matching is case-insensitive (`d:/Kerja` ≡ `D:/Kerja`) and Windows backslashes are normalized.
+- Stored data keeps relative paths — host origin naming is preserved; docker paths never persist.
+
+**Why it's required for smooth Docker usage:** the client and the server see different filesystems — the client knows host paths (`/home/user/...`, `D:/...`), the server only sees what is mounted in the container. Without `HOST_WORKSPACE_DIR`, the server cannot translate the path you hand it, so it fails or walks an empty tree. With it set, you keep using your normal paths and never touch container-internal ones.
+
+Unset or empty `HOST_WORKSPACE_DIR` → no remapping; the given path is used as-is (valid for bare-binary / non-Docker runs, where client and server share the same filesystem).
 
 ---
 
