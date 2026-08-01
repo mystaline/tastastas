@@ -1613,12 +1613,14 @@ func (s *Store) ClearProject(ctx context.Context, projectID, modelID string) (st
 	_ = tx.QueryRowContext(
 		ctx,
 		`SELECT COUNT(*) FROM node_vectors WHERE node_id IN (SELECT id FROM nodes WHERE project_id = ?) AND node_id NOT IN (SELECT nvm.id FROM node_vector_model nvm JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ?)`,
-		projectID, projectID,
+		projectID,
+		projectID,
 	).Scan(&bareNodeVecs)
 	_ = tx.QueryRowContext(
 		ctx,
 		`SELECT COUNT(*) FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE parent_node_id IN (SELECT id FROM nodes WHERE project_id = ?)) AND chunk_id NOT IN (SELECT cvm.id FROM chunk_vector_model cvm JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`,
-		projectID, projectID,
+		projectID,
+		projectID,
 	).Scan(&bareChunkVecs)
 
 	// Delete model-prefixed vectors.
@@ -1637,12 +1639,14 @@ func (s *Store) ClearProject(ctx context.Context, projectID, modelID string) (st
 	_, _ = tx.ExecContext(
 		ctx,
 		`DELETE FROM node_vectors WHERE node_id IN (SELECT id FROM nodes WHERE project_id = ?) AND node_id NOT IN (SELECT nvm.id FROM node_vector_model nvm JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ?)`,
-		projectID, projectID,
+		projectID,
+		projectID,
 	)
 	_, _ = tx.ExecContext(
 		ctx,
 		`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE parent_node_id IN (SELECT id FROM nodes WHERE project_id = ?)) AND chunk_id NOT IN (SELECT cvm.id FROM chunk_vector_model cvm JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`,
-		projectID, projectID,
+		projectID,
+		projectID,
 	)
 	_, _ = tx.ExecContext(
 		ctx,
@@ -1836,6 +1840,36 @@ func (s *Store) GetTopNodesByImportance(ctx context.Context, projectID string, l
 		if err := rows.Scan(&n.ID, &n.ProjectID, &n.NodeType, &n.Title, &n.Content, &n.ContentHash,
 			&n.Status, &n.SourceAdapter, &n.SourcePath, &n.Importance, &n.Language, &n.CreatedAt, &n.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("sqlite: scan node: %w", err)
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetNodesByCrossProjectEdges(
+	ctx context.Context,
+	projectID, otherProject string,
+	limit int,
+) ([]store.Node, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT n.id, n.project_id, n.node_type, n.title, n.content, n.content_hash, n.status, n.source_adapter, n.source_path, n.importance, n.language, n.created_at, n.updated_at
+		FROM edges e
+		JOIN nodes fn ON fn.id = e.from_id
+		JOIN nodes tn ON tn.id = e.to_id
+		JOIN nodes n ON n.id = e.from_id OR n.id = e.to_id
+		WHERE ((fn.project_id = ? AND tn.project_id = ?) OR (fn.project_id = ? AND tn.project_id = ?))
+		  AND n.project_id = ?
+		ORDER BY n.importance DESC LIMIT ?`, projectID, otherProject, otherProject, projectID, projectID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: get nodes by cross-project edges: %w", err)
+	}
+	defer rows.Close()
+	var out []store.Node
+	for rows.Next() {
+		var n store.Node
+		if err := rows.Scan(&n.ID, &n.ProjectID, &n.NodeType, &n.Title, &n.Content, &n.ContentHash,
+			&n.Status, &n.SourceAdapter, &n.SourcePath, &n.Importance, &n.Language, &n.CreatedAt, &n.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("sqlite: scan cross-project node: %w", err)
 		}
 		out = append(out, n)
 	}

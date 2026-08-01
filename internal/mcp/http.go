@@ -180,13 +180,13 @@ func HandleGraphData(db store.Store) http.HandlerFunc {
 
 		nodeMap := map[string]*struct {
 			id, title, ntype, group, projectID string
-			weight, size                        int
+			weight, size                       int
 		}{}
 		addNode := func(id, title, ntype, group, pid string, size int) {
 			if _, ok := nodeMap[id]; !ok {
 				nodeMap[id] = &struct {
 					id, title, ntype, group, projectID string
-					weight, size                        int
+					weight, size                       int
 				}{id: id, title: title, ntype: ntype, group: group, projectID: pid, size: size}
 			}
 			nodeMap[id].weight++
@@ -227,12 +227,6 @@ func HandleGraphData(db store.Store) http.HandlerFunc {
 		// Sidecar projects: pull in top nodes from other projects so the
 		// graph shows the broader surface of linked shared libraries, not
 		// just nodes already touching an edge endpoint.
-		sidecarProjectID := func(id string) string {
-			if strings.Contains(id, "/") {
-				return strings.SplitN(id, "/", 2)[0]
-			}
-			return id
-		}
 		sidecars := map[string]bool{}
 		for _, p := range strings.Split(r.URL.Query().Get("sidecars"), ",") {
 			p = strings.TrimSpace(p)
@@ -240,21 +234,60 @@ func HandleGraphData(db store.Store) http.HandlerFunc {
 				sidecars[p] = true
 			}
 		}
+		sidecarProjectID := func(id string) string {
+			if strings.Contains(id, "/") {
+				return strings.SplitN(id, "/", 2)[0]
+			}
+			return id
+		}
+		addSidecarNode := func(n store.Node, sc string) {
+			if _, ok := nodeMap[n.ID]; !ok {
+				nodeMap[n.ID] = &struct {
+					id, title, ntype, group, projectID string
+					weight, size                       int
+				}{id: n.ID, title: n.Title, ntype: n.NodeType,
+					group: extractGroup(n.ID, sc), projectID: sidecarProjectID(n.ProjectID),
+					size: len(n.Content)}
+			}
+			nodeMap[n.ID].weight++
+		}
 		for sc := range sidecars {
-			sn, err := db.GetTopNodesByImportance(r.Context(), sc, 200)
+			// Cross-project edge endpoints first so connected satellites
+			// render visible links to the main graph, not just isolated nodes.
+			sn, err := db.GetNodesByCrossProjectEdges(r.Context(), sc, projectID, 200)
+			if err == nil {
+				for _, n := range sn {
+					addSidecarNode(n, sc)
+				}
+			}
+			sn, err = db.GetTopNodesByImportance(r.Context(), sc, 200)
 			if err != nil {
 				continue
 			}
 			for _, n := range sn {
-				if _, ok := nodeMap[n.ID]; !ok {
-					nodeMap[n.ID] = &struct {
-						id, title, ntype, group, projectID string
-						weight, size                        int
-					}{id: n.ID, title: n.Title, ntype: n.NodeType,
-						group: extractGroup(n.ID, sc), projectID: sidecarProjectID(n.ProjectID),
-						size: len(n.Content)}
+				addSidecarNode(n, sc)
+			}
+		}
+
+		// Cross-project edges render only when their satellite project is
+		// explicitly selected; otherwise the main graph stays project-local.
+		{
+			filtered := structuralEdges[:0]
+			for _, e := range structuralEdges {
+				sp, tp := sidecarProjectID(e.Source), sidecarProjectID(e.Target)
+				if sp != projectID && !sidecars[sp] {
+					continue
 				}
-				nodeMap[n.ID].weight++
+				if tp != projectID && !sidecars[tp] {
+					continue
+				}
+				filtered = append(filtered, e)
+			}
+			structuralEdges = filtered
+			for id, n := range nodeMap {
+				if n.projectID != projectID && !sidecars[n.projectID] {
+					delete(nodeMap, id)
+				}
 			}
 		}
 

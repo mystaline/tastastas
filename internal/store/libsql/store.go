@@ -233,7 +233,10 @@ func (s *Store) GetNodeEmbeddings(ctx context.Context, nodeIDs []string) (map[st
 		placeholders[i] = "?"
 		args[i] = id
 	}
-	query := "SELECT v.node_id, v.embedding FROM node_vectors v WHERE v.node_id IN (" + strings.Join(placeholders, ",") + ")"
+	query := "SELECT v.node_id, v.embedding FROM node_vectors v WHERE v.node_id IN (" + strings.Join(
+		placeholders,
+		",",
+	) + ")"
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("libsql: get node embeddings: %w", err)
@@ -247,8 +250,13 @@ func (s *Store) GetNodeEmbeddings(ctx context.Context, nodeIDs []string) (map[st
 			return nil, err
 		}
 		if len(blob) != s.dim*4 {
-			log.Printf("libsql: WARN skipping read of %s: blob len %d bytes, expected %d for dim %d (truncated/corrupt row)",
-				id, len(blob), s.dim*4, s.dim)
+			log.Printf(
+				"libsql: WARN skipping read of %s: blob len %d bytes, expected %d for dim %d (truncated/corrupt row)",
+				id,
+				len(blob),
+				s.dim*4,
+				s.dim,
+			)
 			continue
 		}
 		emb := blobToFloat32Slice(blob, s.dim)
@@ -348,12 +356,25 @@ func (s *Store) UpsertNode(ctx context.Context, n store.Node) error {
 	var vectorSkipped error
 	switch {
 	case len(n.Embedding) > 0 && store.HasNonFiniteFloat32(n.Embedding):
-		log.Printf("libsql: WARN skipping vector write for node %s: embedding contains NaN/Inf (metadata still upserted)", n.ID)
+		log.Printf(
+			"libsql: WARN skipping vector write for node %s: embedding contains NaN/Inf (metadata still upserted)",
+			n.ID,
+		)
 		vectorSkipped = fmt.Errorf("node %s: %w: contains NaN/Inf", n.ID, store.ErrVectorSkipped)
 	case len(n.Embedding) > 0 && len(n.Embedding) != s.dim:
-		log.Printf("libsql: WARN skipping vector write for node %s: embedding dim %d != store dim %d (metadata still upserted)",
-			n.ID, len(n.Embedding), s.dim)
-		vectorSkipped = fmt.Errorf("node %s: %w: dim %d != store dim %d", n.ID, store.ErrVectorSkipped, len(n.Embedding), s.dim)
+		log.Printf(
+			"libsql: WARN skipping vector write for node %s: embedding dim %d != store dim %d (metadata still upserted)",
+			n.ID,
+			len(n.Embedding),
+			s.dim,
+		)
+		vectorSkipped = fmt.Errorf(
+			"node %s: %w: dim %d != store dim %d",
+			n.ID,
+			store.ErrVectorSkipped,
+			len(n.Embedding),
+			s.dim,
+		)
 	case len(n.Embedding) > 0:
 		vecJSON, jerr := json.Marshal(n.Embedding)
 		if jerr != nil {
@@ -751,7 +772,12 @@ func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 		return err
 	}
 	if len(skippedIDs) > 0 {
-		return fmt.Errorf("%d chunk(s) skipped [%s]: %w", len(skippedIDs), strings.Join(skippedIDs, ", "), store.ErrVectorSkipped)
+		return fmt.Errorf(
+			"%d chunk(s) skipped [%s]: %w",
+			len(skippedIDs),
+			strings.Join(skippedIDs, ", "),
+			store.ErrVectorSkipped,
+		)
 	}
 	return nil
 }
@@ -1131,10 +1157,16 @@ func (s *Store) ListEdgesByType(
 	edgeType string,
 	limit, offset int,
 ) ([]store.Edge, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT e.from_id, e.to_id, e.edge_type, e.confidence, e.confidence_tier, e.bidirectional
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT e.from_id, e.to_id, e.edge_type, e.confidence, e.confidence_tier, e.bidirectional
 		FROM edges e JOIN nodes n ON n.id = e.from_id
 		WHERE n.project_id = ? AND e.edge_type = ? ORDER BY e.created_at DESC LIMIT ? OFFSET ?`,
-		projectID, edgeType, limit, offset)
+		projectID,
+		edgeType,
+		limit,
+		offset,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1335,27 +1367,37 @@ func (s *Store) ClearProject(ctx context.Context, projectID, modelID string) (st
 
 	var nodes, edges int
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM nodes WHERE project_id = ?`, projectID).Scan(&nodes)
-	_ = s.db.QueryRowContext(ctx,
+	_ = s.db.QueryRowContext(
+		ctx,
 		`SELECT COUNT(*) FROM edges WHERE from_id IN (SELECT id FROM nodes WHERE project_id = ?) OR to_id IN (SELECT id FROM nodes WHERE project_id = ?)`,
-		projectID, projectID).Scan(&edges)
+		projectID,
+		projectID,
+	).Scan(&edges)
 
 	var hasNV, hasCV int
-	_ = s.db.QueryRowContext(ctx, `SELECT 1 FROM pragma_table_list WHERE name = 'node_vectors' AND type = 'table'`).Scan(&hasNV)
-	_ = s.db.QueryRowContext(ctx, `SELECT 1 FROM pragma_table_list WHERE name = 'chunk_vectors' AND type = 'table'`).Scan(&hasCV)
+	_ = s.db.QueryRowContext(ctx, `SELECT 1 FROM pragma_table_list WHERE name = 'node_vectors' AND type = 'table'`).
+		Scan(&hasNV)
+	_ = s.db.QueryRowContext(ctx, `SELECT 1 FROM pragma_table_list WHERE name = 'chunk_vectors' AND type = 'table'`).
+		Scan(&hasCV)
 
 	if hasCV != 0 {
-		_, _ = s.db.ExecContext(ctx,
+		_, _ = s.db.ExecContext(
+			ctx,
 			`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT c.id FROM chunks c JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`,
-			projectID)
+			projectID,
+		)
 	}
 	if hasNV != 0 {
 		_, _ = s.db.ExecContext(ctx,
 			`DELETE FROM node_vectors WHERE node_id IN (SELECT id FROM nodes WHERE project_id = ?)`,
 			projectID)
 	}
-	_, _ = s.db.ExecContext(ctx,
+	_, _ = s.db.ExecContext(
+		ctx,
 		`DELETE FROM edge_proposals WHERE from_id IN (SELECT id FROM nodes WHERE project_id = ?) OR to_id IN (SELECT id FROM nodes WHERE project_id = ?)`,
-		projectID, projectID)
+		projectID,
+		projectID,
+	)
 	_, _ = s.db.ExecContext(ctx, `DELETE FROM unresolved_references WHERE project_id = ?`, projectID)
 	_, _ = s.db.ExecContext(ctx, `DELETE FROM nodes WHERE project_id = ?`, projectID)
 
@@ -1369,9 +1411,11 @@ func (s *Store) LogAccess(ctx context.Context, projectID, nodeID, sessionID stri
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx,
+	_, err = s.db.ExecContext(
+		ctx,
 		`UPDATE nodes SET access_count = access_count + 1, last_accessed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`,
-		nodeID)
+		nodeID,
+	)
 	return err
 }
 
@@ -1427,11 +1471,15 @@ func (s *Store) GetSessionPairs(ctx context.Context, withinSec int, minSessions 
 }
 
 func (s *Store) AccessHistory(ctx context.Context, nodeID string, limit int) ([]store.Node, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.db.QueryContext(
+		ctx,
 		`SELECT n.id, n.project_id, n.node_type, n.title, n.content, n.content_hash, n.status, n.source_adapter, n.source_path, n.importance, n.language, n.created_at, n.updated_at
 		FROM access_log a JOIN nodes n ON n.id = a.node_id
 		WHERE a.node_id = ?
-		ORDER BY a.accessed_at DESC LIMIT ?`, nodeID, limit)
+		ORDER BY a.accessed_at DESC LIMIT ?`,
+		nodeID,
+		limit,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("libsql: access history: %w", err)
 	}
@@ -1460,10 +1508,14 @@ func (s *Store) GetAccessStats(ctx context.Context, nodeID string) (int, string,
 }
 
 func (s *Store) ListNodesByUpdatedAfter(ctx context.Context, projectID, after string, limit int) ([]store.Node, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.db.QueryContext(
+		ctx,
 		`SELECT id, project_id, node_type, title, content, content_hash, status, source_adapter, source_path, importance, language, created_at, updated_at
 		FROM nodes WHERE project_id = ? AND updated_at > ? ORDER BY updated_at DESC LIMIT ?`,
-		projectID, after, limit)
+		projectID,
+		after,
+		limit,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("libsql: list nodes by updated: %w", err)
 	}
@@ -1512,6 +1564,36 @@ func (s *Store) GetTopNodesByImportance(ctx context.Context, projectID string, l
 		if err := rows.Scan(&n.ID, &n.ProjectID, &n.NodeType, &n.Title, &n.Content, &n.ContentHash,
 			&n.Status, &n.SourceAdapter, &n.SourcePath, &n.Importance, &n.Language, &n.CreatedAt, &n.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("libsql: scan node: %w", err)
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetNodesByCrossProjectEdges(
+	ctx context.Context,
+	projectID, otherProject string,
+	limit int,
+) ([]store.Node, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT n.id, n.project_id, n.node_type, n.title, n.content, n.content_hash, n.status, n.source_adapter, n.source_path, n.importance, n.language, n.created_at, n.updated_at
+		FROM edges e
+		JOIN nodes fn ON fn.id = e.from_id
+		JOIN nodes tn ON tn.id = e.to_id
+		JOIN nodes n ON n.id = e.from_id OR n.id = e.to_id
+		WHERE ((fn.project_id = ? AND tn.project_id = ?) OR (fn.project_id = ? AND tn.project_id = ?))
+		  AND n.project_id = ?
+		ORDER BY n.importance DESC LIMIT ?`, projectID, otherProject, otherProject, projectID, projectID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("libsql: get nodes by cross-project edges: %w", err)
+	}
+	defer rows.Close()
+	var out []store.Node
+	for rows.Next() {
+		var n store.Node
+		if err := rows.Scan(&n.ID, &n.ProjectID, &n.NodeType, &n.Title, &n.Content, &n.ContentHash,
+			&n.Status, &n.SourceAdapter, &n.SourcePath, &n.Importance, &n.Language, &n.CreatedAt, &n.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("libsql: scan cross-project node: %w", err)
 		}
 		out = append(out, n)
 	}

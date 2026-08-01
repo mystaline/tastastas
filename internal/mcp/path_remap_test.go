@@ -28,6 +28,7 @@ func TestNormalizePathTilde(t *testing.T) {
 
 func TestRemapRoot(t *testing.T) {
 	t.Setenv("HOST_WORKSPACE_DIR", "/home/user/Workspace")
+	t.Setenv("DOCKER_WORKSPACE_DIR", "/workspaces")
 
 	ok := []struct {
 		name string
@@ -68,6 +69,7 @@ func TestRemapRoot(t *testing.T) {
 
 func TestRemapRootCaseInsensitive(t *testing.T) {
 	t.Setenv("HOST_WORKSPACE_DIR", "D:/Kerja")
+	t.Setenv("DOCKER_WORKSPACE_DIR", "/workspaces")
 
 	for _, in := range []string{"d:/Kerja/proj", "D:/KERJA/proj", "D:/Kerja"} {
 		want := "/workspaces"
@@ -92,6 +94,32 @@ func TestRemapRootNoEnv(t *testing.T) {
 	}
 	if got != "/home/user/proj" {
 		t.Fatalf("remapRoot with empty host prefix = %q, want identity", got)
+	}
+}
+
+func TestRepositoryRootUsesVisibleCWD(t *testing.T) {
+	dir := t.TempDir()
+	got, err := repositoryRoot(dir, "")
+	if err != nil {
+		t.Fatalf("repositoryRoot: %v", err)
+	}
+	if got != dir {
+		t.Fatalf("repositoryRoot = %q, want %q", got, dir)
+	}
+}
+
+func TestNormalizeRepositoryURL(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"https://Gitea.example/Org/repo.git", "gitea.example/Org/repo"},
+		{"git@gitea.example:Org/repo.git", "gitea.example/Org/repo"},
+		{"ssh://git@gitea.example/Org/repo.git", "gitea.example/Org/repo"},
+	}
+	for _, tc := range cases {
+		if got := normalizeRepositoryURL(tc.in); got != tc.want {
+			t.Errorf("normalizeRepositoryURL(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
 

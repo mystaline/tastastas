@@ -128,10 +128,11 @@ type LinkOutput struct {
 }
 
 type IngestInput struct {
-	CWD       string `json:"cwd,omitempty"` // project root to detect + ingest files from
-	ProjectID string `json:"project_id,omitempty"`
-	Scope     string `json:"scope,omitempty"` // "cwd" | "subtree"
-	Ref       string `json:"ref,omitempty"`
+	CWD           string `json:"cwd,omitempty"`
+	RepositoryURL string `json:"repository_url,omitempty"`
+	ProjectID     string `json:"project_id,omitempty"`
+	Scope         string `json:"scope,omitempty"`
+	Ref           string `json:"ref,omitempty"`
 }
 
 type IngestOutput struct {
@@ -175,10 +176,11 @@ type StaleNode struct {
 }
 
 type OnboardInput struct {
-	CWD       string `json:"cwd,omitempty"`
-	ProjectID string `json:"project_id,omitempty"`
-	Scope     string `json:"scope,omitempty"` // "cwd" | "subtree"
-	Ref       string `json:"ref,omitempty"`
+	CWD           string `json:"cwd,omitempty"`
+	RepositoryURL string `json:"repository_url,omitempty"`
+	ProjectID     string `json:"project_id,omitempty"`
+	Scope         string `json:"scope,omitempty"`
+	Ref           string `json:"ref,omitempty"`
 }
 
 type OnboardOutput struct {

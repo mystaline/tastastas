@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -89,6 +90,182 @@ func normalizePath(p string) string {
 // Case-insensitive comparison handles Windows drive letters (D:/Kerja ↔ d:/Kerja).
 // A path outside the host prefix is an error — the client must pass a path
 // under HOST_WORKSPACE_DIR.
+func serverWorkspaceRoot() string {
+	if root := os.Getenv("SERVER_WORKSPACE_ROOT"); root != "" {
+		return filepath.Clean(root)
+	}
+	return ""
+}
+
+func normalizeRepositoryURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if strings.HasPrefix(raw, "git@") {
+		parts := strings.SplitN(raw, ":", 2)
+		if len(parts) == 2 {
+			raw = "ssh://" + parts[0] + "/" + parts[1]
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return strings.TrimSuffix(strings.TrimSuffix(raw, ".git"), "/")
+	}
+	u.Host = strings.ToLower(u.Host)
+	u.User = nil
+	u.RawQuery = ""
+	u.Fragment = ""
+	u.Path = strings.TrimSuffix(strings.TrimSuffix(u.Path, ".git"), "/")
+	return u.Host + u.Path
+}
+
+type repositoryIndexState struct {
+	root        string
+	fingerprint string
+	matches     map[string][]string
+}
+
+var repositoryIndex struct {
+	sync.RWMutex
+	refresh sync.Mutex
+	state   *repositoryIndexState
+}
+
+func buildRepositoryIndex(root string) (*repositoryIndexState, error) {
+	if _, err := os.Stat(root); err != nil {
+		return nil, fmt.Errorf("stat server workspace root %s: %w", root, err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, fmt.Errorf("read server workspace root %s: %w", root, err)
+	}
+	matches := map[string][]string{}
+	configs, err := repositoryConfigs(root)
+	if err != nil {
+		return nil, err
+	}
+	for candidate := range configs {
+		cmd := exec.Command("git", "-C", candidate, "config", "--get", "remote.origin.url")
+		out, err := cmd.Output()
+		if err == nil {
+			key := normalizeRepositoryURL(string(out))
+			matches[key] = append(matches[key], candidate)
+		}
+	}
+	fingerprint, err := repositoryFingerprint(root, entries)
+	if err != nil {
+		return nil, err
+	}
+	return &repositoryIndexState{root: root, fingerprint: fingerprint, matches: matches}, nil
+}
+
+func repositoryConfigs(root string) (map[string]struct{}, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, fmt.Errorf("read server workspace root %s: %w", root, err)
+	}
+	configs := make(map[string]struct{})
+	for _, entry := range entries {
+		if entry.IsDir() {
+			configs[filepath.Join(root, entry.Name())] = struct{}{}
+		}
+	}
+	return configs, nil
+}
+
+func repositoryFingerprint(root string, entries []os.DirEntry) (string, error) {
+	var parts []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		config := filepath.Join(root, entry.Name(), ".git", "config")
+		info, err := os.Stat(config)
+		if err != nil {
+			continue
+		}
+		parts = append(parts, entry.Name()+":"+info.ModTime().String())
+	}
+	return strings.Join(parts, "|"), nil
+}
+
+func repositoryMatches(root, want string) ([]string, error) {
+	repositoryIndex.RLock()
+	state := repositoryIndex.state
+	repositoryIndex.RUnlock()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, fmt.Errorf("read server workspace root %s: %w", root, err)
+	}
+	fingerprint, err := repositoryFingerprint(root, entries)
+	if err != nil {
+		return nil, err
+	}
+	if state != nil && state.root == root && state.fingerprint == fingerprint {
+		return append([]string(nil), state.matches[want]...), nil
+	}
+	repositoryIndex.refresh.Lock()
+	defer repositoryIndex.refresh.Unlock()
+	repositoryIndex.RLock()
+	state = repositoryIndex.state
+	repositoryIndex.RUnlock()
+	entries, err = os.ReadDir(root)
+	if err != nil {
+		return nil, fmt.Errorf("read server workspace root %s: %w", root, err)
+	}
+	fingerprint, err = repositoryFingerprint(root, entries)
+	if err != nil {
+		return nil, err
+	}
+	if state != nil && state.root == root && state.fingerprint == fingerprint {
+		return append([]string(nil), state.matches[want]...), nil
+	}
+	fresh, err := buildRepositoryIndex(root)
+	if err != nil {
+		return nil, err
+	}
+	repositoryIndex.Lock()
+	repositoryIndex.state = fresh
+	repositoryIndex.Unlock()
+	return append([]string(nil), fresh.matches[want]...), nil
+}
+
+func repositoryRoot(cwd, repositoryURL string) (string, error) {
+	cwd = normalizePath(cwd)
+	if cwd == "" && repositoryURL == "" {
+		if root := serverWorkspaceRoot(); root != "" {
+			return root, nil
+		}
+	}
+	if repositoryURL != "" {
+		root := serverWorkspaceRoot()
+		if root == "" {
+			return "", fmt.Errorf("repository_url requires SERVER_WORKSPACE_ROOT")
+		}
+		want := normalizeRepositoryURL(repositoryURL)
+		matches, err := repositoryMatches(root, want)
+		if err != nil {
+			return "", err
+		}
+		if len(matches) == 1 {
+			return matches[0], nil
+		}
+		if len(matches) > 1 {
+			return "", fmt.Errorf("repository_url %q matches multiple server repositories", repositoryURL)
+		}
+	}
+	if cwd != "" {
+		if err := walkRootPreflight(cwd); err == nil {
+			return cwd, nil
+		}
+	}
+	if repositoryURL != "" {
+		return "", fmt.Errorf("could not resolve repository %q on server", repositoryURL)
+	}
+	return "", fmt.Errorf("cwd is not visible to server; provide repository_url")
+}
+
 func remapRoot(hostPath string) (string, error) {
 	hostPrefix := os.Getenv("HOST_WORKSPACE_DIR")
 	if hostPrefix == "" {
@@ -99,12 +276,16 @@ func remapRoot(hostPath string) (string, error) {
 	lowerCleaned := strings.ToLower(cleaned)
 	lowerPrefix := strings.ToLower(prefix)
 	if strings.HasPrefix(lowerCleaned, lowerPrefix+"/") || strings.EqualFold(cleaned, prefix) {
-		return filepath.ToSlash(filepath.Clean(workspaceRoot)) + cleaned[len(prefix):], nil
+		target := serverWorkspaceRoot()
+		if target == "" {
+			target = os.Getenv("DOCKER_WORKSPACE_DIR")
+		}
+		if target == "" {
+			target = "/workspaces"
+		}
+		return filepath.ToSlash(filepath.Clean(target)) + cleaned[len(prefix):], nil
 	}
-	return "", fmt.Errorf(
-		"path %q is outside HOST_WORKSPACE_DIR %q — pass only paths under the workspace dir",
-		hostPath, hostPrefix,
-	)
+	return "", fmt.Errorf("path %q is outside HOST_WORKSPACE_DIR %q — pass only paths under the workspace dir", hostPath, hostPrefix)
 }
 
 // walkRootPreflight fails fast when the walk root is missing or not a
@@ -132,11 +313,6 @@ func NewServer(db store.Store, embedder embed.EmbedderBackend, batchSize int, mo
 	registerTools(srv, db, embedder, batchSize, modelID)
 	return srv
 }
-
-// workspaceRoot is the canonical workspace mount point declared by the image
-// (VOLUME /workspaces). File walks and future git clones target this path
-// regardless of host-side origin.
-const workspaceRoot = "/workspaces"
 
 // modelWarning returns a warning string if the model's data is dirty or
 // missing. Returns "" if everything is fine. Never blocks tool execution.
@@ -206,16 +382,16 @@ Rules:
 			projectID = "default"
 		}
 
-		cwd := args.CWD
-		if cwd == "" {
-			cwd = workspaceRoot
+		cwd := normalizePath(args.CWD)
+		var err error
+		if cwd != "" {
+			cwd, err = remapRoot(cwd)
+			if err != nil {
+				return errorResult(err), OnboardOutput{}, nil
+			}
 		}
-		cwd = normalizePath(cwd)
-		walkCwd, err := remapRoot(cwd)
+		walkCwd, err := repositoryRoot(cwd, args.RepositoryURL)
 		if err != nil {
-			return errorResult(err), OnboardOutput{}, nil
-		}
-		if err := walkRootPreflight(walkCwd); err != nil {
 			return errorResult(err), OnboardOutput{}, nil
 		}
 
@@ -705,16 +881,16 @@ Rules:
 		Description: "Ingest a project directory into memory. Auto-detects adapters (codeast, docwalk, gitrepo, obsidian, markdown-glob), walks files, chunks, embeds, and returns a job_id for polling via job_status.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args IngestInput) (*mcp.CallToolResult, IngestOutput, error) {
 		projectID := args.ProjectID
-		cwd := args.CWD
-		if cwd == "" {
-			cwd = workspaceRoot
+		cwd := normalizePath(args.CWD)
+		var err error
+		if cwd != "" {
+			cwd, err = remapRoot(cwd)
+			if err != nil {
+				return errorResult(err), IngestOutput{}, nil
+			}
 		}
-		cwd = normalizePath(cwd)
-		walkCwd, err := remapRoot(cwd)
+		walkCwd, err := repositoryRoot(cwd, args.RepositoryURL)
 		if err != nil {
-			return errorResult(err), IngestOutput{}, nil
-		}
-		if err := walkRootPreflight(walkCwd); err != nil {
 			return errorResult(err), IngestOutput{}, nil
 		}
 

@@ -293,6 +293,10 @@ type Store interface {
 	// GetTopNodesByImportance returns the top-N nodes for a project ordered by importance DESC.
 	GetTopNodesByImportance(ctx context.Context, projectID string, limit int) ([]Node, error)
 
+	// GetNodesByCrossProjectEdges returns nodes of projectID that are endpoints
+	// of edges touching otherProject, ordered by importance DESC.
+	GetNodesByCrossProjectEdges(ctx context.Context, projectID, otherProject string, limit int) ([]Node, error)
+
 	// GetNodeEmbeddings returns embeddings for the given node IDs.
 	GetNodeEmbeddings(ctx context.Context, nodeIDs []string) (map[string][]float32, error)
 
