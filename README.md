@@ -312,6 +312,13 @@ curl -X POST localhost:8080/ingest \
 ingest project_id=my-project cwd=/path/to/docs ref=main
 ```
 
+### Path resolution (Docker vs native)
+
+Paths handed to `ingest`/`onboard` are resolved the same way in both modes:
+
+- **Native (bare binary):** the given path is used as-is.
+- **Docker:** the container mounts a host workspace at `/workspaces`. Set `HOST_WORKSPACE_DIR` to the mounted host directory (e.g. `/home/user/Workspace` or `D:/Kerja`), then send host paths — the server remaps them to `/workspaces/...` for walking. This is required because the client and server live on different filesystems: without it the server can't translate the paths you pass, so they fail or walk nothing. Paths outside the prefix fail fast with a clear error; Windows backslashes and drive-letter case are handled. Stored paths stay relative, so host origin naming is preserved. See [DEPLOYMENT.md#workspace-paths-docker](./DEPLOYMENT.md#workspace-paths-docker).
+
 `.memoryrc.yaml` example (optional, only needed for typed cross-linking):
 
 ```yaml
