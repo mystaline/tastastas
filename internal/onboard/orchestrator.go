@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -626,6 +627,31 @@ func truncateText(s string, n int) string {
 	return string(runes[:n]) + ".."
 }
 
+// sortedKeys iterates a map[string][]T in sorted key order, yielding
+// (key, members) pairs. Used to make cluster ID assignment (and any
+// downstream map-iteration-derived output) deterministic across runs.
+func sortedKeys(m map[string][]string) []struct {
+	key     string
+	members []string
+} {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]struct {
+		key     string
+		members []string
+	}, 0, len(m))
+	for _, k := range keys {
+		out = append(out, struct {
+			key     string
+			members []string
+		}{k, m[k]})
+	}
+	return out
+}
+
 func InferConventions(ctx context.Context, db store.Store, projectID string, nodes []store.Node) []store.Node {
 	// Collect code:function and code:type nodes
 	type codeSym struct {
@@ -661,7 +687,8 @@ func InferConventions(ctx context.Context, db store.Store, projectID string, nod
 		key := fmt.Sprintf("%s/%s", f.pkg, p)
 		prefixes[key] = append(prefixes[key], f.node.ID)
 	}
-	for key, members := range prefixes {
+	for _, entry := range sortedKeys(prefixes) {
+		key, members := entry.key, entry.members
 		if len(members) < 2 {
 			continue
 		}
@@ -711,7 +738,8 @@ func InferConventions(ctx context.Context, db store.Store, projectID string, nod
 		key := f.pkg + "." + recv
 		recvGroups[key] = append(recvGroups[key], f.node.ID)
 	}
-	for key, members := range recvGroups {
+	for _, entry := range sortedKeys(recvGroups) {
+		key, members := entry.key, entry.members
 		if len(members) < 2 {
 			continue
 		}

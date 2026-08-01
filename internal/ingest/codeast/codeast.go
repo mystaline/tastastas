@@ -69,7 +69,18 @@ func (c *CodeastIngestor) IngestWithCalls(
 		case "go":
 			nodes, edges, err := c.ingestGo()
 			if err != nil {
-				langErrs = append(langErrs, fmt.Sprintf("go: %v", err))
+				// go/packages.Load unavailable (no go toolchain, private
+				// modules unreachable) — degrade to tree-sitter like
+				// TS/Python/Rust: name-matched calls, no type-checking.
+				log.Printf("codeast: go/packages.Load failed (%v) — falling back to tree-sitter", err)
+				tsNodes, tsEdges, tsCalls, tsErr := c.ingestTreeSitterWithCalls("go")
+				if tsErr != nil {
+					langErrs = append(langErrs, fmt.Sprintf("go: %v; tree-sitter fallback: %v", err, tsErr))
+					continue
+				}
+				allNodes = append(allNodes, tsNodes...)
+				allEdges = append(allEdges, tsEdges...)
+				allRawCalls = append(allRawCalls, tsCalls...)
 				continue
 			}
 
