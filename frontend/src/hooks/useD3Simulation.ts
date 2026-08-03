@@ -39,7 +39,16 @@ export function useD3Simulation(
   const angleStep = useMemo(() => computeAngleStep(groupNames), [groupNames])
 
   const simNodes: SimNode[] = useMemo(
-    () => nodes.map(n => ({ ...n, x: 0, y: 0, vx: 0, vy: 0, fx: null, fy: null })),
+    // Seed with a small deterministic spread, not a literal (0,0) stack —
+    // forceManyBody has no defined repulsion direction for coincident
+    // points, so a full-energy restart (alpha 1) blows a perfect stack
+    // outward without bound instead of settling into clusters.
+    () => nodes.map((n, i) => ({
+      ...n,
+      x: Math.cos(i) * 10,
+      y: Math.sin(i) * 10,
+      vx: 0, vy: 0, fx: null, fy: null,
+    })),
     [nodes],
   )
   nodesRef.current = simNodes
@@ -98,8 +107,8 @@ export function useD3Simulation(
         computeOrbitalTarget(d, rootId, groupNames, angleStep, centerX, centerY, orbitalRadius, counters, satelliteProjectIds).y
       ).strength(d => d.id === rootId ? 0.6 : d.project_id === primaryProjectId ? 0.04 : 0.18))
       .force('collide', d3.forceCollide<SimNode>(d => nodeR(d, rootId) + 10).strength(1))
-      .alphaDecay(0.015)
-      .alphaMin(0.01)
+      .alphaDecay(0.005)
+      .alphaMin(0.005)
 
     simRef.current = sim
 

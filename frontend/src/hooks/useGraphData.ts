@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import type { GraphData } from '../types/graph'
+import { getProjectFromPath } from '../utils/route'
 
 export interface UseGraphDataResult {
   loading: boolean
@@ -17,10 +18,7 @@ export function useGraphData(): UseGraphDataResult {
   const [linkedProjects, setLinkedProjects] = useState<string[]>([])
   const [selectedSidecars, setSelectedSidecars] = useState<string[]>([])
 
-  const project = (() => {
-    const m = window.location.pathname.match(/\/graph\/([^/]+)/)
-    return m ? m[1] : null
-  })()
+  const project = getProjectFromPath()
 
   const stage = new URLSearchParams(window.location.search).get('stage')
 

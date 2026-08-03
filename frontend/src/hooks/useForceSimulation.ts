@@ -272,7 +272,7 @@ export function useForceSimulation(data: GraphData): UseForceSimulationResult {
         batchRef.current.updatePositions(proposedSelectionRef.current, nodeIndex)
     })
 
-    sim.alpha(0.02).restart()
+    sim.alpha(1).restart()
     sim.on('end', () => sim.stop())
 
     const afterInject = () => {

@@ -7,6 +7,8 @@ import { Tooltip } from './components/Tooltip'
 import { Stats } from './components/Stats'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { LoadingSkeleton } from './components/LoadingSkeleton'
+import { Dashboard } from './components/Dashboard'
+import { getProjectFromPath } from './utils/route'
 import type { GraphData } from './types/graph'
 
 function scopeLabel(projectID: string): string {
@@ -15,6 +17,7 @@ function scopeLabel(projectID: string): string {
 }
 
 export function App() {
+  const project = getProjectFromPath()
   const { loading, error, data, linkedProjects, selectedSidecars, toggleSidecar } = useGraphData()
 
   useEffect(() => {
@@ -23,13 +26,14 @@ export function App() {
 
   return (
     <ErrorBoundary>
-      {loading && <LoadingSkeleton />}
-      {error && (
+      {!project && <Dashboard />}
+      {project && loading && <LoadingSkeleton />}
+      {project && error && (
         <div className="flex items-center justify-center h-screen bg-slate-950 text-red-400">
           Error: {error}
         </div>
       )}
-      {data && (
+      {project && data && (
         <GraphView
           data={data}
           linkedProjects={linkedProjects}
@@ -53,6 +57,12 @@ function GraphView({ data, linkedProjects, selectedSidecars, onToggleSidecar }: 
 
   return (
     <>
+      <a
+        href="/graph/"
+        className="fixed top-3 left-3 z-50 text-xs text-slate-300 bg-slate-900/80 border border-slate-700 rounded px-2 py-1 hover:bg-slate-800"
+      >
+        ← Dashboard
+      </a>
       <GraphCanvas
         svgRef={sim.svgRef}
         onResize={sim.handleResize}
