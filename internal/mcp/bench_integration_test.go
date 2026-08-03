@@ -39,7 +39,6 @@ func TestIntegrationBench(t *testing.T) {
 		result, err := onboard.Run(ctx, onboard.Config{
 			CWD:       "/home/user/projects/tastastas",
 			ProjectID: "tastastas",
-			Scope:     "subtree",
 			Embedder:  embedder,
 			Store:     db,
 		})
@@ -60,7 +59,6 @@ func TestIntegrationBench(t *testing.T) {
 		result, err := onboard.Run(ctx, onboard.Config{
 			CWD:       "/home/user/projects/project-alpha-gofiber",
 			ProjectID: "project-alpha",
-			Scope:     "subtree",
 			Embedder:  embedder,
 			Store:     db,
 		})
@@ -80,7 +78,6 @@ func TestIntegrationBench(t *testing.T) {
 		result, err := onboard.Run(ctx, onboard.Config{
 			CWD:       "/home/user/projects/project-beta-react",
 			ProjectID: "project-beta",
-			Scope:     "subtree",
 			Embedder:  embedder,
 			Store:     db,
 		})

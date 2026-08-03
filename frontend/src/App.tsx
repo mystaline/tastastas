@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { useGraphData } from './hooks/useGraphData'
 import { useForceSimulation, SIM_DEFAULTS } from './hooks/useForceSimulation'
 import { GraphCanvas } from './components/GraphCanvas'
@@ -8,8 +9,17 @@ import { ErrorBoundary } from './components/ErrorBoundary'
 import { LoadingSkeleton } from './components/LoadingSkeleton'
 import type { GraphData } from './types/graph'
 
+function scopeLabel(projectID: string): string {
+  const stage = new URLSearchParams(window.location.search).get('stage')
+  return stage ? `${projectID} / ${stage}` : projectID
+}
+
 export function App() {
   const { loading, error, data, linkedProjects, selectedSidecars, toggleSidecar } = useGraphData()
+
+  useEffect(() => {
+    if (data) document.title = `Tastastas Graph — ${scopeLabel(data.project_id)}`
+  }, [data])
 
   return (
     <ErrorBoundary>

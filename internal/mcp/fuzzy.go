@@ -1,53 +1,68 @@
 package mcp
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/mystaline/tastastas/internal/store"
 )
 
-// fuzzyMatchProjects returns project_ids from projects that fuzzy-match the query.
-// Matching: case-insensitive substring containment (both directions) or edit distance ≤ 2.
-// Results are sorted: substring matches first, then by edit distance ascending.
-func fuzzyMatchProjects(query string, projects []store.ProjectInfo) []string {
+// fuzzyMatchProjects returns projects that fuzzy-match the query.
+// Matching: case-insensitive substring containment (both directions) or edit
+// distance ≤ 2, tested against base ProjectID, decoded Stage, and
+// EffectiveProjectID — keeping the best (lowest) score per project.
+// Results are sorted: substring matches first, then by edit distance
+// ascending; ties broken by EffectiveProjectID for stability.
+func fuzzyMatchProjects(query string, projects []store.ProjectInfo) []store.ProjectInfo {
 	if query == "" {
 		return nil
 	}
 	type candidate struct {
-		id   string
-		dist int
+		info     store.ProjectInfo
+		isSubstr bool
+		dist     int
 	}
-	var subs, dists []candidate
 	q := strings.ToLower(query)
+	var candidates []candidate
 
 	for _, p := range projects {
-		id := p.ProjectID
-		low := strings.ToLower(id)
-		if strings.Contains(low, q) || strings.Contains(q, low) {
-			subs = append(subs, candidate{id: id, dist: 0})
-			continue
-		}
-		d := editDistance(q, low)
-		if d <= 2 {
-			dists = append(dists, candidate{id: id, dist: d})
-		}
-	}
-
-	// Sort dists by edit distance ascending
-	for i := 0; i < len(dists); i++ {
-		for j := i + 1; j < len(dists); j++ {
-			if dists[j].dist < dists[i].dist {
-				dists[i], dists[j] = dists[j], dists[i]
+		fields := []string{p.ProjectID, p.ProjectName, p.Stage, p.EffectiveProjectID}
+		bestSubstr := false
+		bestDist := -1
+		for _, f := range fields {
+			if f == "" {
+				continue
+			}
+			low := strings.ToLower(f)
+			if strings.Contains(low, q) || strings.Contains(q, low) {
+				bestSubstr = true
+				bestDist = 0
+				break
+			}
+			d := editDistance(q, low)
+			if d <= 2 && (bestDist == -1 || d < bestDist) {
+				bestDist = d
 			}
 		}
+		if bestSubstr || bestDist >= 0 {
+			candidates = append(candidates, candidate{info: p, isSubstr: bestSubstr, dist: bestDist})
+		}
 	}
 
-	result := make([]string, 0, len(subs)+len(dists))
-	for _, c := range subs {
-		result = append(result, c.id)
-	}
-	for _, c := range dists {
-		result = append(result, c.id)
+	sort.SliceStable(candidates, func(i, j int) bool {
+		ci, cj := candidates[i], candidates[j]
+		if ci.isSubstr != cj.isSubstr {
+			return ci.isSubstr
+		}
+		if ci.dist != cj.dist {
+			return ci.dist < cj.dist
+		}
+		return ci.info.EffectiveProjectID < cj.info.EffectiveProjectID
+	})
+
+	result := make([]store.ProjectInfo, 0, len(candidates))
+	for _, c := range candidates {
+		result = append(result, c.info)
 	}
 	return result
 }

@@ -22,6 +22,8 @@ export function useGraphData(): UseGraphDataResult {
     return m ? m[1] : null
   })()
 
+  const stage = new URLSearchParams(window.location.search).get('stage')
+
   useEffect(() => {
     if (!project) {
       setError('Invalid graph URL')
@@ -30,7 +32,8 @@ export function useGraphData(): UseGraphDataResult {
     }
     const controller = new AbortController()
     const signal = controller.signal
-    fetch(`/api/graph/${project}/linked`, {
+    const stageParam = stage ? `?stage=${encodeURIComponent(stage)}` : ''
+    fetch(`/api/graph/${project}/linked${stageParam}`, {
       signal,
       headers: { Accept: 'application/json' },
     })
@@ -40,7 +43,7 @@ export function useGraphData(): UseGraphDataResult {
       })
       .catch(() => {})
     return () => controller.abort()
-  }, [project])
+  }, [project, stage])
 
   useEffect(() => {
     if (!project) return

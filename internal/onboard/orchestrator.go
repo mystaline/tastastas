@@ -42,7 +42,6 @@ type ModuleEntry struct {
 type Config struct {
 	CWD       string
 	ProjectID string
-	Scope     string // "cwd" or "subtree"
 	ModelID   string // current embedding model ID
 	Embedder  embed.EmbedderBackend
 	Store     store.Store // injected from caller, not opened internally
@@ -92,10 +91,6 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	if cfg.ProjectID == "" {
 		cfg.ProjectID = "default"
 	}
-	if cfg.Scope == "" {
-		cfg.Scope = "subtree"
-	}
-
 	db := cfg.Store
 
 	var success bool

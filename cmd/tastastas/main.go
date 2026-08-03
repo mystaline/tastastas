@@ -111,6 +111,23 @@ func ensureDBDir(path string) {
 	_ = os.MkdirAll(dir, 0o755)
 }
 
+// defaultWorkspaceRoot returns $SERVER_WORKSPACE_ROOT if set (never created —
+// an explicit path that's missing is a misconfiguration and must error, not
+// be silently created). If unset, returns a home-based default
+// (~/tastastas/workspaces) for the caller to create. Returns "" if the env
+// is unset and the home directory can't be determined — no relative-path
+// guessing.
+func defaultWorkspaceRoot() string {
+	if v := os.Getenv("SERVER_WORKSPACE_ROOT"); v != "" {
+		return v
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, "tastastas", "workspaces")
+}
+
 func isRemoteDSN(dsn string) bool {
 	return strings.HasPrefix(dsn, "libsql://") || strings.HasPrefix(dsn, "http://") ||
 		strings.HasPrefix(dsn, "https://")
@@ -258,6 +275,21 @@ func main() {
 	// Ensure DB directory exists (for local SQLite, not remote DSN).
 	if !isRemoteDSN(*dbPath) {
 		ensureDBDir(*dbPath)
+	}
+
+	// SERVER_WORKSPACE_ROOT: raw-binary on-prem parity with docker-compose.
+	// Env set explicitly but missing on disk stays an error (surfaced later
+	// by buildRepositoryIndex's stat) — only the unset case gets a default
+	// created here, matching defaultDBPath/ensureDBDir precedent.
+	if os.Getenv("SERVER_WORKSPACE_ROOT") == "" {
+		if root := defaultWorkspaceRoot(); root != "" {
+			if err := os.MkdirAll(root, 0o755); err != nil {
+				log.Printf("warning: could not create default SERVER_WORKSPACE_ROOT %s: %v", root, err)
+			} else {
+				os.Setenv("SERVER_WORKSPACE_ROOT", root)
+				log.Printf("SERVER_WORKSPACE_ROOT unset — using default %s", root)
+			}
+		}
 	}
 
 	// Auto-detect embed dim when not explicitly set (0 = default).
