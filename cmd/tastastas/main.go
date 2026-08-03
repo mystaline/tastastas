@@ -375,6 +375,8 @@ func main() {
 		mux.HandleFunc("GET /graph/{project}/linked", mcpserver.HandleLinkedProjects(db))
 		mux.HandleFunc("GET /api/graph/{project}/linked", mcpserver.HandleLinkedProjects(db))
 		mux.HandleFunc("GET /graph/{project}/", mcpserver.HandleGraphSPA(*spaDir))
+		mux.HandleFunc("GET /graph/", mcpserver.HandleGraphSPA(*spaDir))
+		mux.HandleFunc("GET /api/projects", mcpserver.HandleListProjects(db))
 		graphServer := &http.Server{Addr: *graphAddr, Handler: mux}
 		go func() {
 			log.Printf("graph server listening on %s", *graphAddr)

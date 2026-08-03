@@ -56,6 +56,8 @@ func ServeHTTP(
 	mux.HandleFunc("GET /graph/{project}/linked", HandleLinkedProjects(db))
 	mux.HandleFunc("GET /api/graph/{project}/linked", HandleLinkedProjects(db))
 	mux.HandleFunc("GET /graph/{project}/", HandleGraphSPA(spaDir))
+	mux.HandleFunc("GET /graph/", HandleGraphSPA(spaDir))
+	mux.HandleFunc("GET /api/projects", HandleListProjects(db))
 
 	// REST ingest — POST /ingest auto-detects adapters, same pipeline as MCP ingest tool.
 	mux.HandleFunc("POST /ingest", handleRESTIngest(db, embedder, jobs, batchSize, modelID))
@@ -293,7 +295,7 @@ func HandleGraphData(db store.Store) http.HandlerFunc {
 		{
 			filtered := structuralEdges[:0]
 			for _, e := range structuralEdges {
-				sp, tp := sidecarProjectID(e.Source), sidecarProjectID(e.Target)
+				sp, tp := nodeMap[e.Source].projectID, nodeMap[e.Target].projectID
 				if sp != projectID && !sidecars[sp] {
 					continue
 				}
@@ -413,6 +415,22 @@ func HandleLinkedProjects(db store.Store) http.HandlerFunc {
 	}
 }
 
+// HandleListProjects returns all known projects with per-stage stats, for
+// the graph dashboard's project picker.
+func HandleListProjects(db store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		projects, err := db.ListProjects(r.Context())
+		if err != nil {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(struct {
+			Projects []store.ProjectInfo `json:"projects"`
+		}{Projects: projects})
+	}
+}
+
 func HandleGraphSPA(spaDir string) http.HandlerFunc {
 	readFile := func(path string) ([]byte, error) {
 		if spaDir != "" {
@@ -422,6 +440,18 @@ func HandleGraphSPA(spaDir string) http.HandlerFunc {
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Bare dashboard path — no project segment.
+		if r.URL.Path == "/graph/" || r.URL.Path == "/graph" {
+			w.Header().Set("Cache-Control", "no-cache")
+			data, err := readFile("index.html")
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			http.ServeContent(w, r, "index.html", time.Time{}, bytes.NewReader(data))
+			return
+		}
+
 		projectID := r.PathValue("project")
 		if projectID == "" {
 			projectID = "default"
