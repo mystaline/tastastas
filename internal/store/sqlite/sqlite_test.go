@@ -268,3 +268,41 @@ func TestMarkStaleDownstream(t *testing.T) {
 		t.Errorf("expected unrelated.status to remain current, got %q", unrelated.Status)
 	}
 }
+
+func TestUpsertProject(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+
+	const pid = "gitea.example/Org/repo"
+	if err := s.UpsertNode(ctx, store.Node{ID: pid + "/a", ProjectID: pid, NodeType: "generic-doc", Content: "x"}); err != nil {
+		t.Fatalf("UpsertNode: %v", err)
+	}
+
+	if err := s.UpsertProject(ctx, pid, "repo", "gitea.example/Org/repo"); err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
+	if err := s.UpsertProject(ctx, pid, "renamed", "gitea.example/Org/repo"); err != nil {
+		t.Fatalf("UpsertProject (update): %v", err)
+	}
+
+	projects, err := s.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("ListProjects: %v", err)
+	}
+	count := 0
+	for _, p := range projects {
+		if p.ProjectID != pid {
+			continue
+		}
+		count++
+		if p.ProjectName != "renamed" {
+			t.Errorf("ProjectName = %q, want %q (last upsert wins)", p.ProjectName, "renamed")
+		}
+		if p.RepositoryURL != "gitea.example/Org/repo" {
+			t.Errorf("RepositoryURL = %q, want gitea.example/Org/repo", p.RepositoryURL)
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly one row for %q, got %d: %+v", pid, count, projects)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/mystaline/tastastas/internal/ingest/codeast/treesitter"
+	"github.com/mystaline/tastastas/internal/scope"
 	"github.com/mystaline/tastastas/internal/store"
 )
 
@@ -281,6 +282,8 @@ func CrossProjectLink(
 		return nil, err
 	}
 
+	myBase, myStage, myStaged, _ := scope.Decode(newProjectID)
+
 	// Collect label indices for all other projects
 	type projectIndex struct {
 		id   string
@@ -293,6 +296,12 @@ func CrossProjectLink(
 	for _, otherID := range projectIDs {
 		if otherID == newProjectID {
 			continue
+		}
+		if myStaged {
+			otherBase, otherStage, _, _ := scope.Decode(otherID)
+			if otherStage != myStage || otherBase == myBase {
+				continue
+			}
 		}
 		nodes, err := db.GetTopNodesByImportance(ctx, otherID, crossProjectSampleSize)
 		if err != nil {

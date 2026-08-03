@@ -285,6 +285,10 @@ type Store interface {
 	ClearProject(ctx context.Context, projectID, modelID string) (ClearProjectResult, error)
 	ListProjects(ctx context.Context) ([]ProjectInfo, error)
 
+	// UpsertProject records the human-readable name and remote URL for a base
+	// (unstaged) project ID. Idempotent.
+	UpsertProject(ctx context.Context, projectID, projectName, repositoryURL string) error
+
 	ListEmbedModels(ctx context.Context, projectID string) ([]ModelInfo, error)
 
 	// ListProjectIDs returns all known project IDs.
@@ -340,7 +344,11 @@ type ClearProjectResult struct {
 }
 
 type ProjectInfo struct {
-	ProjectID string `json:"project_id"`
-	NodeCount int    `json:"node_count"`
-	EdgeCount int    `json:"edge_count"`
+	ProjectID          string `json:"project_id"`
+	ProjectName        string `json:"project_name,omitempty"`
+	RepositoryURL      string `json:"repository_url,omitempty"`
+	Stage              string `json:"stage,omitempty"`
+	EffectiveProjectID string `json:"effective_project_id,omitempty"`
+	NodeCount          int    `json:"node_count"`
+	EdgeCount          int    `json:"edge_count"`
 }
