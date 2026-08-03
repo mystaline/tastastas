@@ -46,6 +46,8 @@ go run ./cmd/tastastas --serve :8080 --db ~/.local/share/tastastas/memory.db
 
 Minimum for a PR: your code `go test ./...` passes and `gofmt -l` is clean on the files you touched.
 
+**Flags vs env:** most flags are also settable via env (`TASTASTAS_DB`, `TASTASTAS_OPENAI_KEY`, `TASTASTAS_SPA_DIR`, `TASTASTAS_AUTH_TOKEN`); explicit flag wins. `SERVER_WORKSPACE_ROOT` is env-only. See [DEPLOYMENT.md#env-variables](./DEPLOYMENT.md#env-variables).
+
 ## House rules
 
 - **Conventional commits.** `feat(scope): ...`, `fix(scope): ...`, `chore: ...`. Short subject, imperative ("add", "fix"), no "added". Bullets with `- label:` when a body is needed.
@@ -53,7 +55,7 @@ Minimum for a PR: your code `go test ./...` passes and `gofmt -l` is clean on th
 - **No new dependencies for what a few lines can do.** Stdlib first. If a dep is genuinely needed, say why in the PR.
 - **Tests go with the change.** Non-trivial logic ships with a test (table-driven is the house style, see `internal/onboard/*_test.go`).
 - **Determinism matters.** Never rely on Go map iteration order in anything that produces node IDs or edges — sort keys first (`internal/onboard/orchestrator.go` has a `sortedKeys` helper to copy).
-- **Don't break the Docker story.** See below — the container is `read_only` + tmpfs, code ingestion needs Go, and paths get remapped. Read the section before touching Docker/build files.
+- **Don't break the Docker story.** See below — the container is `read_only` + tmpfs, code ingestion needs Go, and repo paths resolve via `SERVER_WORKSPACE_ROOT`/`repository_url`. Read the section before touching Docker/build files.
 
 ## Common tasks → where to look
 
@@ -68,7 +70,7 @@ Minimum for a PR: your code `go test ./...` passes and `gofmt -l` is clean on th
 
 ## Docker: the 3 things that will bite you
 
-1. **`HOST_WORKSPACE_DIR`** — the container mounts your host workspace at `/workspaces`. Set `HOST_WORKSPACE_DIR=/your/host/workspace` in `.env`, then ingest paths are auto-remapped (client sends host paths, server walks `/workspaces/...`). Empty → no remap → host paths fail inside the container. Details: [DEPLOYMENT.md#workspace-paths-docker](./DEPLOYMENT.md#workspace-paths-docker).
+1. **Workspace paths** — `SERVER_WORKSPACE_ROOT` is the directory visible to tastastas. Docker defaults to `/workspaces`. The server never maps client host paths (multi-user, different local dirs); remote clients pass `repository_url` so the server resolves the canonical repo under `SERVER_WORKSPACE_ROOT`. Details: [DEPLOYMENT.md#workspace-paths](./DEPLOYMENT.md#workspace-paths).
 2. **`read_only: true` + `tmpfs: /tmp`** — only `/tmp` is writable. The Go module cache is baked into the image and copied to `/tmp` at start by `docker-entrypoint.sh`. Don't "fix" this by making the FS writable or removing tmpfs — it's a deliberate security posture (see discussion in commit history).
 3. **Go ingestion needs `go` + modules.** `packages.Load` (type-checked calls, import edges) needs the Go toolchain (baked in) and module resolution. Private modules (e.g. `gitea.tagsamurai.local`) need `GOPRIVATE` + git credentials; without them it falls back to tree-sitter (name-matched, fewer edges, still useful). Both paths are intentional.
 

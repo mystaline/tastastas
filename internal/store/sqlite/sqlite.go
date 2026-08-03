@@ -17,6 +17,7 @@ import (
 
 	"github.com/mystaline/mig/pkg/database"
 	"github.com/mystaline/mig/pkg/migrator"
+	"github.com/mystaline/tastastas/internal/scope"
 	"github.com/mystaline/tastastas/internal/store"
 )
 
@@ -65,7 +66,7 @@ func (s *Store) initSchema(ctx context.Context) error {
 	// won't add missing columns, so we check and fix here.
 	var hasCol int
 	_ = s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM pragma_table_info WHERE name = 'chunks' AND name = 'source_adapter'`).Scan(&hasCol)
+		`SELECT COUNT(*) FROM pragma_table_info('chunks') WHERE name = 'source_adapter'`).Scan(&hasCol)
 	if hasCol == 0 {
 		_, _ = s.db.ExecContext(ctx,
 			`ALTER TABLE chunks ADD COLUMN source_adapter TEXT NOT NULL DEFAULT ''`)
@@ -438,9 +439,61 @@ func (s *Store) UpsertNode(ctx context.Context, n store.Node) error {
 	return nil
 }
 
+// loadEndpointProjects returns node ID -> project_id for the given IDs.
+// Missing nodes are simply absent from the map (treated as unscoped).
+func loadEndpointProjects(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, ids []string) (map[string]string, error) {
+	result := make(map[string]string, len(ids))
+	if len(ids) == 0 {
+		return result, nil
+	}
+	const chunkSize = 900
+	for i := 0; i < len(ids); i += chunkSize {
+		end := i + chunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[i:end]
+		placeholders := make([]string, len(chunk))
+		args := make([]any, len(chunk))
+		for j, id := range chunk {
+			placeholders[j] = "?"
+			args[j] = id
+		}
+		rows, err := q.QueryContext(ctx,
+			fmt.Sprintf(`SELECT id, project_id FROM nodes WHERE id IN (%s)`, strings.Join(placeholders, ",")),
+			args...)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite: load endpoint projects: %w", err)
+		}
+		for rows.Next() {
+			var id, projectID string
+			if err := rows.Scan(&id, &projectID); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("sqlite: scan endpoint project: %w", err)
+			}
+			result[id] = projectID
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("sqlite: load endpoint projects rows: %w", err)
+		}
+		rows.Close()
+	}
+	return result, nil
+}
+
 func (s *Store) UpsertEdge(ctx context.Context, e store.Edge) error {
 	if e.FromID == "" || e.ToID == "" || e.EdgeType == "" {
 		return errors.New("sqlite: edge requires from_id, to_id, edge_type")
+	}
+	endpointProjects, err := loadEndpointProjects(ctx, s.db, []string{e.FromID, e.ToID})
+	if err != nil {
+		return err
+	}
+	if !scope.EdgeAllowed(endpointProjects[e.FromID], endpointProjects[e.ToID]) {
+		return fmt.Errorf("sqlite: edge %s->%s(%s): stage mismatch", e.FromID, e.ToID, e.EdgeType)
 	}
 	if e.Confidence == 0 {
 		e.Confidence = 1.0
@@ -452,7 +505,7 @@ func (s *Store) UpsertEdge(ctx context.Context, e store.Edge) error {
 	if e.Bidirectional {
 		bidir = 1
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO edges (from_id, to_id, edge_type, confidence, confidence_tier, bidirectional)
 		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(from_id, to_id, edge_type) DO UPDATE SET
@@ -474,6 +527,26 @@ func (s *Store) UpsertEdges(ctx context.Context, edges []store.Edge) error {
 	if len(edges) == 0 {
 		return nil
 	}
+	for _, e := range edges {
+		if e.FromID == "" || e.ToID == "" || e.EdgeType == "" {
+			return errors.New("sqlite: edge requires from_id, to_id, edge_type")
+		}
+	}
+
+	idSet := make(map[string]struct{}, len(edges)*2)
+	for _, e := range edges {
+		idSet[e.FromID] = struct{}{}
+		idSet[e.ToID] = struct{}{}
+	}
+	ids := make([]string, 0, len(idSet))
+	for id := range idSet {
+		ids = append(ids, id)
+	}
+	endpointProjects, err := loadEndpointProjects(ctx, s.db, ids)
+	if err != nil {
+		return err
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("sqlite: begin edge upsert tx: %w", err)
@@ -482,6 +555,7 @@ func (s *Store) UpsertEdges(ctx context.Context, edges []store.Edge) error {
 		_ = tx.Rollback()
 	}()
 
+	skipped := 0
 	for i := 0; i < len(edges); i += upsertEdgeBatch {
 		end := i + upsertEdgeBatch
 		if end > len(edges) {
@@ -492,8 +566,9 @@ func (s *Store) UpsertEdges(ctx context.Context, edges []store.Edge) error {
 		var valStrings []string
 		var args []any
 		for _, e := range batch {
-			if e.FromID == "" || e.ToID == "" || e.EdgeType == "" {
-				return errors.New("sqlite: edge requires from_id, to_id, edge_type")
+			if !scope.EdgeAllowed(endpointProjects[e.FromID], endpointProjects[e.ToID]) {
+				skipped++
+				continue
 			}
 			if e.Confidence == 0 {
 				e.Confidence = 1.0
@@ -508,6 +583,9 @@ func (s *Store) UpsertEdges(ctx context.Context, edges []store.Edge) error {
 			}
 			valStrings = append(valStrings, "(?,?,?,?,?,?)")
 			args = append(args, e.FromID, e.ToID, e.EdgeType, e.Confidence, tier, bidir)
+		}
+		if len(valStrings) == 0 {
+			continue
 		}
 		_, err = tx.ExecContext(ctx,
 			fmt.Sprintf(`
@@ -529,7 +607,13 @@ func (s *Store) UpsertEdges(ctx context.Context, edges []store.Edge) error {
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if skipped > 0 {
+		log.Printf("sqlite: skipped %d stage-mismatched edges", skipped)
+	}
+	return nil
 }
 
 func (s *Store) DeleteNode(ctx context.Context, id string) error {
@@ -1007,13 +1091,15 @@ func (s *Store) neighborsBFS(
 
 	typeFilter, args := buildEdgeTypeFilter(edgeTypes)
 
+	edgeScopeFilter := scope.EdgeFilterSQL("fn", "tn")
+
 	for d := 0; d < depth && len(frontier) > 0; d++ {
 		var next []string
 		for _, fromID := range frontier {
-			edgeCols := "from_id, to_id, edge_type, confidence, confidence_tier, bidirectional"
-			q := `SELECT ` + edgeCols + ` FROM edges WHERE from_id = ?` + typeFilter + `
+			edgeCols := "e.from_id, e.to_id, e.edge_type, e.confidence, e.confidence_tier, e.bidirectional"
+			q := `SELECT ` + edgeCols + ` FROM edges e LEFT JOIN nodes fn ON fn.id = e.from_id LEFT JOIN nodes tn ON tn.id = e.to_id WHERE e.from_id = ?` + typeFilter + ` AND ` + edgeScopeFilter + `
 UNION ALL
-SELECT to_id, from_id, edge_type, confidence, confidence_tier, bidirectional FROM edges WHERE to_id = ? AND bidirectional = 1` + typeFilter
+SELECT e.to_id, e.from_id, e.edge_type, e.confidence, e.confidence_tier, e.bidirectional FROM edges e LEFT JOIN nodes fn ON fn.id = e.from_id LEFT JOIN nodes tn ON tn.id = e.to_id WHERE e.to_id = ? AND e.bidirectional = 1` + typeFilter + ` AND ` + edgeScopeFilter
 			queryArgs := make([]any, 0, 2+2*len(edgeTypes))
 			queryArgs = append(queryArgs, fromID)
 			queryArgs = append(queryArgs, args...)
@@ -1240,7 +1326,7 @@ func buildEdgeTypeFilter(edgeTypes []string) (string, []any) {
 	if len(edgeTypes) == 0 {
 		return "", nil
 	}
-	clause := " AND edge_type IN ("
+	clause := " AND e.edge_type IN ("
 	args := make([]any, len(edgeTypes))
 	for i, t := range edgeTypes {
 		if i > 0 {
@@ -1260,7 +1346,15 @@ func (s *Store) ListNodesByType(
 	limit, offset int,
 ) ([]store.Node, error) {
 	if len(types) == 0 {
-		return nil, nil
+		// nil/empty types = all node types
+		q := `SELECT id, project_id, node_type, title, content, content_hash, status, source_adapter, source_path, importance, language, created_at, updated_at
+		FROM nodes WHERE project_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`
+		rows, err := s.db.QueryContext(ctx, q, projectID, limit, offset)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		return scanNodeRows(rows)
 	}
 
 	placeholders := make([]string, len(types))
@@ -1285,7 +1379,10 @@ func (s *Store) ListNodesByType(
 	}
 
 	defer rows.Close()
+	return scanNodeRows(rows)
+}
 
+func scanNodeRows(rows *sql.Rows) ([]store.Node, error) {
 	var out []store.Node
 	for rows.Next() {
 		var n store.Node
@@ -1340,13 +1437,19 @@ func (s *Store) ListEdgesByProject(
 	limit, offset int,
 ) ([]store.EdgeResult, int, error) {
 	// Use COUNT(*) OVER() windowed to get total count in same query.
-	q := `SELECT e.from_id, fn.title, fn.node_type, LENGTH(fn.content), e.to_id, tn.title, tn.node_type, LENGTH(tn.content), e.edge_type, e.confidence, e.confidence_tier,
+	// Match edges where EITHER endpoint belongs to the project so
+	// cross-project edges (auto-linked, cross-project-call, depends_on)
+	// are visible from both sides. SELECT DISTINCT because an edge whose
+	// endpoints are both in the project matches the OR twice.
+	q := `SELECT DISTINCT e.from_id, fn.title, fn.node_type, LENGTH(fn.content), fn.project_id,
+	       e.to_id, tn.title, tn.node_type, LENGTH(tn.content), tn.project_id,
+	       e.edge_type, e.confidence, e.confidence_tier,
 	       COUNT(*) OVER() AS total
 		FROM edges e
 		JOIN nodes fn ON fn.id = e.from_id
 		JOIN nodes tn ON tn.id = e.to_id
-		WHERE fn.project_id = ?`
-	args := []any{projectID}
+		WHERE (fn.project_id = ? OR tn.project_id = ?) AND ` + scope.EdgeFilterSQL("fn", "tn")
+	args := []any{projectID, projectID}
 
 	if len(edgeTypes) > 0 {
 		placeholders := make([]string, len(edgeTypes))
@@ -1371,7 +1474,9 @@ func (s *Store) ListEdgesByProject(
 		var er store.EdgeResult
 		var fromTitle, fromType, toTitle, toType string
 		var totalRow int
-		if err := rows.Scan(&er.FromID, &fromTitle, &fromType, &er.FromSize, &er.ToID, &toTitle, &toType, &er.ToSize, &er.EdgeType, &er.Confidence, &er.ConfidenceTier, &totalRow); err != nil {
+		if err := rows.Scan(&er.FromID, &fromTitle, &fromType, &er.FromSize, &er.FromProjectID,
+			&er.ToID, &toTitle, &toType, &er.ToSize, &er.ToProjectID,
+			&er.EdgeType, &er.Confidence, &er.ConfidenceTier, &totalRow); err != nil {
 			return nil, 0, fmt.Errorf("sqlite: scan edge result: %w", err)
 		}
 		total = totalRow
@@ -1379,8 +1484,8 @@ func (s *Store) ListEdgesByProject(
 		er.FromType = fromType
 		er.ToTitle = toTitle
 		er.ToType = toType
-		er.FromGroup = extractGroup(er.FromID, projectID)
-		er.ToGroup = extractGroup(er.ToID, projectID)
+		er.FromGroup = extractGroup(er.FromID, er.FromProjectID)
+		er.ToGroup = extractGroup(er.ToID, er.ToProjectID)
 		out = append(out, er)
 	}
 	if err := rows.Err(); err != nil {
@@ -1399,10 +1504,11 @@ func extractGroup(id, projectID string) string {
 
 func (s *Store) GetEdgesFrom(ctx context.Context, nodeID string, edgeTypes []string) ([]store.Edge, error) {
 	typeFilter, args := buildEdgeTypeFilter(edgeTypes)
-	edgeCols := "from_id, to_id, edge_type, confidence, confidence_tier, bidirectional"
-	q := `SELECT ` + edgeCols + ` FROM edges WHERE from_id = ?` + typeFilter + `
+	edgeScopeFilter := scope.EdgeFilterSQL("fn", "tn")
+	edgeCols := "e.from_id, e.to_id, e.edge_type, e.confidence, e.confidence_tier, e.bidirectional"
+	q := `SELECT ` + edgeCols + ` FROM edges e LEFT JOIN nodes fn ON fn.id = e.from_id LEFT JOIN nodes tn ON tn.id = e.to_id WHERE e.from_id = ?` + typeFilter + ` AND ` + edgeScopeFilter + `
 UNION
-SELECT to_id, from_id, edge_type, confidence, confidence_tier, bidirectional FROM edges WHERE to_id = ? AND bidirectional = 1` + typeFilter + `
+SELECT e.to_id, e.from_id, e.edge_type, e.confidence, e.confidence_tier, e.bidirectional FROM edges e LEFT JOIN nodes fn ON fn.id = e.from_id LEFT JOIN nodes tn ON tn.id = e.to_id WHERE e.to_id = ? AND e.bidirectional = 1` + typeFilter + ` AND ` + edgeScopeFilter + `
 ORDER BY confidence DESC`
 	queryArgs := make([]any, 0, 2+2*len(edgeTypes))
 	queryArgs = append(queryArgs, nodeID)
@@ -1428,10 +1534,11 @@ ORDER BY confidence DESC`
 
 func (s *Store) GetEdgesTo(ctx context.Context, nodeID string, edgeTypes []string) ([]store.Edge, error) {
 	typeFilter, args := buildEdgeTypeFilter(edgeTypes)
-	edgeCols := "from_id, to_id, edge_type, confidence, confidence_tier, bidirectional"
-	q := `SELECT ` + edgeCols + ` FROM edges WHERE to_id = ?` + typeFilter + `
+	edgeScopeFilter := scope.EdgeFilterSQL("fn", "tn")
+	edgeCols := "e.from_id, e.to_id, e.edge_type, e.confidence, e.confidence_tier, e.bidirectional"
+	q := `SELECT ` + edgeCols + ` FROM edges e LEFT JOIN nodes fn ON fn.id = e.from_id LEFT JOIN nodes tn ON tn.id = e.to_id WHERE e.to_id = ?` + typeFilter + ` AND ` + edgeScopeFilter + `
 UNION
-SELECT to_id, from_id, edge_type, confidence, confidence_tier, bidirectional FROM edges WHERE from_id = ? AND bidirectional = 1` + typeFilter + `
+SELECT e.to_id, e.from_id, e.edge_type, e.confidence, e.confidence_tier, e.bidirectional FROM edges e LEFT JOIN nodes fn ON fn.id = e.from_id LEFT JOIN nodes tn ON tn.id = e.to_id WHERE e.from_id = ? AND e.bidirectional = 1` + typeFilter + ` AND ` + edgeScopeFilter + `
 ORDER BY confidence DESC`
 	queryArgs := make([]any, 0, 2+2*len(edgeTypes))
 	queryArgs = append(queryArgs, nodeID)
@@ -1594,12 +1701,14 @@ func (s *Store) ClearProject(ctx context.Context, projectID, modelID string) (st
 	_ = tx.QueryRowContext(
 		ctx,
 		`SELECT COUNT(*) FROM node_vectors WHERE node_id IN (SELECT id FROM nodes WHERE project_id = ?) AND node_id NOT IN (SELECT nvm.id FROM node_vector_model nvm JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ?)`,
-		projectID, projectID,
+		projectID,
+		projectID,
 	).Scan(&bareNodeVecs)
 	_ = tx.QueryRowContext(
 		ctx,
 		`SELECT COUNT(*) FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE parent_node_id IN (SELECT id FROM nodes WHERE project_id = ?)) AND chunk_id NOT IN (SELECT cvm.id FROM chunk_vector_model cvm JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`,
-		projectID, projectID,
+		projectID,
+		projectID,
 	).Scan(&bareChunkVecs)
 
 	// Delete model-prefixed vectors.
@@ -1618,12 +1727,14 @@ func (s *Store) ClearProject(ctx context.Context, projectID, modelID string) (st
 	_, _ = tx.ExecContext(
 		ctx,
 		`DELETE FROM node_vectors WHERE node_id IN (SELECT id FROM nodes WHERE project_id = ?) AND node_id NOT IN (SELECT nvm.id FROM node_vector_model nvm JOIN nodes n ON n.id = nvm.node_id WHERE n.project_id = ?)`,
-		projectID, projectID,
+		projectID,
+		projectID,
 	)
 	_, _ = tx.ExecContext(
 		ctx,
 		`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE parent_node_id IN (SELECT id FROM nodes WHERE project_id = ?)) AND chunk_id NOT IN (SELECT cvm.id FROM chunk_vector_model cvm JOIN chunks c ON c.id = cvm.chunk_id JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`,
-		projectID, projectID,
+		projectID,
+		projectID,
 	)
 	_, _ = tx.ExecContext(
 		ctx,
@@ -1823,6 +1934,36 @@ func (s *Store) GetTopNodesByImportance(ctx context.Context, projectID string, l
 	return out, rows.Err()
 }
 
+func (s *Store) GetNodesByCrossProjectEdges(
+	ctx context.Context,
+	projectID, otherProject string,
+	limit int,
+) ([]store.Node, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT n.id, n.project_id, n.node_type, n.title, n.content, n.content_hash, n.status, n.source_adapter, n.source_path, n.importance, n.language, n.created_at, n.updated_at
+		FROM edges e
+		JOIN nodes fn ON fn.id = e.from_id
+		JOIN nodes tn ON tn.id = e.to_id
+		JOIN nodes n ON n.id = e.from_id OR n.id = e.to_id
+		WHERE ((fn.project_id = ? AND tn.project_id = ?) OR (fn.project_id = ? AND tn.project_id = ?))
+		  AND n.project_id = ?
+		ORDER BY n.importance DESC LIMIT ?`, projectID, otherProject, otherProject, projectID, projectID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: get nodes by cross-project edges: %w", err)
+	}
+	defer rows.Close()
+	var out []store.Node
+	for rows.Next() {
+		var n store.Node
+		if err := rows.Scan(&n.ID, &n.ProjectID, &n.NodeType, &n.Title, &n.Content, &n.ContentHash,
+			&n.Status, &n.SourceAdapter, &n.SourcePath, &n.Importance, &n.Language, &n.CreatedAt, &n.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("sqlite: scan cross-project node: %w", err)
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) ListProjects(ctx context.Context) ([]store.ProjectInfo, error) {
 	nodeRows, err := s.db.QueryContext(ctx, `SELECT project_id, COUNT(*) FROM nodes GROUP BY project_id`)
 	if err != nil {
@@ -1863,13 +2004,34 @@ func (s *Store) ListProjects(ctx context.Context) ([]store.ProjectInfo, error) {
 		return nil, err
 	}
 
+	meta := map[string]struct{ name, url string }{}
+	if metaRows, err := s.db.QueryContext(ctx, `SELECT project_id, project_name, repository_url FROM projects`); err == nil {
+		for metaRows.Next() {
+			var pid, name, url string
+			if err := metaRows.Scan(&pid, &name, &url); err == nil {
+				meta[pid] = struct{ name, url string }{name: name, url: url}
+			}
+		}
+		metaRows.Close()
+	}
+
 	out := make([]store.ProjectInfo, 0, len(nodeMap))
 	for pid, nc := range nodeMap {
-		out = append(out, store.ProjectInfo{
+		info := store.ProjectInfo{
 			ProjectID: pid,
 			NodeCount: nc,
 			EdgeCount: edgeMap[pid],
-		})
+		}
+		if base, stage, staged, err := scope.Decode(pid); err == nil && staged {
+			info.ProjectID = base
+			info.Stage = stage
+			info.EffectiveProjectID = pid
+		}
+		if m, ok := meta[info.ProjectID]; ok {
+			info.ProjectName = m.name
+			info.RepositoryURL = m.url
+		}
+		out = append(out, info)
 	}
 	for pid := range edgeMap {
 		if _, ok := nodeMap[pid]; !ok {
@@ -1877,4 +2039,22 @@ func (s *Store) ListProjects(ctx context.Context) ([]store.ProjectInfo, error) {
 		}
 	}
 	return out, nil
+}
+
+func (s *Store) UpsertProject(ctx context.Context, projectID, projectName, repositoryURL string) error {
+	if projectID == "" {
+		return errors.New("sqlite: project id must not be empty")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO projects (project_id, project_name, repository_url, updated_at)
+		VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+		ON CONFLICT(project_id) DO UPDATE SET
+			project_name   = excluded.project_name,
+			repository_url = excluded.repository_url,
+			updated_at     = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+	`, projectID, projectName, repositoryURL)
+	if err != nil {
+		return fmt.Errorf("sqlite: upsert project %s: %w", projectID, err)
+	}
+	return nil
 }

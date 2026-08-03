@@ -36,6 +36,7 @@ func TestE2EFullWorkspaceRecall(t *testing.T) {
 	callTool(t, sess, "ingest", map[string]any{
 		"cwd":        root,
 		"project_id": "full-workspace",
+		"stage":      "e2e-test",
 	}, &ingestOut)
 	if ingestOut.JobID == "" {
 		t.Fatalf("ingest: expected job_id, got %+v", ingestOut)
@@ -84,6 +85,7 @@ func TestE2EFullWorkspaceRecall(t *testing.T) {
 	for _, q := range queries {
 		callTool(t, sess, "recall", map[string]any{
 			"project_id": "full-workspace",
+			"stage":      "e2e-test",
 			"query":      q,
 			"limit":      5,
 		}, &recallOut)

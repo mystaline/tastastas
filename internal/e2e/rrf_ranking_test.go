@@ -2,9 +2,9 @@
 //
 // Spawns real binary, ingests tastastas repo itself as ground truth, runs
 // recall queries with known expected results, asserts:
-//   1. Semantic/hybrid search hits outrank pure graph expansions
-//   2. Named functions resolve in top-5
-//   3. Same query twice → deterministic ordering
+//  1. Semantic/hybrid search hits outrank pure graph expansions
+//  2. Named functions resolve in top-5
+//  3. Same query twice → deterministic ordering
 package e2e
 
 import (
@@ -121,11 +121,13 @@ func TestE2ERRFDeterministic(t *testing.T) {
 	var first, second recallResult
 	callTool(t, sess, "recall", map[string]any{
 		"project_id": "e2e-rrf",
+		"stage":      "e2e-test",
 		"query":      "store interface node edge",
 		"limit":      5,
 	}, &first)
 	callTool(t, sess, "recall", map[string]any{
 		"project_id": "e2e-rrf",
+		"stage":      "e2e-test",
 		"query":      "store interface node edge",
 		"limit":      5,
 	}, &second)
@@ -168,6 +170,7 @@ func queryAndLog(t *testing.T, sess *mcp.ClientSession, query string, assert fun
 	var out recallResult
 	callTool(t, sess, "recall", map[string]any{
 		"project_id": "e2e-rrf",
+		"stage":      "e2e-test",
 		"query":      query,
 		"limit":      10,
 	}, &out)
@@ -189,6 +192,7 @@ func ingestProject(t *testing.T, sess *mcp.ClientSession) {
 	callTool(t, sess, "ingest", map[string]any{
 		"cwd":        "../..", // up from internal/e2e/ to repo root
 		"project_id": "e2e-rrf",
+		"stage":      "e2e-test",
 	}, &out)
 
 	for i := 0; i < 60; i++ {

@@ -27,6 +27,7 @@ import (
 	"github.com/mystaline/tastastas/internal/ingest/obsidian"
 	"github.com/mystaline/tastastas/internal/onboard"
 	"github.com/mystaline/tastastas/internal/retrieve"
+	"github.com/mystaline/tastastas/internal/scope"
 	"github.com/mystaline/tastastas/internal/store"
 )
 
@@ -48,25 +49,28 @@ func safeGo(fn func()) {
 	}()
 }
 
-// resolveRef resolves the git ref for a working directory.
-// If explicitRef is non-empty, returns it directly.
-// If cwd is non-empty, attempts auto-detection via `git rev-parse --abbrev-ref HEAD`.
-// Returns error if ref cannot be determined.
-func resolveRef(cwd, explicitRef string) (string, error) {
-	if explicitRef != "" {
-		return explicitRef, nil
-	}
+// resolveRef auto-detects the git branch for a working directory via
+// `git rev-parse --abbrev-ref HEAD`. Total function — never errors. Falls
+// back to the literal stage "local" for anything that isn't a clean git
+// branch detection: no cwd, no .git, git binary missing, non-zero exit, or
+// unborn HEAD (empty output or literal "HEAD", i.e. no commits yet). This
+// keeps non-git directories (docs folders, tarball exports, CI checkouts
+// without .git) ingestable instead of hard-failing.
+func resolveRef(cwd string) string {
 	if cwd == "" {
-		return "", fmt.Errorf("ref required")
+		return "local"
 	}
 	cmd := exec.Command("git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD")
 	cmd.Stderr = nil
 	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("could not detect git ref from cwd: %w (specify ref explicitly)", err)
+		return "local"
 	}
 	ref := strings.TrimSpace(string(out))
-	return ref, nil
+	if ref == "" || ref == "HEAD" {
+		return "local"
+	}
+	return ref
 }
 
 // normalizePath expands a leading ~/ or ~\ to the user's home directory and
@@ -82,29 +86,369 @@ func normalizePath(p string) string {
 	return p
 }
 
-// remapRoot maps a host-side path to the docker-visible path using the
-// HOST_WORKSPACE_DIR prefix mapping. The docker side is fixed at workspaceRoot
-// (the image-declared /workspaces volume); the host side varies per machine
-// and is configured via env. Unset host prefix → path returned unchanged.
-// Case-insensitive comparison handles Windows drive letters (D:/Kerja ↔ d:/Kerja).
-// A path outside the host prefix is an error — the client must pass a path
-// under HOST_WORKSPACE_DIR.
-func remapRoot(hostPath string) (string, error) {
-	hostPrefix := os.Getenv("HOST_WORKSPACE_DIR")
-	if hostPrefix == "" {
-		return hostPath, nil
+func serverWorkspaceRoot() string {
+	if root := os.Getenv("SERVER_WORKSPACE_ROOT"); root != "" {
+		return filepath.Clean(root)
 	}
-	cleaned := filepath.ToSlash(filepath.Clean(hostPath))
-	prefix := filepath.ToSlash(filepath.Clean(hostPrefix))
-	lowerCleaned := strings.ToLower(cleaned)
-	lowerPrefix := strings.ToLower(prefix)
-	if strings.HasPrefix(lowerCleaned, lowerPrefix+"/") || strings.EqualFold(cleaned, prefix) {
-		return filepath.ToSlash(filepath.Clean(workspaceRoot)) + cleaned[len(prefix):], nil
+	return ""
+}
+
+// validateCloneURL rejects anything that could be read as a git option or
+// a local-path escape. git clone treats a leading '-' as a flag, and
+// some transports (ext::, file://) can execute local commands.
+func validateCloneURL(raw string) error {
+	u := strings.TrimSpace(raw)
+	if u == "" {
+		return errors.New("repository_url is required")
 	}
-	return "", fmt.Errorf(
-		"path %q is outside HOST_WORKSPACE_DIR %q — pass only paths under the workspace dir",
-		hostPath, hostPrefix,
-	)
+	if strings.HasPrefix(u, "-") {
+		return fmt.Errorf("invalid repository_url %q", raw)
+	}
+	if strings.ContainsAny(u, " \t\n\r\x00") {
+		return fmt.Errorf("invalid repository_url %q", raw)
+	}
+	ok := strings.HasPrefix(u, "https://") ||
+		strings.HasPrefix(u, "ssh://") ||
+		strings.HasPrefix(u, "git@")
+	if !ok {
+		return fmt.Errorf("repository_url must use https://, ssh://, or git@ (got %q)", raw)
+	}
+	return nil
+}
+
+func normalizeRepositoryURL(raw string) string { return scope.NormalizeRepositoryURL(raw) }
+
+// skipDirNames are never descended into while scanning for repositories —
+// they're either huge, irrelevant, or (for .git) the marker itself. No
+// depth limit is applied otherwise: repos can be nested arbitrarily deep
+// under SERVER_WORKSPACE_ROOT (e.g. org/group/repo layouts), and once a
+// directory's own .git is found, its subtree is never descended into
+// anyway, which bounds the scan naturally.
+var skipDirNames = map[string]bool{
+	".git": true, "node_modules": true, "vendor": true,
+	".cache": true, ".venv": true, "venv": true, "__pycache__": true,
+}
+
+type repositoryIndexState struct {
+	root        string
+	fingerprint string
+	byRemote    map[string][]string // normalized remote URL -> repo dirs
+	byBasename  map[string][]string // dir basename -> repo dirs (any depth)
+}
+
+var repositoryIndex struct {
+	sync.RWMutex
+	refresh sync.Mutex
+	state   *repositoryIndexState
+}
+
+// findGitRepos walks root and returns every directory that contains a
+// .git entry (repo or worktree checkout). Unbounded depth — skipDirNames
+// is what keeps the scan out of irrelevant/huge trees, and a repo's own
+// subdirectories are never descended into once its .git is found.
+func findGitRepos(root string) ([]string, error) {
+	var repos []string
+	var walk func(dir string) error
+	walk = func(dir string) error {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			repos = append(repos, dir)
+			return nil // don't descend into a repo's own subdirectories
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return nil // unreadable subdir — skip, not fatal for the whole scan
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() || skipDirNames[entry.Name()] || strings.HasPrefix(entry.Name(), ".") {
+				continue
+			}
+			if err := walk(filepath.Join(dir, entry.Name())); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walk(root); err != nil {
+		return nil, err
+	}
+	return repos, nil
+}
+
+func buildRepositoryIndex(root string) (*repositoryIndexState, error) {
+	if _, err := os.Stat(root); err != nil {
+		return nil, fmt.Errorf("stat server workspace root %s: %w", root, err)
+	}
+	repos, err := findGitRepos(root)
+	if err != nil {
+		return nil, err
+	}
+	byRemote := map[string][]string{}
+	byBasename := map[string][]string{}
+	for _, candidate := range repos {
+		cmd := exec.Command("git", "-C", candidate, "config", "--get", "remote.origin.url")
+		if out, err := cmd.Output(); err == nil {
+			key := normalizeRepositoryURL(string(out))
+			byRemote[key] = append(byRemote[key], candidate)
+		}
+		base := filepath.Base(candidate)
+		byBasename[base] = append(byBasename[base], candidate)
+	}
+	fingerprint, err := repositoryFingerprint(repos)
+	if err != nil {
+		return nil, err
+	}
+	return &repositoryIndexState{root: root, fingerprint: fingerprint, byRemote: byRemote, byBasename: byBasename}, nil
+}
+
+// repositoryFingerprint is a cheap cache-invalidation signal: repo dir list
+// plus each repo's .git/config mtime. Doesn't need to be perfect — a stale
+// cache just means a brand-new repo isn't found until the next rebuild.
+func repositoryFingerprint(repos []string) (string, error) {
+	sorted := append([]string(nil), repos...)
+	sort.Strings(sorted)
+	var parts []string
+	for _, dir := range sorted {
+		config := filepath.Join(dir, ".git", "config")
+		info, err := os.Stat(config)
+		if err != nil {
+			parts = append(parts, dir+":?")
+			continue
+		}
+		parts = append(parts, dir+":"+info.ModTime().String())
+	}
+	return strings.Join(parts, "|"), nil
+}
+
+// repositoryIndexFor returns a cached or freshly built index for root,
+// rebuilding when the repo set or any .git/config mtime has changed.
+func repositoryIndexFor(root string) (*repositoryIndexState, error) {
+	repositoryIndex.RLock()
+	state := repositoryIndex.state
+	repositoryIndex.RUnlock()
+	if state != nil && state.root == root {
+		if repos, err := findGitRepos(root); err == nil {
+			if fp, err := repositoryFingerprint(repos); err == nil && fp == state.fingerprint {
+				return state, nil
+			}
+		}
+	}
+	repositoryIndex.refresh.Lock()
+	defer repositoryIndex.refresh.Unlock()
+	repositoryIndex.RLock()
+	state = repositoryIndex.state
+	repositoryIndex.RUnlock()
+	if state != nil && state.root == root {
+		if repos, err := findGitRepos(root); err == nil {
+			if fp, err := repositoryFingerprint(repos); err == nil && fp == state.fingerprint {
+				return state, nil
+			}
+		}
+	}
+	fresh, err := buildRepositoryIndex(root)
+	if err != nil {
+		return nil, err
+	}
+	repositoryIndex.Lock()
+	repositoryIndex.state = fresh
+	repositoryIndex.Unlock()
+	return fresh, nil
+}
+
+func repositoryMatches(root, want string) ([]string, error) {
+	state, err := repositoryIndexFor(root)
+	if err != nil {
+		return nil, err
+	}
+	return append([]string(nil), state.byRemote[want]...), nil
+}
+
+// repositoryMatchesByName finds repos anywhere under root whose directory
+// basename equals name — used when the caller has neither a server-visible
+// cwd nor a repository_url, only a project_id.
+func repositoryMatchesByName(root, name string) ([]string, error) {
+	state, err := repositoryIndexFor(root)
+	if err != nil {
+		return nil, err
+	}
+	return append([]string(nil), state.byBasename[name]...), nil
+}
+
+// repositoryMatchesBySuffix resolves a client-side cwd against server-side
+// repo paths when the two live in different path namespaces (client
+// /home/me/Workspace/Personal/repo vs server /workspaces/Personal/repo).
+// It tries progressively shorter trailing path segments of cwd and returns
+// the first depth that yields matches. Longest suffix wins, so a deeper
+// unique match beats a shallow ambiguous one.
+func repositoryMatchesBySuffix(root, cwd string) ([]string, error) {
+	if cwd == "" {
+		return nil, nil
+	}
+	state, err := repositoryIndexFor(root)
+	if err != nil {
+		return nil, err
+	}
+	segs := strings.Split(strings.Trim(filepath.ToSlash(cwd), "/"), "/")
+	for n := len(segs); n >= 1; n-- {
+		suffix := "/" + strings.Join(segs[len(segs)-n:], "/")
+		var hits []string
+		for _, dirs := range state.byBasename {
+			for _, dir := range dirs {
+				if strings.HasSuffix(filepath.ToSlash(dir), suffix) {
+					hits = append(hits, dir)
+				}
+			}
+		}
+		if len(hits) > 0 {
+			sort.Strings(hits)
+			return hits, nil
+		}
+	}
+	return nil, nil
+}
+
+// resolvedRepo is the full identity + location of one repository, derived
+// once per onboard/ingest call.
+type resolvedRepo struct {
+	Root          string // server-visible directory to walk
+	ProjectID     string // base (unstaged) identity
+	ProjectName   string // repo basename, for display and fuzzy search
+	RepositoryURL string // normalized remote, "" for non-git dirs
+}
+
+// resolveRepo locates a repository and derives its identity. Location and
+// identity are deliberately separate concerns: the directory is only a way
+// to find files, while identity comes from the git remote so it survives
+// directory renames and differs per client path namespace.
+//
+// Resolution order, first hit wins:
+//  1. repository_url  -> exact remote match in the index
+//  2. project_id that looks like host/org/repo -> exact remote match
+//  3. cwd             -> longest-suffix match against indexed repo paths
+//  4. cwd             -> used directly if it exists on this machine
+//  5. project_id      -> basename match anywhere under the workspace root
+//
+// It never falls back to walking the bare SERVER_WORKSPACE_ROOT — that
+// would silently ingest every repository under the mount into whatever
+// project_id the caller happened to pass.
+func resolveRepo(cwd, repositoryURL, projectID string) (resolvedRepo, error) {
+	cwd = normalizePath(cwd)
+	root := serverWorkspaceRoot()
+
+	if cwd == "" && repositoryURL == "" && projectID == "" {
+		return resolvedRepo{}, fmt.Errorf(
+			"cwd and repository_url are both empty; provide project_id, cwd, or repository_url so the server can locate one repository under %s (refusing to walk the entire workspace root)",
+			root,
+		)
+	}
+
+	if repositoryURL != "" {
+		if root == "" {
+			return resolvedRepo{}, fmt.Errorf("repository_url requires SERVER_WORKSPACE_ROOT")
+		}
+		matches, err := repositoryMatches(root, normalizeRepositoryURL(repositoryURL))
+		if err != nil {
+			return resolvedRepo{}, err
+		}
+		if len(matches) == 1 {
+			return resolveRepoFromRoot(matches[0], projectID), nil
+		}
+		if len(matches) > 1 {
+			return resolvedRepo{}, fmt.Errorf("repository_url %q matches multiple server repositories", repositoryURL)
+		}
+		return resolvedRepo{}, fmt.Errorf("repository %q not found under server workspace root %q; call clone_repo first, or pass a server-visible cwd", repositoryURL, root)
+	}
+
+	if projectID != "" && strings.Contains(projectID, "/") && root != "" {
+		matches, err := repositoryMatches(root, projectID)
+		if err != nil {
+			return resolvedRepo{}, err
+		}
+		if len(matches) == 1 {
+			return resolveRepoFromRoot(matches[0], projectID), nil
+		}
+		// Any other count falls through; it may be a legacy free-form id.
+	}
+
+	if cwd != "" && root != "" {
+		matches, err := repositoryMatchesBySuffix(root, cwd)
+		if err != nil {
+			return resolvedRepo{}, err
+		}
+		if len(matches) == 1 {
+			return resolveRepoFromRoot(matches[0], projectID), nil
+		}
+		if len(matches) > 1 {
+			return resolvedRepo{}, fmt.Errorf("cwd %q matches multiple server repositories: %v; pass repository_url to disambiguate", cwd, matches)
+		}
+	}
+
+	if cwd != "" {
+		if err := walkRootPreflight(cwd); err == nil {
+			return resolveRepoFromRoot(cwd, projectID), nil
+		}
+	}
+
+	if projectID != "" && root != "" {
+		matches, err := repositoryMatchesByName(root, projectID)
+		if err != nil {
+			return resolvedRepo{}, err
+		}
+		if len(matches) == 1 {
+			return resolveRepoFromRoot(matches[0], projectID), nil
+		}
+		if len(matches) > 1 {
+			return resolvedRepo{}, fmt.Errorf("project_id %q matches multiple repositories under %q: %v; pass cwd or repository_url explicitly", projectID, root, matches)
+		}
+	}
+
+	if repositoryURL != "" {
+		return resolvedRepo{}, fmt.Errorf("could not resolve repository %q on server", repositoryURL)
+	}
+	if serverWorkspaceRoot() == "" {
+		return resolvedRepo{}, fmt.Errorf(
+			"cwd %q is not visible to server and SERVER_WORKSPACE_ROOT is unset; set SERVER_WORKSPACE_ROOT or pass a server-visible cwd",
+			cwd,
+		)
+	}
+	return resolvedRepo{}, fmt.Errorf("cwd %q is not visible to server; provide repository_url", cwd)
+}
+
+func resolveRepoFromRoot(root, callerProjectID string) resolvedRepo {
+	rr := resolvedRepo{Root: root}
+	rr.ProjectID, rr.ProjectName, rr.RepositoryURL = repoIdentity(root, callerProjectID)
+	return rr
+}
+
+// repoIdentity derives a repo's project identity once its root is known.
+// A git remote wins; non-git directories fall back to the dir basename. An
+// explicit non-URL-shaped project_id is a deliberate override and keeps
+// legacy projects addressable by their existing id.
+func repoIdentity(root, callerProjectID string) (id, name, url string) {
+	out, err := exec.Command("git", "-C", root, "config", "--get", "remote.origin.url").Output()
+	if err == nil {
+		if derivedID, derivedName, ok := scope.ProjectIDFromRemote(string(out)); ok {
+			id, name, url = derivedID, derivedName, derivedID
+		}
+	}
+	if id == "" {
+		id = filepath.Base(root)
+		name = id
+	}
+	if callerProjectID != "" && !strings.Contains(callerProjectID, "/") {
+		id = callerProjectID
+	}
+	return id, name, url
+}
+
+// repositoryRoot is kept as a thin wrapper for callers that only need the
+// resolved directory (existing tests). Identity-aware callers use
+// resolveRepo.
+func repositoryRoot(cwd, repositoryURL, projectID string) (string, error) {
+	rr, err := resolveRepo(cwd, repositoryURL, projectID)
+	if err != nil {
+		return "", err
+	}
+	return rr.Root, nil
 }
 
 // walkRootPreflight fails fast when the walk root is missing or not a
@@ -133,11 +477,6 @@ func NewServer(db store.Store, embedder embed.EmbedderBackend, batchSize int, mo
 	return srv
 }
 
-// workspaceRoot is the canonical workspace mount point declared by the image
-// (VOLUME /workspaces). File walks and future git clones target this path
-// regardless of host-side origin.
-const workspaceRoot = "/workspaces"
-
 // modelWarning returns a warning string if the model's data is dirty or
 // missing. Returns "" if everything is fine. Never blocks tool execution.
 func modelWarning(ctx context.Context, db store.Store, projectID, modelID string) string {
@@ -162,6 +501,29 @@ func modelWarning(ctx context.Context, db store.Store, projectID, modelID string
 		return fmt.Sprintf("no data found for model %q. Run 'onboard' or 'ingest' first.", modelID)
 	}
 	return ""
+}
+
+// stageTransitionWarning fires when a repo previously ingested at the
+// "local" fallback stage now resolves a real git branch — it warns instead
+// of silently leaving the old local-stage data orphaned. local data is
+// never auto-purged: a docs directory or Obsidian vault legitimately stays
+// at "local" forever, so this is purely informational.
+func stageTransitionWarning(ctx context.Context, db store.Store, projectID, stage string) string {
+	if stage == "local" {
+		return ""
+	}
+	localID, err := scope.Encode(projectID, "local")
+	if err != nil {
+		return ""
+	}
+	stats, err := db.Stats(ctx, localID, "")
+	if err != nil || stats.NodeCount == 0 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"project_id %q also has data at stage \"local\" (ingested before git was detected); clear_project with stage=local to remove it",
+		projectID,
+	)
 }
 
 func registerTools(srv *mcp.Server, db store.Store, embedder embed.EmbedderBackend, batchSize int, modelID string) {
@@ -190,7 +552,38 @@ Rules:
   - Always init first.
   - Prefer recall over ad-hoc searches.
   - Use link for complex relationships (ERD, PRD, API spec).
-  - Ingest is idempotent; run on every push.`
+  - Ingest is idempotent; run on every push.
+
+Paths (onboard/ingest, server mode only):
+  - cwd is a server-side path, not a path on your machine. It only works when
+    it already exists on the server's filesystem (e.g. same host as the
+    server, or a path under a shared Docker volume like /workspaces).
+  - If cwd is not server-visible, pass project_id + repository_url instead.
+    Both require $SERVER_WORKSPACE_ROOT to be set on the server (docker sets
+    it; a bare binary defaults to ~/tastastas/workspaces if unset). The
+    server recursively scans that root (repos nested under an org/group dir
+    are found too, e.g. /workspaces/Personal/repo-a) for a repo whose
+    'git remote get-url origin' matches, and resolves the server path itself
+    — your local cwd is irrelevant once repository_url matches.
+  - If you have neither a server-visible cwd nor a repository_url, pass
+    project_id alone: the server searches the same recursive index (also
+    requires $SERVER_WORKSPACE_ROOT) for a repository directory whose name
+    matches project_id, at any depth. It will never fall back to walking
+    the entire workspace root.
+  - If a repository is not present under the server workspace root, onboard
+    will say so. Do not clone it yourself — tell the user and wait for them
+    to ask. Only then call clone_repo.
+  - Stage: onboard/ingest resolve stage as the git branch detected from cwd,
+    falling back to the literal stage "local" for non-git directories,
+    unborn HEAD (no commits), or when the git binary/branch can't be
+    detected — never an error. Pass stage explicitly to override. Reads
+    (recall, onboard_check, clear_project, etc.) must use the same
+    project_id+stage pair the data was ingested under — mismatches return
+    zero results/nodes rather than an error, since a stage simply being
+    empty is valid. If a repo previously ingested at "local" now resolves a
+    real branch, new data lands on the branch and the response carries a
+    warning that "local" data still exists — clear_project with stage=local
+    to remove it (never auto-purged).`
 		projects, _ := db.ListProjects(ctx)
 		output := InitOutput{Help: help, ModelID: modelID, Projects: projects}
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: help}}}, output, nil
@@ -199,47 +592,33 @@ Rules:
 	// Tool 2: onboard — async
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "onboard",
-		Description: "Onboard into a codebase. Auto-detects adapters, runs all matching, infers conventions, runs Tier 2 linking. Async — returns job_id.",
+		Description: "Onboard into a codebase. Auto-detects adapters, runs all matching, infers conventions, runs Tier 2 linking. Async — returns job_id. cwd must be server-visible; if not, pass project_id+repository_url instead. Never omit all three (cwd, repository_url, project_id) — the server refuses to walk its entire workspace root and will error.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args OnboardInput) (*mcp.CallToolResult, OnboardOutput, error) {
-		projectID := args.ProjectID
-		if projectID == "" {
-			projectID = "default"
-		}
-
-		cwd := args.CWD
-		if cwd == "" {
-			cwd = workspaceRoot
-		}
-		cwd = normalizePath(cwd)
-		walkCwd, err := remapRoot(cwd)
+		rr, err := resolveRepo(args.CWD, args.RepositoryURL, args.ProjectID)
 		if err != nil {
 			return errorResult(err), OnboardOutput{}, nil
 		}
-		if err := walkRootPreflight(walkCwd); err != nil {
+		walkCwd := rr.Root
+		projectID := rr.ProjectID
+
+		stage := args.Stage
+		if stage == "" {
+			stage = resolveRef(walkCwd)
+		}
+		effectiveID, err := scope.Encode(projectID, stage)
+		if err != nil {
 			return errorResult(err), OnboardOutput{}, nil
 		}
+		_ = db.UpsertProject(ctx, projectID, rr.ProjectName, rr.RepositoryURL)
+		warning := stageTransitionWarning(ctx, db, projectID, stage)
 
-		ref, refErr := resolveRef(walkCwd, args.Ref)
-		if refErr != nil {
-			return errorResult(refErr), OnboardOutput{}, nil
-		}
-		if ref != "" && ref != "HEAD" && !strings.Contains(projectID, ref) {
-			log.Printf(
-				"WARNING: ref %q not found in project_id %q — consider using %s-%s",
-				ref,
-				projectID,
-				projectID,
-				ref,
-			)
-		}
-
-		job := jobs.create(projectID)
+		job := jobs.create(effectiveID)
 		runCtx, cancel := context.WithCancel(jobCtx)
 		jobs.setCancel(job.ID, cancel)
 		safeGo(func() {
 			// Per-model AlreadyOnboarded guard.
 			if modelID != "" {
-				status, _ := db.GetEmbedModelStatus(ctx, projectID, modelID)
+				status, _ := db.GetEmbedModelStatus(ctx, effectiveID, modelID)
 				if status == "clean" {
 					jobs.finish(job.ID, 0, 0, 0, nil)
 					return
@@ -249,8 +628,7 @@ Rules:
 			ingestMu.Lock()
 			result, err := onboard.Run(runCtx, onboard.Config{
 				CWD:       walkCwd,
-				ProjectID: projectID,
-				Scope:     args.Scope,
+				ProjectID: effectiveID,
 				ModelID:   modelID,
 				Embedder:  embedder,
 				Store:     db,
@@ -272,7 +650,7 @@ Rules:
 		})
 		// Report walk counts and transition phase to "embedding" — same as ingest path.
 
-		output := OnboardOutput{ProjectID: projectID, JobID: job.ID, Status: "running", Ref: ref}
+		output := OnboardOutput{ProjectID: projectID, JobID: job.ID, Status: "running", Stage: stage, EffectiveProjectID: effectiveID, Warning: warning}
 
 		toolResult := &mcp.CallToolResult{
 			Content: []mcp.Content{
@@ -289,9 +667,9 @@ Rules:
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "onboard_check", Description: "Check graph state for a project filtered by model. Read-only. model_id optional (default: current server model). Pass empty string for all models.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args OnboardCheckInput) (*mcp.CallToolResult, OnboardCheckOutput, error) {
-		projectID := args.ProjectID
-		if projectID == "" {
-			projectID = "default"
+		projectID, err := resolveToolScope(args.ProjectID, args.Stage)
+		if err != nil {
+			return errorResult(err), OnboardCheckOutput{}, nil
 		}
 		checkModelID := args.ModelID
 		if checkModelID == "" {
@@ -317,6 +695,21 @@ Rules:
 		}
 		if etc, err := db.EdgeTypeCounts(ctx, projectID); err == nil && len(etc) > 0 {
 			output.EdgeTypeCounts = etc
+		}
+		if checkModelID != "" && stats.NodeCount > 0 {
+			if status, err := db.GetEmbedModelStatus(ctx, projectID, checkModelID); err == nil && status == "clean" {
+				output.Gated = true
+				output.GateReason = fmt.Sprintf(
+					"project %q is already onboarded clean for model %q; onboard would be a no-op. Use clear_project to force a re-onboard.",
+					projectID, checkModelID)
+			}
+		}
+		if stats.NodeCount == 0 {
+			projects, _ := db.ListProjects(ctx)
+			if suggestions := fuzzyMatchProjects(args.ProjectID, projects); len(suggestions) > 0 {
+				output.Warning = fmt.Sprintf("project_id '%s' has no nodes. Did you mean: %s?",
+					args.ProjectID, formatSuggestions(suggestions))
+			}
 		}
 
 		toolResult := &mcp.CallToolResult{
@@ -408,8 +801,24 @@ Rules:
 			Name:        "recall",
 			Description: "Search memory by query (FTS5 lexical + optional vector + RRF fusion + graph neighbors). Returns scored nodes with excerpt, first 3 chunk previews, and pagination metadata. Use recall_chunks to fetch more chunks when more_available is true.",
 		}, func(ctx context.Context, req *mcp.CallToolRequest, args RecallInput) (*mcp.CallToolResult, RecallOutput, error) {
+			if len(args.ProjectScopes) > 0 && len(args.ProjectIDs) > 0 {
+				return errorResult(fmt.Errorf("project_ids and project_scopes are mutually exclusive")), RecallOutput{}, nil
+			}
+
 			projectIDs := []string{}
-			if len(args.ProjectIDs) > 0 {
+			if len(args.ProjectScopes) > 0 {
+				for _, ps := range args.ProjectScopes {
+					pid := ps.ProjectID
+					if pid == "" {
+						pid = "default"
+					}
+					encoded, err := scope.Resolve(pid, ps.Stage, false)
+					if err != nil {
+						return errorResult(err), RecallOutput{}, nil
+					}
+					projectIDs = append(projectIDs, encoded)
+				}
+			} else if len(args.ProjectIDs) > 0 {
 				projectIDs = args.ProjectIDs
 			} else if args.AllProjects {
 				ids, err := db.ListProjectIDs(ctx)
@@ -422,7 +831,15 @@ Rules:
 				if pid == "" {
 					pid = "default"
 				}
-				projectIDs = []string{pid}
+				if args.Stage != "" {
+					effectiveID, err := scope.Encode(pid, args.Stage)
+					if err != nil {
+						return errorResult(err), RecallOutput{}, nil
+					}
+					projectIDs = []string{effectiveID, pid}
+				} else {
+					projectIDs = []string{pid}
+				}
 			}
 
 			limit := args.Limit
@@ -484,13 +901,22 @@ Rules:
 								EdgeType: e.EdgeType, Confidence: e.Confidence,
 							})
 						}
-						items = append(items, RecallItem{
+						base, stg, staged, decErr := scope.Decode(s.ProjectID)
+						item := RecallItem{
 							ID: s.ID, Title: s.Title, Excerpt: s.Excerpt,
 							NodeType: s.NodeType, Score: s.Score, MatchType: s.MatchType,
 							PreviewChunks: s.PreviewChunks, TotalChunks: s.TotalChunks,
 							MoreAvailable: s.MoreAvailable, NextChunkStart: s.NextChunkStart,
 							Edges: edges, InferredEdges: inferredEdges,
-						})
+						}
+						if decErr == nil {
+							item.ProjectID = base
+							if staged {
+								item.Stage = stg
+								item.EffectiveProjectID = s.ProjectID
+							}
+						}
+						items = append(items, item)
 					}
 
 					// Log access for each result node (P3a)
@@ -553,7 +979,7 @@ Rules:
 				projects, _ := db.ListProjects(ctx)
 				if suggestions := fuzzyMatchProjects(args.ProjectID, projects); len(suggestions) > 0 {
 					warn = fmt.Sprintf("project_id '%s' not found. Did you mean: %s?",
-						args.ProjectID, strings.Join(suggestions, ", "))
+						args.ProjectID, formatSuggestions(suggestions))
 				}
 			}
 
@@ -676,6 +1102,14 @@ Rules:
 			args.Confidence = 1.0
 		}
 
+		fromNode, err := db.GetNode(ctx, args.FromID)
+		if err == nil {
+			toNode, err2 := db.GetNode(ctx, args.ToID)
+			if err2 == nil && !scope.EdgeAllowed(fromNode.ProjectID, toNode.ProjectID) {
+				return errorResult(fmt.Errorf("link %s->%s: stage mismatch", args.FromID, args.ToID)), LinkOutput{}, nil
+			}
+		}
+
 		if err := db.UpsertEdge(
 			ctx,
 			store.Edge{
@@ -702,54 +1136,50 @@ Rules:
 	// Tool 9: ingest — async, auto-detect adapters
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ingest",
-		Description: "Ingest a project directory into memory. Auto-detects adapters (codeast, docwalk, gitrepo, obsidian, markdown-glob), walks files, chunks, embeds, and returns a job_id for polling via job_status.",
+		Description: "Ingest a project directory into memory. Auto-detects adapters (codeast, docwalk, gitrepo, obsidian, markdown-glob), walks files, chunks, embeds, and returns a job_id for polling via job_status. cwd must be server-visible; if not, pass project_id+repository_url instead. Never omit all three (cwd, repository_url, project_id) — the server refuses to walk its entire workspace root and will error.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args IngestInput) (*mcp.CallToolResult, IngestOutput, error) {
-		projectID := args.ProjectID
-		cwd := args.CWD
-		if cwd == "" {
-			cwd = workspaceRoot
-		}
-		cwd = normalizePath(cwd)
-		walkCwd, err := remapRoot(cwd)
+		rr, err := resolveRepo(args.CWD, args.RepositoryURL, args.ProjectID)
 		if err != nil {
 			return errorResult(err), IngestOutput{}, nil
 		}
-		if err := walkRootPreflight(walkCwd); err != nil {
-			return errorResult(err), IngestOutput{}, nil
-		}
+		walkCwd := rr.Root
+		projectID := rr.ProjectID
 
-		if projectID == "" {
-			// Fallback to .memoryrc.yaml project_id if available
+		if args.ProjectID == "" && rr.RepositoryURL == "" {
+			// A .memoryrc.yaml project_id overrides the derived identity for
+			// non-git directories; otherwise keep resolveRepo's basename.
+			//
+			// Behavior change: non-git dirs used to land in project_id
+			// "default" when no .memoryrc.yaml was present. They now keep
+			// their basename instead, matching the "dir is never identity,
+			// but still gets a stable one" rule the rest of this file
+			// follows. Existing "default"-project data for such dirs is
+			// unaffected (additive only) but new ingests land elsewhere.
 			cfg, err := docwalk.LoadConfig(filepath.Join(walkCwd, ".memoryrc.yaml"))
 			if err == nil && cfg.ProjectID != "" {
 				projectID = cfg.ProjectID
-			} else {
-				projectID = "default"
 			}
 		}
 
-		ref, refErr := resolveRef(walkCwd, args.Ref)
-		if refErr != nil {
-			return errorResult(refErr), IngestOutput{}, nil
+		stage := args.Stage
+		if stage == "" {
+			stage = resolveRef(walkCwd)
 		}
-		if ref != "" && ref != "HEAD" && !strings.Contains(projectID, ref) {
-			log.Printf(
-				"WARNING: ref %q not found in project_id %q — consider using %s-%s",
-				ref,
-				projectID,
-				projectID,
-				ref,
-			)
+		effectiveID, err := scope.Encode(projectID, stage)
+		if err != nil {
+			return errorResult(err), IngestOutput{}, nil
 		}
+		_ = db.UpsertProject(ctx, projectID, rr.ProjectName, rr.RepositoryURL)
+		warning := stageTransitionWarning(ctx, db, projectID, stage)
 
-		job := jobs.create(projectID)
+		job := jobs.create(effectiveID)
 		runCtx, cancel := context.WithCancel(jobCtx)
 		jobs.setCancel(job.ID, cancel)
 		safeGo(func() {
 			ingestMu.Lock()
 			result, err := onboard.Run(runCtx, onboard.Config{
 				CWD:       walkCwd,
-				ProjectID: projectID,
+				ProjectID: effectiveID,
 				ModelID:   modelID,
 				Embedder:  embedder,
 				Store:     db,
@@ -770,13 +1200,58 @@ Rules:
 				result.ConventionsInferred, result.AutoLinked, result.ProposalsQueued)
 		})
 
-		output := IngestOutput{JobID: job.ID, Status: "running", Ref: ref}
+		output := IngestOutput{JobID: job.ID, Status: "running", Stage: stage, EffectiveProjectID: effectiveID, Warning: warning}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(output)}},
 		}, output, nil
 	})
 
-	// Tool 10: check_impact
+	// Tool 10: clone_repo
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "clone_repo",
+		Description: "Clone a git repository into the server workspace root so it can be onboarded. Requires SERVER_WORKSPACE_ROOT. Never call this without the user explicitly asking to clone — if onboard reports a repo is absent, tell the user and wait.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args CloneRepoInput) (*mcp.CallToolResult, CloneRepoOutput, error) {
+		if err := validateCloneURL(args.RepositoryURL); err != nil {
+			return errorResult(err), CloneRepoOutput{}, nil
+		}
+		if args.Ref != "" {
+			if strings.HasPrefix(args.Ref, "-") || strings.ContainsAny(args.Ref, " \t\n\r\x00") {
+				return errorResult(fmt.Errorf("invalid ref %q", args.Ref)), CloneRepoOutput{}, nil
+			}
+		}
+		root := serverWorkspaceRoot()
+		if root == "" {
+			return errorResult(fmt.Errorf("clone_repo requires SERVER_WORKSPACE_ROOT")), CloneRepoOutput{}, nil
+		}
+		id, _, ok := scope.ProjectIDFromRemote(args.RepositoryURL)
+		if !ok {
+			return errorResult(fmt.Errorf("cannot derive project id from %q", args.RepositoryURL)), CloneRepoOutput{}, nil
+		}
+		dest := filepath.Join(root, filepath.FromSlash(id[strings.Index(id, "/")+1:]))
+		rel, err := filepath.Rel(root, dest)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			return errorResult(fmt.Errorf("clone destination escapes workspace root")), CloneRepoOutput{}, nil
+		}
+		if _, err := os.Stat(dest); err == nil {
+			return errorResult(fmt.Errorf("%s already exists; nothing cloned", dest)), CloneRepoOutput{}, nil
+		}
+		cloneArgs := []string{"clone"}
+		if args.Ref != "" {
+			cloneArgs = append(cloneArgs, "--branch", args.Ref)
+		}
+		cloneArgs = append(cloneArgs, "--", args.RepositoryURL, dest)
+		out, err := exec.CommandContext(ctx, "git", cloneArgs...).CombinedOutput()
+		if err != nil {
+			_ = os.RemoveAll(dest)
+			return errorResult(fmt.Errorf("git clone failed: %v: %s", err, out)), CloneRepoOutput{}, nil
+		}
+		output := CloneRepoOutput{Path: dest, ProjectID: id, Status: "cloned"}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(output)}},
+		}, output, nil
+	})
+
+	// Tool 11: check_impact
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "check_impact", Description: "After updating a node, check which downstream nodes are affected.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args CheckImpactInput) (*mcp.CallToolResult, CheckImpactOutput, error) {
@@ -812,7 +1287,7 @@ Rules:
 		return toolResult, output, nil
 	})
 
-	// Tool 11: extract_and_remember — async
+	// Tool 12: extract_and_remember — async
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "extract_and_remember",
 		Description: "Extract atomic facts/entities from raw conversation text via LLM, dedupe-check each against existing memory, and store (merge on near-duplicate, insert otherwise).",
@@ -907,7 +1382,7 @@ Rules:
 		return toolResult, output, nil
 	})
 
-	// Tool 12: query_graph - synchronous
+	// Tool 13: query_graph - synchronous
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "query_graph",
 		Description: "Query graph edges from/to a node. Returns typed relationships: who calls this function, what this doc references, etc. Use after recall to explore connections.",
@@ -1009,14 +1484,14 @@ Rules:
 		}, output, nil
 	})
 
-	// Tool 13: project_graph - synchronous, macro-level visualization data
+	// Tool 14: project_graph - synchronous, macro-level visualization data
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "project_graph",
 		Description: "Return all edges and deduplicated nodes for a project, for macro-level graph visualization. By default excludes proposed edges and caps at 5000 edges.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args ProjectGraphInput) (*mcp.CallToolResult, ProjectGraphOutput, error) {
-		projectID := args.ProjectID
-		if projectID == "" {
-			projectID = "default"
+		projectID, err := resolveToolScope(args.ProjectID, args.Stage)
+		if err != nil {
+			return errorResult(err), ProjectGraphOutput{}, nil
 		}
 		maxEdges := args.MaxEdges
 		if maxEdges <= 0 {
@@ -1024,7 +1499,7 @@ Rules:
 		}
 		edgeTypes := args.EdgeTypes
 
-		// Default: structural + auto-linked (exclude proposed).
+		// Default: structural + auto-linked + cross-project (exclude proposed).
 		if len(edgeTypes) == 0 {
 			edgeTypes = []string{
 				"specifies",
@@ -1035,6 +1510,8 @@ Rules:
 				"imports",
 				"convention-member",
 				"auto-linked",
+				"cross-project-call",
+				"depends_on",
 				"references",
 			}
 		}
@@ -1088,13 +1565,20 @@ Rules:
 			Nodes:      nodes,
 			Edges:      edges,
 		}
+		if total == 0 {
+			projects, _ := db.ListProjects(ctx)
+			if suggestions := fuzzyMatchProjects(args.ProjectID, projects); len(suggestions) > 0 {
+				out.Warning = fmt.Sprintf("project_id '%s' has no edges. Did you mean: %s?",
+					args.ProjectID, formatSuggestions(suggestions))
+			}
+		}
 
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
 		}, out, nil
 	})
 
-	// Tool 14: job_status — poll any async job
+	// Tool 15: job_status — poll any async job
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "job_status", Description: "Poll status of an async job (onboard, extract_and_remember). Returns current state.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args JobStatusInput) (*mcp.CallToolResult, JobStatusOutput, error) {
@@ -1131,7 +1615,7 @@ Rules:
 		return toolResult, output, nil
 	})
 
-	// Tool 15: clear_project — synchronous, requires confirm
+	// Tool 16: clear_project — synchronous, requires confirm
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "clear_project",
 		Description: "Delete project data. Default: clears current model only (safe — keeps other models' vectors). model_id optional: override target model. purge=true: clear ALL models (full wipe). Requires confirm: true.",
@@ -1142,6 +1626,10 @@ Rules:
 		if args.ProjectID == "" {
 			return errorResult(fmt.Errorf("project_id is required")), ClearProjectOutput{}, nil
 		}
+		resolvedID, err := resolveToolScope(args.ProjectID, args.Stage)
+		if err != nil {
+			return errorResult(err), ClearProjectOutput{}, nil
+		}
 
 		targetModelID := args.ModelID
 		if args.Purge {
@@ -1150,7 +1638,7 @@ Rules:
 			targetModelID = modelID // default: current server model
 		}
 
-		result, err := db.ClearProject(ctx, args.ProjectID, targetModelID)
+		result, err := db.ClearProject(ctx, resolvedID, targetModelID)
 		if err != nil {
 			return errorResult(err), ClearProjectOutput{}, nil
 		}
@@ -1162,12 +1650,19 @@ Rules:
 			DeletedChunks: result.Chunks,
 			DeletedVecs:   result.Vectors,
 		}
+		if result.Nodes == 0 {
+			projects, _ := db.ListProjects(ctx)
+			if suggestions := fuzzyMatchProjects(args.ProjectID, projects); len(suggestions) > 0 {
+				out.Warning = fmt.Sprintf("project_id '%s' had nothing to clear. Did you mean: %s?",
+					args.ProjectID, formatSuggestions(suggestions))
+			}
+		}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
 		}, out, nil
 	})
 
-	// Tool 16: list_projects — synchronous, read-only
+	// Tool 17: list_projects — synchronous, read-only
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "list_projects", Description: "List all projects with basic stats (node count, edge count). Read-only.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct{}) (*mcp.CallToolResult, ListProjectsOutput, error) {
@@ -1181,14 +1676,14 @@ Rules:
 		}, out, nil
 	})
 
-	// Tool 17: check_recent
+	// Tool 18: check_recent
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "check_recent",
 		Description: "List nodes updated within the past N days. Default 7 days.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args CheckRecentInput) (*mcp.CallToolResult, CheckRecentOutput, error) {
-		projectID := args.ProjectID
-		if projectID == "" {
-			projectID = "default"
+		projectID, err := resolveToolScope(args.ProjectID, args.Stage)
+		if err != nil {
+			return errorResult(err), CheckRecentOutput{}, nil
 		}
 		days := args.Days
 		if days <= 0 {
@@ -1207,12 +1702,19 @@ Rules:
 			})
 		}
 		out := CheckRecentOutput{Nodes: items}
+		if len(items) == 0 {
+			projects, _ := db.ListProjects(ctx)
+			if suggestions := fuzzyMatchProjects(args.ProjectID, projects); len(suggestions) > 0 {
+				out.Warning = fmt.Sprintf("project_id '%s' has no recent nodes. Did you mean: %s?",
+					args.ProjectID, formatSuggestions(suggestions))
+			}
+		}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(out)}},
 		}, out, nil
 	})
 
-	// Tool 18: find_path
+	// Tool 19: find_path
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "find_path",
 		Description: "BFS shortest path between two nodes. Returns path hops and total count.",
@@ -1299,7 +1801,7 @@ Rules:
 		}, out, nil
 	})
 
-	// Tool 19: link_projects
+	// Tool 20: link_projects
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "link_projects",
 		Description: "Run cross-project linking for a project. Links code symbols to matching symbols in all other known projects.",
@@ -1307,12 +1809,16 @@ Rules:
 		if args.ProjectID == "" {
 			return errorResult(fmt.Errorf("project_id is required")), LinkProjectsOutput{}, nil
 		}
-		// Load all nodes for this project
-		allNodes, err := db.ListNodesByType(ctx, args.ProjectID, nil, 10000, 0)
+		resolvedID, err := resolveToolScope(args.ProjectID, args.Stage)
 		if err != nil {
 			return errorResult(err), LinkProjectsOutput{}, nil
 		}
-		edges, err := onboard.CrossProjectLink(ctx, db, args.ProjectID, allNodes)
+		// Load all nodes for this project
+		allNodes, err := db.ListNodesByType(ctx, resolvedID, nil, 10000, 0)
+		if err != nil {
+			return errorResult(err), LinkProjectsOutput{}, nil
+		}
+		edges, err := onboard.CrossProjectLink(ctx, db, resolvedID, allNodes)
 		if err != nil {
 			return errorResult(err), LinkProjectsOutput{}, nil
 		}
@@ -1325,12 +1831,16 @@ Rules:
 		}, out, nil
 	})
 
-	// Tool 20: abort_ingestion
+	// Tool 21: abort_ingestion
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "abort_ingestion",
 		Description: "Cancel running ingest/onboard jobs. No project_id = cancel all. Partial data is left in place; re-run ingest to converge (idempotent upsert).",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args AbortInput) (*mcp.CallToolResult, AbortOutput, error) {
-		count := jobs.abort(args.ProjectID)
+		resolvedID, err := scope.Resolve(args.ProjectID, args.Stage, false)
+		if err != nil {
+			return errorResult(err), AbortOutput{}, nil
+		}
+		count := jobs.abort(resolvedID)
 		output := AbortOutput{Cancelled: count, ProjectID: args.ProjectID}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: marshalJSON(output)}},

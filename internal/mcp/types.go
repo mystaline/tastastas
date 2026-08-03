@@ -29,16 +29,24 @@ type RememberOutput struct {
 }
 
 type RecallInput struct {
-	ProjectID     string   `json:"project_id,omitempty"`
-	ProjectIDs    []string `json:"project_ids,omitempty"` // explicit multi-project filter
-	Query         string   `json:"query"`
-	Limit         int      `json:"limit,omitempty"`
-	LinkThreshold float64  `json:"link_threshold,omitempty"` // override default 0.75
-	AllProjects   bool     `json:"all_projects,omitempty"`   // search all projects
+	ProjectID     string              `json:"project_id,omitempty"`
+	ProjectIDs    []string            `json:"project_ids,omitempty"` // explicit multi-project filter
+	ProjectScopes []ProjectScopeInput `json:"project_scopes,omitempty"`
+	Stage         string              `json:"stage,omitempty"`
+	Query         string              `json:"query"`
+	Limit         int                 `json:"limit,omitempty"`
+	LinkThreshold float64             `json:"link_threshold,omitempty"` // override default 0.75
+	AllProjects   bool                `json:"all_projects,omitempty"`   // search all projects
+}
+
+type ProjectScopeInput struct {
+	ProjectID string `json:"project_id"`
+	Stage     string `json:"stage,omitempty"`
 }
 
 type LinkProjectsInput struct {
 	ProjectID string `json:"project_id"`
+	Stage     string `json:"stage,omitempty"`
 }
 
 type LinkProjectsOutput struct {
@@ -46,18 +54,21 @@ type LinkProjectsOutput struct {
 }
 
 type RecallItem struct {
-	ID             string       `json:"id"`
-	Title          string       `json:"title"`
-	Excerpt        string       `json:"excerpt"`
-	NodeType       string       `json:"node_type"`
-	Score          float64      `json:"score"`
-	MatchType      string       `json:"match_type"`
-	PreviewChunks  []string     `json:"preview_chunks,omitempty"` // first 3 chunk contents
-	TotalChunks    int          `json:"total_chunks"`             // e.g. 15
-	MoreAvailable  bool         `json:"more_available"`           // total_chunks > len(preview_chunks)
-	NextChunkStart int          `json:"next_chunk_start"`         // where to resume paging, or -1
-	Edges          []RecallEdge `json:"edges,omitempty"`
-	InferredEdges  []RecallEdge `json:"inferred_edges,omitempty"`
+	ID                 string       `json:"id"`
+	Title              string       `json:"title"`
+	Excerpt            string       `json:"excerpt"`
+	NodeType           string       `json:"node_type"`
+	ProjectID          string       `json:"project_id,omitempty"`
+	Stage              string       `json:"stage,omitempty"`
+	EffectiveProjectID string       `json:"effective_project_id,omitempty"`
+	Score              float64      `json:"score"`
+	MatchType          string       `json:"match_type"`
+	PreviewChunks      []string     `json:"preview_chunks,omitempty"` // first 3 chunk contents
+	TotalChunks        int          `json:"total_chunks"`             // e.g. 15
+	MoreAvailable      bool         `json:"more_available"`           // total_chunks > len(preview_chunks)
+	NextChunkStart     int          `json:"next_chunk_start"`         // where to resume paging, or -1
+	Edges              []RecallEdge `json:"edges,omitempty"`
+	InferredEdges      []RecallEdge `json:"inferred_edges,omitempty"`
 }
 
 type RecallEdge struct {
@@ -87,6 +98,7 @@ type RecallOutput struct {
 
 type RecallChunksInput struct {
 	ProjectID    string `json:"project_id,omitempty"`
+	Stage        string `json:"stage,omitempty"`
 	ParentNodeID string `json:"parent_node_id"`
 	ChunkStart   int    `json:"chunk_start"` // 0-based, inclusive
 	ChunkEnd     int    `json:"chunk_end"`   // 0-based, exclusive; default chunk_start+3
@@ -128,10 +140,10 @@ type LinkOutput struct {
 }
 
 type IngestInput struct {
-	CWD       string `json:"cwd,omitempty"` // project root to detect + ingest files from
-	ProjectID string `json:"project_id,omitempty"`
-	Scope     string `json:"scope,omitempty"` // "cwd" | "subtree"
-	Ref       string `json:"ref,omitempty"`
+	CWD           string `json:"cwd,omitempty"`
+	RepositoryURL string `json:"repository_url,omitempty"`
+	ProjectID     string `json:"project_id,omitempty"`
+	Stage         string `json:"stage,omitempty"`
 }
 
 type IngestOutput struct {
@@ -143,7 +155,9 @@ type IngestOutput struct {
 	ConventionsInferred int    `json:"conventions_inferred,omitempty"`
 	AutoLinked          int    `json:"auto_linked,omitempty"`
 	ProposalsQueued     int    `json:"proposals_queued,omitempty"`
-	Ref                 string `json:"ref,omitempty"`
+	Stage               string `json:"stage,omitempty"`
+	EffectiveProjectID  string `json:"effective_project_id,omitempty"`
+	Warning             string `json:"warning,omitempty"`
 }
 
 type ExtractAndRememberInput struct {
@@ -175,10 +189,10 @@ type StaleNode struct {
 }
 
 type OnboardInput struct {
-	CWD       string `json:"cwd,omitempty"`
-	ProjectID string `json:"project_id,omitempty"`
-	Scope     string `json:"scope,omitempty"` // "cwd" | "subtree"
-	Ref       string `json:"ref,omitempty"`
+	CWD           string `json:"cwd,omitempty"`
+	RepositoryURL string `json:"repository_url,omitempty"`
+	ProjectID     string `json:"project_id,omitempty"`
+	Stage         string `json:"stage,omitempty"`
 }
 
 type OnboardOutput struct {
@@ -196,11 +210,14 @@ type OnboardOutput struct {
 	ProposalsQueued     int      `json:"proposals_queued"`
 	FilesWalked         int      `json:"files_walked"`
 	DurationMs          int64    `json:"duration_ms"`
-	Ref                 string   `json:"ref,omitempty"`
+	Stage               string   `json:"stage,omitempty"`
+	EffectiveProjectID  string   `json:"effective_project_id,omitempty"`
+	Warning             string   `json:"warning,omitempty"`
 }
 
 type OnboardCheckInput struct {
 	ProjectID string `json:"project_id,omitempty"`
+	Stage     string `json:"stage,omitempty"`
 	ModelID   string `json:"model_id,omitempty"` // filter vectors to this model (empty = all models)
 }
 
@@ -214,17 +231,33 @@ type OnboardCheckOutput struct {
 	NodeCount      int            `json:"node_count"`
 	EdgeCount      int            `json:"edge_count"`
 	ChunkCount     int            `json:"chunk_count"`
+	Warning        string         `json:"warning,omitempty"`
 	VecCount       int            `json:"vec_count"`
 	EdgeTypeCounts map[string]int `json:"edge_type_counts,omitempty"`
+	Gated          bool           `json:"gated"`
+	GateReason     string         `json:"gate_reason,omitempty"`
+}
+
+type CloneRepoInput struct {
+	RepositoryURL string `json:"repository_url"`
+	Ref           string `json:"ref,omitempty"`
+}
+
+type CloneRepoOutput struct {
+	Path      string `json:"path"`
+	ProjectID string `json:"project_id"`
+	Status    string `json:"status"` // "cloned"
 }
 
 type CheckRecentInput struct {
 	ProjectID string `json:"project_id,omitempty"`
+	Stage     string `json:"stage,omitempty"`
 	Days      int    `json:"days,omitempty"` // default 7
 }
 
 type CheckRecentOutput struct {
-	Nodes []CheckRecentNode `json:"nodes"`
+	Nodes   []CheckRecentNode `json:"nodes"`
+	Warning string            `json:"warning,omitempty"`
 }
 
 type CheckRecentNode struct {
@@ -279,6 +312,7 @@ type EdgeResult struct {
 
 type ProjectGraphInput struct {
 	ProjectID       string   `json:"project_id,omitempty"`
+	Stage           string   `json:"stage,omitempty"`
 	MaxEdges        int      `json:"max_edges,omitempty"`  // default 5000
 	EdgeTypes       []string `json:"edge_types,omitempty"` // empty = all non-proposed types
 	ConfidenceTiers []string `json:"confidence_tiers,omitempty"`
@@ -290,6 +324,7 @@ type ProjectGraphOutput struct {
 	Returned   int         `json:"returned"`
 	Nodes      []GraphNode `json:"nodes"`
 	Edges      []GraphEdge `json:"edges"`
+	Warning    string      `json:"warning,omitempty"`
 }
 
 type GraphNode struct {
@@ -309,6 +344,7 @@ type GraphEdge struct {
 
 type ClearProjectInput struct {
 	ProjectID string `json:"project_id"`
+	Stage     string `json:"stage,omitempty"`
 	ModelID   string `json:"model_id,omitempty"` // model to clear (default = current server model)
 	Confirm   bool   `json:"confirm"`
 	Purge     bool   `json:"purge"` // clear all models for this project
@@ -320,6 +356,7 @@ type ClearProjectOutput struct {
 	DeletedEdges  int    `json:"deleted_edges"`
 	DeletedChunks int    `json:"deleted_chunks"`
 	DeletedVecs   int    `json:"deleted_vectors"`
+	Warning       string `json:"warning,omitempty"`
 }
 
 type ListProjectsOutput struct {
@@ -348,6 +385,7 @@ type JobStatusOutput struct {
 
 type AbortInput struct {
 	ProjectID string `json:"project_id,omitempty"` // empty = cancel all running jobs
+	Stage     string `json:"stage,omitempty"`
 }
 
 type AbortOutput struct {

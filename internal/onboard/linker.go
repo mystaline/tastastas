@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/mystaline/tastastas/internal/ingest/codeast/treesitter"
+	"github.com/mystaline/tastastas/internal/scope"
 	"github.com/mystaline/tastastas/internal/store"
 )
 
@@ -69,6 +70,33 @@ const godNodeGuard = 10
 
 // crossProjectGodGuard skips names that appear in too many other projects.
 const crossProjectGodGuard = 20
+
+// crossProjectSampleSize is how many top-importance nodes per other project
+// are considered for cross-project linking.
+const crossProjectSampleSize = 500
+
+// symbolPkgSuffix extracts the "pkgPath.QualName" tail of a code symbol node
+// ID (proj/code:function|code:method|code:type/<tail>). Used for module-root
+// matching across projects — exact pkg-path splitting is unreliable because
+// qualified names contain dots too, so callers check prefix against module
+// roots instead.
+func symbolPkgSuffix(nodeID string) string {
+	for _, marker := range []string{"/code:function/", "/code:method/", "/code:type/"} {
+		if _, after, ok := strings.Cut(nodeID, marker); ok {
+			return after
+		}
+	}
+	return ""
+}
+
+// sameModuleRoot reports whether a symbol's package path belongs to the given
+// module root. Matches "root/pkg" and "root.Type" (root-level types).
+func sameModuleRoot(symbolID, modRoot string) bool {
+	if symbolID == "" || modRoot == "" {
+		return false
+	}
+	return strings.HasPrefix(symbolID, modRoot+"/") || strings.HasPrefix(symbolID, modRoot+".")
+}
 
 // ResolveCrossFileCalls resolves raw_calls from tree-sitter extraction using
 // a global label index built from all ingested nodes. Returns resolved edges.
@@ -217,9 +245,11 @@ func resolveViaImports(rc treesitter.RawCall, candidates []labelEntry, importMap
 	return ""
 }
 
-// BuildLabelIndex builds a normalized label → nodeID index for cross-project linking.
-func BuildLabelIndex(nodes []store.Node) map[string]string {
-	idx := make(map[string]string)
+// BuildLabelIndex builds a normalized label → labelEntry index for
+// cross-project linking. Tracks language so same-named symbols in different
+// languages (Go main vs Rust main) never match.
+func BuildLabelIndex(nodes []store.Node) map[string]labelEntry {
+	idx := make(map[string]labelEntry)
 	for _, n := range nodes {
 		if !isCodeSymbol(n.NodeType) {
 			continue
@@ -228,7 +258,7 @@ func BuildLabelIndex(nodes []store.Node) map[string]string {
 		normalized = strings.TrimSuffix(normalized, "()")
 		normalized = strings.TrimPrefix(normalized, ".")
 		if normalized != "" {
-			idx[normalized] = n.ID
+			idx[normalized] = labelEntry{nodeID: n.ID, language: n.Language}
 		}
 	}
 	return idx
@@ -252,11 +282,13 @@ func CrossProjectLink(
 		return nil, err
 	}
 
+	myBase, myStage, myStaged, _ := scope.Decode(newProjectID)
+
 	// Collect label indices for all other projects
 	type projectIndex struct {
 		id   string
-		idx  map[string]string // code symbol label → node ID
-		pkgs map[string]string // module root → representative node ID
+		idx  map[string]labelEntry // code symbol label → entry
+		pkgs map[string]string     // module root → representative node ID
 	}
 	var others []projectIndex
 	freq := map[string]int{} // normalized code name → count of projects containing it
@@ -265,7 +297,13 @@ func CrossProjectLink(
 		if otherID == newProjectID {
 			continue
 		}
-		nodes, err := db.GetTopNodesByImportance(ctx, otherID, 100)
+		if myStaged {
+			otherBase, otherStage, _, _ := scope.Decode(otherID)
+			if otherStage != myStage || otherBase == myBase {
+				continue
+			}
+		}
+		nodes, err := db.GetTopNodesByImportance(ctx, otherID, crossProjectSampleSize)
 		if err != nil {
 			continue
 		}
@@ -282,8 +320,14 @@ func CrossProjectLink(
 
 	var allEdges []store.Edge
 
-	// Name-based matching with god-node guard
+	// Name-based matching with god-node guard. Same-module symbols (the new
+	// project directly depends on the other project's module) bypass the
+	// guard — a shared function in a dependency is a real link, not noise.
 	for _, o := range others {
+		modRoots := make([]string, 0, len(o.pkgs))
+		for root := range o.pkgs {
+			modRoots = append(modRoots, root)
+		}
 		for _, n := range newNodes {
 			if !isCodeSymbol(n.NodeType) {
 				continue
@@ -294,19 +338,34 @@ func CrossProjectLink(
 			if normalized == "" {
 				continue
 			}
-			if freq[normalized] > crossProjectGodGuard {
+			target, ok := o.idx[normalized]
+			if !ok {
 				continue
 			}
-			if targetID, ok := o.idx[normalized]; ok {
-				allEdges = append(allEdges, store.Edge{
-					FromID:         n.ID,
-					ToID:           targetID,
-					EdgeType:       "cross-project-call",
-					Confidence:     0.7,
-					ConfidenceTier: "INFERRED",
-					Bidirectional:  true,
-				})
+			// Cross-language guard: same name in different languages is not
+			// the same symbol (Go main vs Rust main, TS Client vs Go Client).
+			if n.Language != "" && target.language != "" && n.Language != target.language {
+				continue
 			}
+			suffix := symbolPkgSuffix(n.ID)
+			sameMod := false
+			for _, root := range modRoots {
+				if sameModuleRoot(suffix, root) {
+					sameMod = true
+					break
+				}
+			}
+			if !sameMod && freq[normalized] > crossProjectGodGuard {
+				continue
+			}
+			allEdges = append(allEdges, store.Edge{
+				FromID:         n.ID,
+				ToID:           target.nodeID,
+				EdgeType:       "cross-project-call",
+				Confidence:     0.7,
+				ConfidenceTier: "INFERRED",
+				Bidirectional:  true,
+			})
 		}
 	}
 
@@ -329,12 +388,14 @@ func CrossProjectLink(
 		}
 	}
 
-	// Embedding-based: cosine similarity on top signature nodes
-	sigNodes := make([]store.Node, 0, 100)
+	// Embedding-based: cosine similarity on top signature nodes.
+	// Capped per project (not across projects) so every linked project is
+	// scored instead of the first one winning the whole budget.
+	sigNodes := make([]store.Node, 0, 200)
 	for _, n := range newNodes {
 		if isCodeSymbol(n.NodeType) {
 			sigNodes = append(sigNodes, n)
-			if len(sigNodes) >= 100 {
+			if len(sigNodes) >= 200 {
 				break
 			}
 		}
@@ -348,8 +409,11 @@ func CrossProjectLink(
 		if err == nil && len(newEmbeds) > 0 {
 			for _, o := range others {
 				otherIDs := make([]string, 0, len(o.idx))
-				for _, id := range o.idx {
-					otherIDs = append(otherIDs, id)
+				for _, entry := range o.idx {
+					if len(otherIDs) >= 200 {
+						break
+					}
+					otherIDs = append(otherIDs, entry.nodeID)
 				}
 				otherEmbeds, err := db.GetNodeEmbeddings(ctx, otherIDs)
 				if err != nil || len(otherEmbeds) == 0 {
@@ -369,10 +433,6 @@ func CrossProjectLink(
 							})
 						}
 					}
-				}
-				// Limit to top 100 other nodes to keep O(100x100)
-				if len(otherEmbeds) > 100 {
-					break
 				}
 			}
 		}

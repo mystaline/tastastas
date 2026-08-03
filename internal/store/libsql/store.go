@@ -19,6 +19,7 @@ import (
 	"math"
 	"strings"
 
+	"github.com/mystaline/tastastas/internal/scope"
 	"github.com/mystaline/tastastas/internal/store"
 	_ "github.com/tursodatabase/libsql-client-go/libsql"
 	_ "turso.tech/database/tursogo"
@@ -89,6 +90,19 @@ func (s *Store) initSchema(ctx context.Context) error {
 		return err
 	}
 
+	// Projects table — base (unstaged) project id -> display name + remote URL
+	_, err = s.db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS projects (
+			project_id     TEXT PRIMARY KEY,
+			project_name   TEXT NOT NULL DEFAULT '',
+			repository_url TEXT NOT NULL DEFAULT '',
+			updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+		)
+	`)
+	if err != nil {
+		return err
+	}
+
 	// Indexes
 	_, err = s.db.ExecContext(ctx, `
 		CREATE INDEX IF NOT EXISTS idx_nodes_project_type ON nodes(project_id, node_type);
@@ -115,7 +129,7 @@ func (s *Store) initSchema(ctx context.Context) error {
 	} {
 		var has int
 		_ = s.db.QueryRowContext(ctx,
-			"SELECT COUNT(*) FROM pragma_table_info WHERE name='nodes' AND name=?", col.name).Scan(&has)
+			"SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name=?", col.name).Scan(&has)
 		if has == 0 {
 			_, _ = s.db.ExecContext(ctx,
 				fmt.Sprintf("ALTER TABLE nodes ADD COLUMN %s %s", col.name, col.def))
@@ -233,7 +247,10 @@ func (s *Store) GetNodeEmbeddings(ctx context.Context, nodeIDs []string) (map[st
 		placeholders[i] = "?"
 		args[i] = id
 	}
-	query := "SELECT v.node_id, v.embedding FROM node_vectors v WHERE v.node_id IN (" + strings.Join(placeholders, ",") + ")"
+	query := "SELECT v.node_id, v.embedding FROM node_vectors v WHERE v.node_id IN (" + strings.Join(
+		placeholders,
+		",",
+	) + ")"
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("libsql: get node embeddings: %w", err)
@@ -247,8 +264,13 @@ func (s *Store) GetNodeEmbeddings(ctx context.Context, nodeIDs []string) (map[st
 			return nil, err
 		}
 		if len(blob) != s.dim*4 {
-			log.Printf("libsql: WARN skipping read of %s: blob len %d bytes, expected %d for dim %d (truncated/corrupt row)",
-				id, len(blob), s.dim*4, s.dim)
+			log.Printf(
+				"libsql: WARN skipping read of %s: blob len %d bytes, expected %d for dim %d (truncated/corrupt row)",
+				id,
+				len(blob),
+				s.dim*4,
+				s.dim,
+			)
 			continue
 		}
 		emb := blobToFloat32Slice(blob, s.dim)
@@ -348,12 +370,25 @@ func (s *Store) UpsertNode(ctx context.Context, n store.Node) error {
 	var vectorSkipped error
 	switch {
 	case len(n.Embedding) > 0 && store.HasNonFiniteFloat32(n.Embedding):
-		log.Printf("libsql: WARN skipping vector write for node %s: embedding contains NaN/Inf (metadata still upserted)", n.ID)
+		log.Printf(
+			"libsql: WARN skipping vector write for node %s: embedding contains NaN/Inf (metadata still upserted)",
+			n.ID,
+		)
 		vectorSkipped = fmt.Errorf("node %s: %w: contains NaN/Inf", n.ID, store.ErrVectorSkipped)
 	case len(n.Embedding) > 0 && len(n.Embedding) != s.dim:
-		log.Printf("libsql: WARN skipping vector write for node %s: embedding dim %d != store dim %d (metadata still upserted)",
-			n.ID, len(n.Embedding), s.dim)
-		vectorSkipped = fmt.Errorf("node %s: %w: dim %d != store dim %d", n.ID, store.ErrVectorSkipped, len(n.Embedding), s.dim)
+		log.Printf(
+			"libsql: WARN skipping vector write for node %s: embedding dim %d != store dim %d (metadata still upserted)",
+			n.ID,
+			len(n.Embedding),
+			s.dim,
+		)
+		vectorSkipped = fmt.Errorf(
+			"node %s: %w: dim %d != store dim %d",
+			n.ID,
+			store.ErrVectorSkipped,
+			len(n.Embedding),
+			s.dim,
+		)
 	case len(n.Embedding) > 0:
 		vecJSON, jerr := json.Marshal(n.Embedding)
 		if jerr != nil {
@@ -385,10 +420,62 @@ func (s *Store) UpsertNode(ctx context.Context, n store.Node) error {
 	return nil
 }
 
+// loadEndpointProjects returns node ID -> project_id for the given IDs.
+// Missing nodes are simply absent from the map (treated as unscoped).
+func loadEndpointProjects(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, ids []string) (map[string]string, error) {
+	result := make(map[string]string, len(ids))
+	if len(ids) == 0 {
+		return result, nil
+	}
+	const chunkSize = 900
+	for i := 0; i < len(ids); i += chunkSize {
+		end := i + chunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[i:end]
+		placeholders := make([]string, len(chunk))
+		args := make([]any, len(chunk))
+		for j, id := range chunk {
+			placeholders[j] = "?"
+			args[j] = id
+		}
+		rows, err := q.QueryContext(ctx,
+			fmt.Sprintf(`SELECT id, project_id FROM nodes WHERE id IN (%s)`, strings.Join(placeholders, ",")),
+			args...)
+		if err != nil {
+			return nil, fmt.Errorf("libsql: load endpoint projects: %w", err)
+		}
+		for rows.Next() {
+			var id, projectID string
+			if err := rows.Scan(&id, &projectID); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("libsql: scan endpoint project: %w", err)
+			}
+			result[id] = projectID
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("libsql: load endpoint projects rows: %w", err)
+		}
+		rows.Close()
+	}
+	return result, nil
+}
+
 // UpsertEdge inserts or updates an edge.
 func (s *Store) UpsertEdge(ctx context.Context, e store.Edge) error {
 	if e.FromID == "" || e.ToID == "" || e.EdgeType == "" {
 		return errors.New("libsql: edge requires from_id, to_id, edge_type")
+	}
+	endpointProjects, err := loadEndpointProjects(ctx, s.db, []string{e.FromID, e.ToID})
+	if err != nil {
+		return err
+	}
+	if !scope.EdgeAllowed(endpointProjects[e.FromID], endpointProjects[e.ToID]) {
+		return fmt.Errorf("libsql: edge %s->%s(%s): stage mismatch", e.FromID, e.ToID, e.EdgeType)
 	}
 	if e.Confidence == 0 {
 		e.Confidence = 1.0
@@ -400,7 +487,7 @@ func (s *Store) UpsertEdge(ctx context.Context, e store.Edge) error {
 	if e.Bidirectional {
 		bidir = 1
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO edges (from_id, to_id, edge_type, confidence, confidence_tier, bidirectional)
 		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(from_id, to_id, edge_type) DO UPDATE SET
@@ -422,6 +509,26 @@ func (s *Store) UpsertEdges(ctx context.Context, edges []store.Edge) error {
 	if len(edges) == 0 {
 		return nil
 	}
+	for _, e := range edges {
+		if e.FromID == "" || e.ToID == "" || e.EdgeType == "" {
+			return errors.New("libsql: edge requires from_id, to_id, edge_type")
+		}
+	}
+
+	idSet := make(map[string]struct{}, len(edges)*2)
+	for _, e := range edges {
+		idSet[e.FromID] = struct{}{}
+		idSet[e.ToID] = struct{}{}
+	}
+	ids := make([]string, 0, len(idSet))
+	for id := range idSet {
+		ids = append(ids, id)
+	}
+	endpointProjects, err := loadEndpointProjects(ctx, s.db, ids)
+	if err != nil {
+		return err
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("libsql: begin edge upsert tx: %w", err)
@@ -430,6 +537,7 @@ func (s *Store) UpsertEdges(ctx context.Context, edges []store.Edge) error {
 		_ = tx.Rollback()
 	}()
 
+	skipped := 0
 	const batchSize = 100
 	for i := 0; i < len(edges); i += batchSize {
 		end := i + batchSize
@@ -441,8 +549,9 @@ func (s *Store) UpsertEdges(ctx context.Context, edges []store.Edge) error {
 		var valStrings []string
 		var args []any
 		for _, e := range batch {
-			if e.FromID == "" || e.ToID == "" || e.EdgeType == "" {
-				return errors.New("libsql: edge requires from_id, to_id, edge_type")
+			if !scope.EdgeAllowed(endpointProjects[e.FromID], endpointProjects[e.ToID]) {
+				skipped++
+				continue
 			}
 			if e.Confidence == 0 {
 				e.Confidence = 1.0
@@ -457,6 +566,9 @@ func (s *Store) UpsertEdges(ctx context.Context, edges []store.Edge) error {
 			}
 			valStrings = append(valStrings, "(?,?,?,?,?,?)")
 			args = append(args, e.FromID, e.ToID, e.EdgeType, e.Confidence, tier, bidir)
+		}
+		if len(valStrings) == 0 {
+			continue
 		}
 		_, err = tx.ExecContext(ctx,
 			fmt.Sprintf(`
@@ -478,7 +590,13 @@ func (s *Store) UpsertEdges(ctx context.Context, edges []store.Edge) error {
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if skipped > 0 {
+		log.Printf("libsql: skipped %d stage-mismatched edges", skipped)
+	}
+	return nil
 }
 
 func (s *Store) DeleteNode(ctx context.Context, id string) error {
@@ -751,7 +869,12 @@ func (s *Store) UpsertChunks(ctx context.Context, chunks []store.Chunk) error {
 		return err
 	}
 	if len(skippedIDs) > 0 {
-		return fmt.Errorf("%d chunk(s) skipped [%s]: %w", len(skippedIDs), strings.Join(skippedIDs, ", "), store.ErrVectorSkipped)
+		return fmt.Errorf(
+			"%d chunk(s) skipped [%s]: %w",
+			len(skippedIDs),
+			strings.Join(skippedIDs, ", "),
+			store.ErrVectorSkipped,
+		)
 	}
 	return nil
 }
@@ -890,14 +1013,15 @@ func (s *Store) neighborsBFS(
 	var allEdges []store.Edge
 
 	typeFilter, args := buildEdgeTypeFilter(edgeTypes)
+	edgeScopeFilter := scope.EdgeFilterSQL("fn", "tn")
 
 	for d := 0; d < depth && len(frontier) > 0; d++ {
 		var next []string
 		for _, fromID := range frontier {
-			edgeCols := "from_id, to_id, edge_type, confidence, confidence_tier, bidirectional"
-			q := `SELECT ` + edgeCols + ` FROM edges WHERE from_id = ?` + typeFilter + `
+			edgeCols := "e.from_id, e.to_id, e.edge_type, e.confidence, e.confidence_tier, e.bidirectional"
+			q := `SELECT ` + edgeCols + ` FROM edges e LEFT JOIN nodes fn ON fn.id = e.from_id LEFT JOIN nodes tn ON tn.id = e.to_id WHERE e.from_id = ?` + typeFilter + ` AND ` + edgeScopeFilter + `
 UNION ALL
-SELECT to_id, from_id, edge_type, confidence, confidence_tier, bidirectional FROM edges WHERE to_id = ? AND bidirectional = 1` + typeFilter
+SELECT e.to_id, e.from_id, e.edge_type, e.confidence, e.confidence_tier, e.bidirectional FROM edges e LEFT JOIN nodes fn ON fn.id = e.from_id LEFT JOIN nodes tn ON tn.id = e.to_id WHERE e.to_id = ? AND e.bidirectional = 1` + typeFilter + ` AND ` + edgeScopeFilter
 			queryArgs := make([]any, 0, 2+2*len(edgeTypes))
 			queryArgs = append(queryArgs, fromID)
 			queryArgs = append(queryArgs, args...)
@@ -1055,7 +1179,7 @@ func buildEdgeTypeFilter(edgeTypes []string) (string, []any) {
 	if len(edgeTypes) == 0 {
 		return "", nil
 	}
-	clause := " AND edge_type IN ("
+	clause := " AND e.edge_type IN ("
 	args := make([]any, len(edgeTypes))
 	for i, t := range edgeTypes {
 		if i > 0 {
@@ -1075,7 +1199,15 @@ func (s *Store) ListNodesByType(
 	limit, offset int,
 ) ([]store.Node, error) {
 	if len(types) == 0 {
-		return nil, nil
+		// nil/empty types = all node types
+		q := `SELECT id, project_id, node_type, title, content, content_hash, status, source_adapter, source_path, importance, language, created_at, updated_at
+		FROM nodes WHERE project_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`
+		rows, err := s.db.QueryContext(ctx, q, projectID, limit, offset)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		return scanNodeRows(rows)
 	}
 
 	placeholders := make([]string, len(types))
@@ -1100,7 +1232,10 @@ func (s *Store) ListNodesByType(
 	}
 
 	defer rows.Close()
+	return scanNodeRows(rows)
+}
 
+func scanNodeRows(rows *sql.Rows) ([]store.Node, error) {
 	var out []store.Node
 	for rows.Next() {
 		var n store.Node
@@ -1120,10 +1255,16 @@ func (s *Store) ListEdgesByType(
 	edgeType string,
 	limit, offset int,
 ) ([]store.Edge, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT e.from_id, e.to_id, e.edge_type, e.confidence, e.confidence_tier, e.bidirectional
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT e.from_id, e.to_id, e.edge_type, e.confidence, e.confidence_tier, e.bidirectional
 		FROM edges e JOIN nodes n ON n.id = e.from_id
 		WHERE n.project_id = ? AND e.edge_type = ? ORDER BY e.created_at DESC LIMIT ? OFFSET ?`,
-		projectID, edgeType, limit, offset)
+		projectID,
+		edgeType,
+		limit,
+		offset,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1148,13 +1289,15 @@ func (s *Store) ListEdgesByProject(
 	edgeTypes []string,
 	limit, offset int,
 ) ([]store.EdgeResult, int, error) {
-	q := `SELECT e.from_id, fn.title, fn.node_type, LENGTH(fn.content), e.to_id, tn.title, tn.node_type, LENGTH(tn.content), e.edge_type, e.confidence, e.confidence_tier,
+	q := `SELECT DISTINCT e.from_id, fn.title, fn.node_type, LENGTH(fn.content), fn.project_id,
+	       e.to_id, tn.title, tn.node_type, LENGTH(tn.content), tn.project_id,
+	       e.edge_type, e.confidence, e.confidence_tier,
 	       COUNT(*) OVER() AS total
 		FROM edges e
 		JOIN nodes fn ON fn.id = e.from_id
 		JOIN nodes tn ON tn.id = e.to_id
-		WHERE fn.project_id = ?`
-	args := []any{projectID}
+		WHERE (fn.project_id = ? OR tn.project_id = ?) AND ` + scope.EdgeFilterSQL("fn", "tn")
+	args := []any{projectID, projectID}
 
 	if len(edgeTypes) > 0 {
 		placeholders := make([]string, len(edgeTypes))
@@ -1179,7 +1322,9 @@ func (s *Store) ListEdgesByProject(
 		var er store.EdgeResult
 		var fromTitle, fromType, toTitle, toType string
 		var totalRow int
-		if err := rows.Scan(&er.FromID, &fromTitle, &fromType, &er.FromSize, &er.ToID, &toTitle, &toType, &er.ToSize, &er.EdgeType, &er.Confidence, &er.ConfidenceTier, &totalRow); err != nil {
+		if err := rows.Scan(&er.FromID, &fromTitle, &fromType, &er.FromSize, &er.FromProjectID,
+			&er.ToID, &toTitle, &toType, &er.ToSize, &er.ToProjectID,
+			&er.EdgeType, &er.Confidence, &er.ConfidenceTier, &totalRow); err != nil {
 			return nil, 0, fmt.Errorf("libsql: scan edge result: %w", err)
 		}
 		total = totalRow
@@ -1187,8 +1332,8 @@ func (s *Store) ListEdgesByProject(
 		er.FromType = fromType
 		er.ToTitle = toTitle
 		er.ToType = toType
-		er.FromGroup = extractGroup(er.FromID, projectID)
-		er.ToGroup = extractGroup(er.ToID, projectID)
+		er.FromGroup = extractGroup(er.FromID, er.FromProjectID)
+		er.ToGroup = extractGroup(er.ToID, er.ToProjectID)
 		out = append(out, er)
 	}
 	if err := rows.Err(); err != nil {
@@ -1207,10 +1352,11 @@ func extractGroup(id, projectID string) string {
 
 func (s *Store) GetEdgesFrom(ctx context.Context, nodeID string, edgeTypes []string) ([]store.Edge, error) {
 	typeFilter, args := buildEdgeTypeFilter(edgeTypes)
-	edgeCols := "from_id, to_id, edge_type, confidence, confidence_tier, bidirectional"
-	q := `SELECT ` + edgeCols + ` FROM edges WHERE from_id = ?` + typeFilter + `
+	edgeScopeFilter := scope.EdgeFilterSQL("fn", "tn")
+	edgeCols := "e.from_id, e.to_id, e.edge_type, e.confidence, e.confidence_tier, e.bidirectional"
+	q := `SELECT ` + edgeCols + ` FROM edges e LEFT JOIN nodes fn ON fn.id = e.from_id LEFT JOIN nodes tn ON tn.id = e.to_id WHERE e.from_id = ?` + typeFilter + ` AND ` + edgeScopeFilter + `
 UNION
-SELECT to_id, from_id, edge_type, confidence, confidence_tier, bidirectional FROM edges WHERE to_id = ? AND bidirectional = 1` + typeFilter + `
+SELECT e.to_id, e.from_id, e.edge_type, e.confidence, e.confidence_tier, e.bidirectional FROM edges e LEFT JOIN nodes fn ON fn.id = e.from_id LEFT JOIN nodes tn ON tn.id = e.to_id WHERE e.to_id = ? AND e.bidirectional = 1` + typeFilter + ` AND ` + edgeScopeFilter + `
 ORDER BY confidence DESC`
 	queryArgs := make([]any, 0, 2+2*len(edgeTypes))
 	queryArgs = append(queryArgs, nodeID)
@@ -1236,10 +1382,11 @@ ORDER BY confidence DESC`
 
 func (s *Store) GetEdgesTo(ctx context.Context, nodeID string, edgeTypes []string) ([]store.Edge, error) {
 	typeFilter, args := buildEdgeTypeFilter(edgeTypes)
-	edgeCols := "from_id, to_id, edge_type, confidence, confidence_tier, bidirectional"
-	q := `SELECT ` + edgeCols + ` FROM edges WHERE to_id = ?` + typeFilter + `
+	edgeScopeFilter := scope.EdgeFilterSQL("fn", "tn")
+	edgeCols := "e.from_id, e.to_id, e.edge_type, e.confidence, e.confidence_tier, e.bidirectional"
+	q := `SELECT ` + edgeCols + ` FROM edges e LEFT JOIN nodes fn ON fn.id = e.from_id LEFT JOIN nodes tn ON tn.id = e.to_id WHERE e.to_id = ?` + typeFilter + ` AND ` + edgeScopeFilter + `
 UNION
-SELECT to_id, from_id, edge_type, confidence, confidence_tier, bidirectional FROM edges WHERE from_id = ? AND bidirectional = 1` + typeFilter + `
+SELECT e.to_id, e.from_id, e.edge_type, e.confidence, e.confidence_tier, e.bidirectional FROM edges e LEFT JOIN nodes fn ON fn.id = e.from_id LEFT JOIN nodes tn ON tn.id = e.to_id WHERE e.from_id = ? AND e.bidirectional = 1` + typeFilter + ` AND ` + edgeScopeFilter + `
 ORDER BY confidence DESC`
 	queryArgs := make([]any, 0, 2+2*len(edgeTypes))
 	queryArgs = append(queryArgs, nodeID)
@@ -1320,27 +1467,37 @@ func (s *Store) ClearProject(ctx context.Context, projectID, modelID string) (st
 
 	var nodes, edges int
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM nodes WHERE project_id = ?`, projectID).Scan(&nodes)
-	_ = s.db.QueryRowContext(ctx,
+	_ = s.db.QueryRowContext(
+		ctx,
 		`SELECT COUNT(*) FROM edges WHERE from_id IN (SELECT id FROM nodes WHERE project_id = ?) OR to_id IN (SELECT id FROM nodes WHERE project_id = ?)`,
-		projectID, projectID).Scan(&edges)
+		projectID,
+		projectID,
+	).Scan(&edges)
 
 	var hasNV, hasCV int
-	_ = s.db.QueryRowContext(ctx, `SELECT 1 FROM pragma_table_list WHERE name = 'node_vectors' AND type = 'table'`).Scan(&hasNV)
-	_ = s.db.QueryRowContext(ctx, `SELECT 1 FROM pragma_table_list WHERE name = 'chunk_vectors' AND type = 'table'`).Scan(&hasCV)
+	_ = s.db.QueryRowContext(ctx, `SELECT 1 FROM pragma_table_list WHERE name = 'node_vectors' AND type = 'table'`).
+		Scan(&hasNV)
+	_ = s.db.QueryRowContext(ctx, `SELECT 1 FROM pragma_table_list WHERE name = 'chunk_vectors' AND type = 'table'`).
+		Scan(&hasCV)
 
 	if hasCV != 0 {
-		_, _ = s.db.ExecContext(ctx,
+		_, _ = s.db.ExecContext(
+			ctx,
 			`DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT c.id FROM chunks c JOIN nodes n ON n.id = c.parent_node_id WHERE n.project_id = ?)`,
-			projectID)
+			projectID,
+		)
 	}
 	if hasNV != 0 {
 		_, _ = s.db.ExecContext(ctx,
 			`DELETE FROM node_vectors WHERE node_id IN (SELECT id FROM nodes WHERE project_id = ?)`,
 			projectID)
 	}
-	_, _ = s.db.ExecContext(ctx,
+	_, _ = s.db.ExecContext(
+		ctx,
 		`DELETE FROM edge_proposals WHERE from_id IN (SELECT id FROM nodes WHERE project_id = ?) OR to_id IN (SELECT id FROM nodes WHERE project_id = ?)`,
-		projectID, projectID)
+		projectID,
+		projectID,
+	)
 	_, _ = s.db.ExecContext(ctx, `DELETE FROM unresolved_references WHERE project_id = ?`, projectID)
 	_, _ = s.db.ExecContext(ctx, `DELETE FROM nodes WHERE project_id = ?`, projectID)
 
@@ -1354,9 +1511,11 @@ func (s *Store) LogAccess(ctx context.Context, projectID, nodeID, sessionID stri
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx,
+	_, err = s.db.ExecContext(
+		ctx,
 		`UPDATE nodes SET access_count = access_count + 1, last_accessed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`,
-		nodeID)
+		nodeID,
+	)
 	return err
 }
 
@@ -1412,11 +1571,15 @@ func (s *Store) GetSessionPairs(ctx context.Context, withinSec int, minSessions 
 }
 
 func (s *Store) AccessHistory(ctx context.Context, nodeID string, limit int) ([]store.Node, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.db.QueryContext(
+		ctx,
 		`SELECT n.id, n.project_id, n.node_type, n.title, n.content, n.content_hash, n.status, n.source_adapter, n.source_path, n.importance, n.language, n.created_at, n.updated_at
 		FROM access_log a JOIN nodes n ON n.id = a.node_id
 		WHERE a.node_id = ?
-		ORDER BY a.accessed_at DESC LIMIT ?`, nodeID, limit)
+		ORDER BY a.accessed_at DESC LIMIT ?`,
+		nodeID,
+		limit,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("libsql: access history: %w", err)
 	}
@@ -1445,10 +1608,14 @@ func (s *Store) GetAccessStats(ctx context.Context, nodeID string) (int, string,
 }
 
 func (s *Store) ListNodesByUpdatedAfter(ctx context.Context, projectID, after string, limit int) ([]store.Node, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.db.QueryContext(
+		ctx,
 		`SELECT id, project_id, node_type, title, content, content_hash, status, source_adapter, source_path, importance, language, created_at, updated_at
 		FROM nodes WHERE project_id = ? AND updated_at > ? ORDER BY updated_at DESC LIMIT ?`,
-		projectID, after, limit)
+		projectID,
+		after,
+		limit,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("libsql: list nodes by updated: %w", err)
 	}
@@ -1503,6 +1670,36 @@ func (s *Store) GetTopNodesByImportance(ctx context.Context, projectID string, l
 	return out, rows.Err()
 }
 
+func (s *Store) GetNodesByCrossProjectEdges(
+	ctx context.Context,
+	projectID, otherProject string,
+	limit int,
+) ([]store.Node, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT n.id, n.project_id, n.node_type, n.title, n.content, n.content_hash, n.status, n.source_adapter, n.source_path, n.importance, n.language, n.created_at, n.updated_at
+		FROM edges e
+		JOIN nodes fn ON fn.id = e.from_id
+		JOIN nodes tn ON tn.id = e.to_id
+		JOIN nodes n ON n.id = e.from_id OR n.id = e.to_id
+		WHERE ((fn.project_id = ? AND tn.project_id = ?) OR (fn.project_id = ? AND tn.project_id = ?))
+		  AND n.project_id = ?
+		ORDER BY n.importance DESC LIMIT ?`, projectID, otherProject, otherProject, projectID, projectID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("libsql: get nodes by cross-project edges: %w", err)
+	}
+	defer rows.Close()
+	var out []store.Node
+	for rows.Next() {
+		var n store.Node
+		if err := rows.Scan(&n.ID, &n.ProjectID, &n.NodeType, &n.Title, &n.Content, &n.ContentHash,
+			&n.Status, &n.SourceAdapter, &n.SourcePath, &n.Importance, &n.Language, &n.CreatedAt, &n.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("libsql: scan cross-project node: %w", err)
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) ListProjects(ctx context.Context) ([]store.ProjectInfo, error) {
 	nodeRows, err := s.db.QueryContext(ctx, `SELECT project_id, COUNT(*) FROM nodes GROUP BY project_id`)
 	if err != nil {
@@ -1543,13 +1740,34 @@ func (s *Store) ListProjects(ctx context.Context) ([]store.ProjectInfo, error) {
 		return nil, err
 	}
 
+	meta := map[string]struct{ name, url string }{}
+	if metaRows, err := s.db.QueryContext(ctx, `SELECT project_id, project_name, repository_url FROM projects`); err == nil {
+		for metaRows.Next() {
+			var pid, name, url string
+			if err := metaRows.Scan(&pid, &name, &url); err == nil {
+				meta[pid] = struct{ name, url string }{name: name, url: url}
+			}
+		}
+		metaRows.Close()
+	}
+
 	out := make([]store.ProjectInfo, 0, len(nodeMap))
 	for pid, nc := range nodeMap {
-		out = append(out, store.ProjectInfo{
+		info := store.ProjectInfo{
 			ProjectID: pid,
 			NodeCount: nc,
 			EdgeCount: edgeMap[pid],
-		})
+		}
+		if base, stage, staged, err := scope.Decode(pid); err == nil && staged {
+			info.ProjectID = base
+			info.Stage = stage
+			info.EffectiveProjectID = pid
+		}
+		if m, ok := meta[info.ProjectID]; ok {
+			info.ProjectName = m.name
+			info.RepositoryURL = m.url
+		}
+		out = append(out, info)
 	}
 	for pid := range edgeMap {
 		if _, ok := nodeMap[pid]; !ok {
@@ -1557,4 +1775,22 @@ func (s *Store) ListProjects(ctx context.Context) ([]store.ProjectInfo, error) {
 		}
 	}
 	return out, nil
+}
+
+func (s *Store) UpsertProject(ctx context.Context, projectID, projectName, repositoryURL string) error {
+	if projectID == "" {
+		return errors.New("libsql: project id must not be empty")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO projects (project_id, project_name, repository_url, updated_at)
+		VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+		ON CONFLICT(project_id) DO UPDATE SET
+			project_name   = excluded.project_name,
+			repository_url = excluded.repository_url,
+			updated_at     = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+	`, projectID, projectName, repositoryURL)
+	if err != nil {
+		return fmt.Errorf("libsql: upsert project %s: %w", projectID, err)
+	}
+	return nil
 }

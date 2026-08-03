@@ -14,8 +14,18 @@ export function computeOrbitalTarget(
   centerY: number,
   orbitalRadius: number,
   groupCounters: Map<string, number>,
+  satelliteProjectIds: string[],
 ): RadialTarget {
   if (d.id === rootId) return { x: centerX, y: centerY }
+  const satelliteIndex = satelliteProjectIds.indexOf(d.project_id)
+  if (satelliteIndex >= 0) {
+    const angle = ((satelliteIndex + 1) / (satelliteProjectIds.length + 1)) * Math.PI * 2 - Math.PI / 2
+    const distance = orbitalRadius * 5
+    return {
+      x: centerX + Math.cos(angle) * distance,
+      y: centerY + Math.sin(angle) * distance,
+    }
+  }
   const idx = groupNames.indexOf(d.group)
   const baseAngle = idx >= 0 ? idx * angleStep : 0
   const n = groupCounters.get(d.group) || 0

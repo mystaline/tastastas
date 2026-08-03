@@ -17,6 +17,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/mystaline/tastastas/internal/embed"
 	"github.com/mystaline/tastastas/internal/onboard"
+	"github.com/mystaline/tastastas/internal/scope"
 	"github.com/mystaline/tastastas/internal/store"
 )
 
@@ -52,6 +53,8 @@ func ServeHTTP(
 	// SPA fetches from /api/graph/{project}, no reverse proxy in front to strip the prefix.
 	mux.HandleFunc("GET /graph/{project}", HandleGraphData(db))
 	mux.HandleFunc("GET /api/graph/{project}", HandleGraphData(db))
+	mux.HandleFunc("GET /graph/{project}/linked", HandleLinkedProjects(db))
+	mux.HandleFunc("GET /api/graph/{project}/linked", HandleLinkedProjects(db))
 	mux.HandleFunc("GET /graph/{project}/", HandleGraphSPA(spaDir))
 
 	// REST ingest — POST /ingest auto-detects adapters, same pipeline as MCP ingest tool.
@@ -129,11 +132,48 @@ func bearerMatches(r *http.Request, token string) bool {
 	return ok == len(token) && len(token) > 0
 }
 
+// crossProjectEdgeTypes are the edge types that can link nodes across projects.
+var crossProjectEdgeTypes = []string{"cross-project-call", "depends_on", "auto-linked"}
+
+// extractGroup derives the first path segment of a node ID after its project
+// prefix, e.g. "proj/code:file/services/iam/app.go" → "code:file".
+func extractGroup(id, projectID string) string {
+	trimmed := strings.TrimPrefix(id, projectID+"/")
+	if i := strings.Index(trimmed, "/"); i >= 0 {
+		return trimmed[:i]
+	}
+	return ""
+}
+
+// sidecarProjectID reduces a project ID to a repo-path key for cross-project
+// graph filtering: it strips the stage marker and the host. Under the
+// remote-derived identity scheme (`host/org/repo`), every edge into a
+// URL-derived project's graph would otherwise be keyed by just the host,
+// silently dropping cross-project edges. Stripping to `org/repo` makes
+// host/org/repo and org/repo keys agree.
+func sidecarProjectID(id string) string {
+	base, _, _, _ := scope.Decode(id)
+	if i := strings.Index(base, "/"); i >= 0 {
+		return base[i+1:]
+	}
+	return base
+}
+
 func HandleGraphData(db store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		projectID := r.PathValue("project")
-		if projectID == "" {
-			projectID = "default"
+		pathProjectID := r.PathValue("project")
+		if pathProjectID == "" {
+			pathProjectID = "default"
+		}
+		if strings.Contains(pathProjectID, scope.Marker) {
+			http.Error(w, `{"error":"project path segment must not contain a stage marker"}`, http.StatusBadRequest)
+			return
+		}
+		stageParam := r.URL.Query().Get("stage")
+		projectID, err := scope.Resolve(pathProjectID, stageParam, false)
+		if err != nil {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+			return
 		}
 
 		edgeTypes := []string{
@@ -145,6 +185,8 @@ func HandleGraphData(db store.Store) http.HandlerFunc {
 			"imports",
 			"convention-member",
 			"auto-linked",
+			"cross-project-call",
+			"depends_on",
 			"proposed",
 			"references",
 			"contains",
@@ -162,15 +204,15 @@ func HandleGraphData(db store.Store) http.HandlerFunc {
 		}
 
 		nodeMap := map[string]*struct {
-			id, title, ntype, group string
-			weight, size            int
+			id, title, ntype, group, projectID string
+			weight, size                       int
 		}{}
-		addNode := func(id, title, ntype, group string, size int) {
+		addNode := func(id, title, ntype, group, pid string, size int) {
 			if _, ok := nodeMap[id]; !ok {
 				nodeMap[id] = &struct {
-					id, title, ntype, group string
-					weight, size            int
-				}{id: id, title: title, ntype: ntype, group: group, size: size}
+					id, title, ntype, group, projectID string
+					weight, size                       int
+				}{id: id, title: title, ntype: ntype, group: group, projectID: pid, size: size}
 			}
 			nodeMap[id].weight++
 		}
@@ -194,8 +236,8 @@ func HandleGraphData(db store.Store) http.HandlerFunc {
 		structuralEdges := []graphEdge{}
 		proposedEdges := []graphEdge{}
 		for _, r := range results {
-			addNode(r.FromID, r.FromTitle, r.FromType, r.FromGroup, r.FromSize)
-			addNode(r.ToID, r.ToTitle, r.ToType, r.ToGroup, r.ToSize)
+			addNode(r.FromID, r.FromTitle, r.FromType, r.FromGroup, r.FromProjectID, r.FromSize)
+			addNode(r.ToID, r.ToTitle, r.ToType, r.ToGroup, r.ToProjectID, r.ToSize)
 			edge := graphEdge{
 				Source: r.FromID, Target: r.ToID,
 				EdgeType: r.EdgeType, Confidence: r.Confidence,
@@ -206,11 +248,73 @@ func HandleGraphData(db store.Store) http.HandlerFunc {
 				structuralEdges = append(structuralEdges, edge)
 			}
 		}
+
+		// Sidecar projects: pull in top nodes from other projects so the
+		// graph shows the broader surface of linked shared libraries, not
+		// just nodes already touching an edge endpoint.
+		sidecars := map[string]bool{}
+		for _, p := range strings.Split(r.URL.Query().Get("sidecars"), ",") {
+			p = strings.TrimSpace(p)
+			if p != "" && p != projectID {
+				sidecars[p] = true
+			}
+		}
+		addSidecarNode := func(n store.Node, sc string) {
+			if _, ok := nodeMap[n.ID]; !ok {
+				nodeMap[n.ID] = &struct {
+					id, title, ntype, group, projectID string
+					weight, size                       int
+				}{id: n.ID, title: n.Title, ntype: n.NodeType,
+					group: extractGroup(n.ID, sc), projectID: sidecarProjectID(n.ProjectID),
+					size: len(n.Content)}
+			}
+			nodeMap[n.ID].weight++
+		}
+		for sc := range sidecars {
+			// Cross-project edge endpoints first so connected satellites
+			// render visible links to the main graph, not just isolated nodes.
+			sn, err := db.GetNodesByCrossProjectEdges(r.Context(), sc, projectID, 200)
+			if err == nil {
+				for _, n := range sn {
+					addSidecarNode(n, sc)
+				}
+			}
+			sn, err = db.GetTopNodesByImportance(r.Context(), sc, 200)
+			if err != nil {
+				continue
+			}
+			for _, n := range sn {
+				addSidecarNode(n, sc)
+			}
+		}
+
+		// Cross-project edges render only when their satellite project is
+		// explicitly selected; otherwise the main graph stays project-local.
+		{
+			filtered := structuralEdges[:0]
+			for _, e := range structuralEdges {
+				sp, tp := sidecarProjectID(e.Source), sidecarProjectID(e.Target)
+				if sp != projectID && !sidecars[sp] {
+					continue
+				}
+				if tp != projectID && !sidecars[tp] {
+					continue
+				}
+				filtered = append(filtered, e)
+			}
+			structuralEdges = filtered
+			for id, n := range nodeMap {
+				if n.projectID != projectID && !sidecars[n.projectID] {
+					delete(nodeMap, id)
+				}
+			}
+		}
+
 		for _, n := range nodeMap {
 			nodes = append(nodes, graphNode{
 				ID: n.id, Title: n.title, Type: n.ntype, Group: n.group,
 				Size: n.size, Weight: n.weight,
-				ProjectID: projectID,
+				ProjectID: n.projectID,
 			})
 		}
 
@@ -251,11 +355,61 @@ func HandleGraphData(db store.Store) http.HandlerFunc {
 		}
 
 		// Redirect to SPA entry point
-		redirectURL := "/graph/" + projectID + "/"
+		redirectURL := "/graph/" + pathProjectID + "/"
 		if r.URL.RawQuery != "" {
 			redirectURL += "?" + r.URL.RawQuery
 		}
 		http.Redirect(w, r, redirectURL, http.StatusFound)
+	}
+}
+
+// HandleLinkedProjects returns the list of projects linked to the given
+// project via cross-project edges (auto-discovered, not manually configured).
+func HandleLinkedProjects(db store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		pathProjectID := r.PathValue("project")
+		if pathProjectID == "" {
+			pathProjectID = "default"
+		}
+		if strings.Contains(pathProjectID, scope.Marker) {
+			http.Error(w, `{"error":"project path segment must not contain a stage marker"}`, http.StatusBadRequest)
+			return
+		}
+		stageParam := r.URL.Query().Get("stage")
+		projectID, err := scope.Resolve(pathProjectID, stageParam, false)
+		if err != nil {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+			return
+		}
+		results, _, err := db.ListEdgesByProject(r.Context(), projectID, crossProjectEdgeTypes, 10000, 0)
+		if err != nil {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+			return
+		}
+		seen := map[string]bool{}
+		linked := []string{}
+		consider := func(id string) {
+			if id == "" || id == projectID || seen[id] {
+				return
+			}
+			if stageParam != "" {
+				_, otherStage, _, _ := scope.Decode(id)
+				if otherStage != stageParam {
+					return
+				}
+			}
+			seen[id] = true
+			linked = append(linked, id)
+		}
+		for _, res := range results {
+			consider(res.FromProjectID)
+			consider(res.ToProjectID)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(struct {
+			ProjectID      string   `json:"project_id"`
+			LinkedProjects []string `json:"linked_projects"`
+		}{ProjectID: pathProjectID, LinkedProjects: linked})
 	}
 }
 
@@ -335,37 +489,45 @@ func handleRESTIngest(
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Root      string `json:"root"`
-			ProjectID string `json:"project_id"`
-			Ref       string `json:"ref,omitempty"`
+			Root          string `json:"root"`
+			RepositoryURL string `json:"repository_url"`
+			ProjectID     string `json:"project_id"`
+			Stage         string `json:"stage"`
 		}
 		body, _ := io.ReadAll(r.Body)
 		if err := json.Unmarshal(body, &req); err != nil {
 			http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
 			return
 		}
-		projectID := req.ProjectID
-		if projectID == "" {
-			projectID = "default"
-		}
-		root := req.Root
-		if root == "" {
-			http.Error(w, `{"error":"root is required"}`, http.StatusBadRequest)
+
+		rr, err := resolveRepo(req.Root, req.RepositoryURL, req.ProjectID)
+		if err != nil {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
 			return
 		}
-		root = normalizePath(root)
-		if req.Ref != "" {
-			log.Printf("ingest: project=%s ref=%s root=%s", projectID, req.Ref, root)
-		}
+		walkCwd := rr.Root
+		projectID := rr.ProjectID
 
-		job := jobs.create(projectID)
+		stage := req.Stage
+		if stage == "" {
+			stage = resolveRef(walkCwd)
+		}
+		effectiveID, err := scope.Encode(projectID, stage)
+		if err != nil {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+			return
+		}
+		_ = db.UpsertProject(r.Context(), projectID, rr.ProjectName, rr.RepositoryURL)
+		warning := stageTransitionWarning(r.Context(), db, projectID, stage)
+
+		job := jobs.create(effectiveID)
 		runCtx, cancel := context.WithCancel(jobCtx)
 		jobs.setCancel(job.ID, cancel)
 		safeGo(func() {
 			ingestMu.Lock()
 			result, err := onboard.Run(runCtx, onboard.Config{
-				CWD:       root,
-				ProjectID: projectID,
+				CWD:       walkCwd,
+				ProjectID: effectiveID,
 				ModelID:   modelID,
 				Embedder:  embedder,
 				Store:     db,
@@ -388,7 +550,14 @@ func handleRESTIngest(
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
-		fmt.Fprintf(w, `{"job_id":%q,"status":"running"}`, job.ID)
+		resp, _ := json.Marshal(struct {
+			JobID              string `json:"job_id"`
+			Status             string `json:"status"`
+			Stage              string `json:"stage"`
+			EffectiveProjectID string `json:"effective_project_id"`
+			Warning            string `json:"warning,omitempty"`
+		}{JobID: job.ID, Status: "running", Stage: stage, EffectiveProjectID: effectiveID, Warning: warning})
+		w.Write(resp)
 	}
 }
 

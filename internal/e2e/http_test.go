@@ -16,7 +16,9 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -202,10 +204,15 @@ func TestE2EHTTPHealthAndIngest(t *testing.T) {
 
 	// POST /ingest — REST ingest shape check. Ingest is async now
 	// (internal/mcp/jobs.go): it returns 202 + job_id immediately, and the
-	// caller polls GET /ingest/jobs/{id}. Use testdata directory root so
-	// ingest walks our existing test fixtures.
+	// caller polls GET /ingest/jobs/{id}. Uses a plain t.TempDir() (outside
+	// this repo's git tree, so resolveRef falls back to stage "local"
+	// instead of picking up this repo's own branch).
+	nonGitRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(nonGitRoot, "notes.md"), []byte("# Notes\n"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
 	ingestBody, _ := json.Marshal(map[string]string{
-		"root":       "testdata",
+		"root":       nonGitRoot,
 		"project_id": "e2e-http",
 	})
 	resp2, err := http.Post(base+"/ingest", "application/json", bytes.NewReader(ingestBody))
@@ -218,13 +225,245 @@ func TestE2EHTTPHealthAndIngest(t *testing.T) {
 		t.Fatalf("POST /ingest: status %d: %s", resp2.StatusCode, b)
 	}
 	var ingestOut struct {
-		JobID string `json:"job_id"`
+		JobID              string `json:"job_id"`
+		Stage              string `json:"stage"`
+		EffectiveProjectID string `json:"effective_project_id"`
 	}
 	if err := json.NewDecoder(resp2.Body).Decode(&ingestOut); err != nil {
 		t.Fatalf("decode /ingest accepted: %v", err)
 	}
 	if ingestOut.JobID == "" {
 		t.Fatalf("/ingest: expected job_id, got %+v", ingestOut)
+	}
+	// "testdata" isn't a git repo — resolveRef falls back to "local".
+	if ingestOut.Stage != "local" {
+		t.Fatalf("/ingest: expected stage=local for non-git root, got %+v", ingestOut)
+	}
+	if ingestOut.EffectiveProjectID != "e2e-http::stage:local" {
+		t.Fatalf("/ingest: expected effective_project_id e2e-http::stage:local, got %+v", ingestOut)
+	}
+}
+
+// TestE2EHTTPIngestRepositoryURLNoRoot proves POST /ingest resolves a
+// repository purely from repository_url + project_id when root is omitted
+// entirely — CI runners shouldn't need server filesystem knowledge.
+func TestE2EHTTPIngestRepositoryURLNoRoot(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping E2E HTTP test in -short mode")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary not available")
+	}
+
+	workspaceRoot := t.TempDir()
+	t.Setenv("SERVER_WORKSPACE_ROOT", workspaceRoot)
+
+	repoDir := filepath.Join(workspaceRoot, "repo-a")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	for _, args := range [][]string{
+		{"init", "-q"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "test"},
+		{"remote", "add", "origin", "https://example.com/org/repo-a.git"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", repoDir}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# Repo A\n"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	addr := startHTTPServer(t)
+	base := "http://" + addr
+
+	body, _ := json.Marshal(map[string]string{
+		"repository_url": "https://example.com/org/repo-a.git",
+		"project_id":     "repo-a",
+	})
+	resp, err := http.Post(base+"/ingest", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /ingest: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("POST /ingest: status %d: %s", resp.StatusCode, b)
+	}
+	var out struct {
+		JobID              string `json:"job_id"`
+		EffectiveProjectID string `json:"effective_project_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode /ingest accepted: %v", err)
+	}
+	if out.JobID == "" {
+		t.Fatalf("/ingest: expected job_id, got %+v", out)
+	}
+}
+
+// TestE2EHTTPIngestMissingEverythingReturns400 proves the REST endpoint
+// mirrors the MCP tool's error path: no root, no repository_url, and no
+// matching project_id under SERVER_WORKSPACE_ROOT must 400, not silently
+// walk nothing or the whole workspace root.
+func TestE2EHTTPIngestMissingEverythingReturns400(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping E2E HTTP test in -short mode")
+	}
+	t.Setenv("SERVER_WORKSPACE_ROOT", t.TempDir())
+
+	addr := startHTTPServer(t)
+	base := "http://" + addr
+
+	body, _ := json.Marshal(map[string]string{
+		"project_id": "no-such-project",
+	})
+	resp, err := http.Post(base+"/ingest", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /ingest: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("POST /ingest: expected 400, got %d: %s", resp.StatusCode, b)
+	}
+}
+
+// TestE2EHTTPIngestLocalToBranchTransitionWarns proves that ingesting a
+// directory first as non-git (stage=local), then re-ingesting after it
+// becomes a real git repo, carries a warning about the orphaned local data
+// — and that the local-stage data itself is never auto-purged.
+func TestE2EHTTPIngestLocalToBranchTransitionWarns(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping E2E HTTP test in -short mode")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary not available")
+	}
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "notes.md"), []byte("# Notes\n"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	addr := startHTTPServer(t)
+	base := "http://" + addr
+	projectID := "transition-test"
+
+	postIngest := func() struct {
+		JobID              string `json:"job_id"`
+		Stage              string `json:"stage"`
+		EffectiveProjectID string `json:"effective_project_id"`
+		Warning            string `json:"warning"`
+	} {
+		t.Helper()
+		body, _ := json.Marshal(map[string]string{
+			"root":       root,
+			"project_id": projectID,
+		})
+		resp, err := http.Post(base+"/ingest", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST /ingest: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusAccepted {
+			b, _ := io.ReadAll(resp.Body)
+			t.Fatalf("POST /ingest: status %d: %s", resp.StatusCode, b)
+		}
+		var out struct {
+			JobID              string `json:"job_id"`
+			Stage              string `json:"stage"`
+			EffectiveProjectID string `json:"effective_project_id"`
+			Warning            string `json:"warning"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatalf("decode /ingest accepted: %v", err)
+		}
+		return out
+	}
+
+	waitDone := func(jobID string) {
+		t.Helper()
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			jresp, err := http.Get(base + "/ingest/jobs/" + jobID)
+			if err != nil {
+				t.Fatalf("GET /ingest/jobs/%s: %v", jobID, err)
+			}
+			var st struct {
+				Status string `json:"status"`
+			}
+			json.NewDecoder(jresp.Body).Decode(&st)
+			jresp.Body.Close()
+			if st.Status == "done" || st.Status == "error" {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Fatalf("job %s did not complete in time", jobID)
+	}
+
+	first := postIngest()
+	if first.Stage != "local" {
+		t.Fatalf("first ingest: expected stage=local, got %+v", first)
+	}
+	waitDone(first.JobID)
+
+	for _, args := range [][]string{
+		{"init", "-q"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "test"},
+		{"add", "notes.md"},
+		{"commit", "-q", "-m", "init"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+
+	second := postIngest()
+	if second.Stage == "local" {
+		t.Fatalf("second ingest: expected a real branch stage, got %+v", second)
+	}
+	if second.Warning == "" {
+		t.Fatalf("second ingest: expected warning about orphaned local-stage data, got %+v", second)
+	}
+	waitDone(second.JobID)
+
+	// local-stage data must still be present — never auto-purged. Verify
+	// via the MCP onboard_check tool (REST has no direct equivalent).
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	transport := &mcp.StreamableClientTransport{Endpoint: base + "/mcp"}
+	client := mcp.NewClient(&mcp.Implementation{Name: "e2e-http-test", Version: "0.0.0"}, nil)
+	sess, err := client.Connect(ctx, transport, nil)
+	if err != nil {
+		t.Fatalf("connect over StreamableClientTransport: %v", err)
+	}
+	defer sess.Close()
+	res, err := sess.CallTool(ctx, &mcp.CallToolParams{
+		Name: "onboard_check",
+		Arguments: map[string]any{
+			"project_id": projectID,
+			"stage":      "local",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool(onboard_check): %v", err)
+	}
+	var checkOut struct {
+		HasNodes bool `json:"has_nodes"`
+	}
+	b, _ := json.Marshal(res.StructuredContent)
+	if err := json.Unmarshal(b, &checkOut); err != nil {
+		t.Fatalf("unmarshal onboard_check StructuredContent: %v", err)
+	}
+	if !checkOut.HasNodes {
+		t.Fatalf("expected stage=local data still present after transition, got %+v", checkOut)
 	}
 }
 
@@ -345,5 +584,169 @@ func TestE2EHTTPMCPToolSequence(t *testing.T) {
 	callHTTPTool("forget", map[string]any{"id": "e2e-http/fact/prd-001"}, &forgetOut)
 	if forgetOut.Status != "not_found" {
 		t.Fatalf("forget: expected status=not_found on repeat, got %+v", forgetOut)
+	}
+}
+
+// connectHTTP opens a real MCP-over-HTTP session against a running test
+// server, so the HTTP tests here can drive tools with the SDK client and
+// reuse the package-level callRaw tool (identity_e2e_test.go) for
+// error-path assertions.
+func connectHTTP(t *testing.T, base string) *mcp.ClientSession {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	transport := &mcp.StreamableClientTransport{Endpoint: base + "/mcp"}
+	client := mcp.NewClient(&mcp.Implementation{Name: "e2e-http", Version: "0.0.0"}, nil)
+	sess, err := client.Connect(ctx, transport, nil)
+	if err != nil {
+		t.Fatalf("connect over StreamableClientTransport: %v", err)
+	}
+	t.Cleanup(func() { sess.Close() })
+	return sess
+}
+
+// TestE2EHTTPIdentitySuffixResolves proves the on-prem path: a client cwd in
+// a different path namespace than the server (<root>/Personal/tastastas vs
+// the client's /home/client/Workspace/Personal/tastastas) suffix-matches to
+// the server repo and derives identity from the remote — over HTTP.
+func TestE2EHTTPIdentitySuffixResolves(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping E2E HTTP test in -short mode")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary not available")
+	}
+
+	workspaceRoot := t.TempDir()
+	t.Setenv("SERVER_WORKSPACE_ROOT", workspaceRoot)
+
+	repoDir := filepath.Join(workspaceRoot, "Personal", "tastastas")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	for _, args := range [][]string{
+		{"init", "-q"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "test"},
+		{"remote", "add", "origin", "https://gitea.example/Org/tastastas.git"},
+	} {
+		out, err := exec.Command("git", append([]string{"-C", repoDir}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# tastastas\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	for _, args := range [][]string{
+		{"add", "README.md"},
+		{"commit", "-q", "-m", "init"},
+	} {
+		out, err := exec.Command("git", append([]string{"-C", repoDir}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+
+	addr := startHTTPServer(t)
+	base := "http://" + addr
+
+	body, _ := json.Marshal(map[string]string{
+		// a client-side path that does not exist on the server. The REST
+		// ingest field is "root" (the MCP tool's cwd), so that is what the
+		// suffix matcher resolves.
+		"root": "/home/client/Workspace/Personal/tastastas",
+	})
+	resp, err := http.Post(base+"/ingest", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /ingest: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("POST /ingest: status %d: %s", resp.StatusCode, b)
+	}
+	var out struct {
+		JobID              string `json:"job_id"`
+		Stage              string `json:"stage"`
+		EffectiveProjectID string `json:"effective_project_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode ingest response: %v", err)
+	}
+	if out.JobID == "" {
+		t.Fatalf("expected job_id, got %+v", out)
+	}
+	if out.Stage == "" {
+		t.Fatalf("expected a stage (or local fallback), got %+v", out)
+	}
+	if !strings.HasPrefix(out.EffectiveProjectID, "gitea.example/Org/tastastas::stage:") {
+		t.Fatalf("effective_project_id = %q, want prefix gitea.example/Org/tastastas::stage:", out.EffectiveProjectID)
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		jresp, err := http.Get(base + "/ingest/jobs/" + out.JobID)
+		if err != nil {
+			t.Fatalf("job poll: %v", err)
+		}
+		var st struct {
+			Status string `json:"status"`
+		}
+		json.NewDecoder(jresp.Body).Decode(&st)
+		jresp.Body.Close()
+		if st.Status == "done" || st.Status == "error" || time.Now().After(deadline) {
+			if st.Status != "done" {
+				t.Fatalf("job not done: %+v", st)
+			}
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestE2EHTTPCloneRepoValidation proves the clone_repo guard rails over the
+// wire without touching the network: no SERVER_WORKSPACE_ROOT, option-injection
+// URLs, file:// URLs, and the never-overwrite existing-dest refusal. The real
+// network clone happy path stays manual (ponytail: extend here once a
+// fixture remote exists).
+func TestE2EHTTPCloneRepoValidation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping E2E HTTP test in -short mode")
+	}
+
+	// 1. No SERVER_WORKSPACE_ROOT -> refuses before any git.
+	addr := startHTTPServer(t)
+	sess := connectHTTP(t, "http://"+addr)
+	isErr, text := callRaw(t, sess, "clone_repo", map[string]any{
+		"repository_url": "https://gitea.example/Org/repo.git",
+	})
+	if !isErr || !strings.Contains(text, "SERVER_WORKSPACE_ROOT") {
+		t.Fatalf("clone without workspace root: expected error naming SERVER_WORKSPACE_ROOT, got isErr=%v text=%q", isErr, text)
+	}
+
+	// 2. With a root set, the destructive inputs are rejected.
+	wsRoot := t.TempDir()
+	t.Setenv("SERVER_WORKSPACE_ROOT", wsRoot)
+	addr = startHTTPServer(t)
+	sess = connectHTTP(t, "http://"+addr)
+
+	for _, bad := range []string{"--upload-pack=evil", "file:///etc/passwd"} {
+		isErr, text = callRaw(t, sess, "clone_repo", map[string]any{"repository_url": bad})
+		if !isErr {
+			t.Fatalf("clone %q: expected validation error, got %q", bad, text)
+		}
+	}
+
+	// 3. Existing destination -> refusal, no clone attempt (never overwrite).
+	dest := filepath.Join(wsRoot, "Org", "repo")
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		t.Fatalf("MkdirAll dest: %v", err)
+	}
+	isErr, text = callRaw(t, sess, "clone_repo", map[string]any{
+		"repository_url": "https://gitea.example/Org/repo.git",
+	})
+	if !isErr || !strings.Contains(text, "already exists") {
+		t.Fatalf("clone into existing dest: expected 'already exists' error, got isErr=%v text=%q", isErr, text)
 	}
 }

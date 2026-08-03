@@ -111,6 +111,23 @@ func ensureDBDir(path string) {
 	_ = os.MkdirAll(dir, 0o755)
 }
 
+// defaultWorkspaceRoot returns $SERVER_WORKSPACE_ROOT if set (never created —
+// an explicit path that's missing is a misconfiguration and must error, not
+// be silently created). If unset, returns a home-based default
+// (~/tastastas/workspaces) for the caller to create. Returns "" if the env
+// is unset and the home directory can't be determined — no relative-path
+// guessing.
+func defaultWorkspaceRoot() string {
+	if v := os.Getenv("SERVER_WORKSPACE_ROOT"); v != "" {
+		return v
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, "tastastas", "workspaces")
+}
+
 func isRemoteDSN(dsn string) bool {
 	return strings.HasPrefix(dsn, "libsql://") || strings.HasPrefix(dsn, "http://") ||
 		strings.HasPrefix(dsn, "https://")
@@ -152,8 +169,8 @@ func main() {
 	)
 	embedBackend := flag.String(
 		"embed-backend",
-		"sidecar",
-		"embedder backend: sidecar (baked ONNX, zero deps, 384-dim), ollama (HTTP, 768-dim), openai (cloud API, 1536-dim), or none (lexical only)",
+		"",
+		"embedder backend: sidecar (baked ONNX, zero deps, 384-dim), ollama (HTTP, 768-dim), openai (cloud API, 1536-dim), or none (lexical only). Default sidecar; also $TASTASTAS_EMBED",
 	)
 	ollamaURL := flag.String(
 		"ollama-url",
@@ -173,13 +190,13 @@ func main() {
 	openaiKey := flag.String("openai-api-key", "", "OpenAI API key (prefer $TASTASTAS_OPENAI_KEY env var)")
 	openaiModel := flag.String(
 		"openai-model",
-		"text-embedding-3-small",
-		"OpenAI model ID (used when --embed-backend=openai)",
+		"",
+		"OpenAI model ID (used when --embed-backend=openai). Default text-embedding-3-small; also $TASTASTAS_OPENAI_MODEL",
 	)
 	openaiBaseURL := flag.String(
 		"openai-base-url",
-		"https://api.openai.com/v1",
-		"OpenAI API base URL (used when --embed-backend=openai)",
+		"",
+		"OpenAI API base URL (used when --embed-backend=openai). Default https://api.openai.com/v1; also $TASTASTAS_OPENAI_BASE_URL",
 	)
 	sidecarIntraThreads := flag.Int(
 		"sidecar-intra-threads",
@@ -222,6 +239,35 @@ func main() {
 		*openaiKey = os.Getenv("TASTASTAS_OPENAI_KEY")
 	}
 
+	if *authToken == "" {
+		*authToken = os.Getenv("TASTASTAS_AUTH_TOKEN")
+	}
+
+	if *embedBackend == "" {
+		*embedBackend = os.Getenv("TASTASTAS_EMBED")
+	}
+	if *embedBackend == "" {
+		*embedBackend = "sidecar"
+	}
+
+	if *openaiModel == "" {
+		*openaiModel = os.Getenv("TASTASTAS_OPENAI_MODEL")
+	}
+	if *openaiModel == "" {
+		*openaiModel = "text-embedding-3-small"
+	}
+
+	if *openaiBaseURL == "" {
+		*openaiBaseURL = os.Getenv("TASTASTAS_OPENAI_BASE_URL")
+	}
+	if *openaiBaseURL == "" {
+		*openaiBaseURL = "https://api.openai.com/v1"
+	}
+
+	if *consolidateInterval == "" {
+		*consolidateInterval = os.Getenv("TASTASTAS_CONSOLIDATE")
+	}
+
 	// Expand ~ in dbPath — MCP clients spawn without shell, so tilde
 	// isn't expanded by the OS.
 	*dbPath = expandTilde(*dbPath)
@@ -229,6 +275,21 @@ func main() {
 	// Ensure DB directory exists (for local SQLite, not remote DSN).
 	if !isRemoteDSN(*dbPath) {
 		ensureDBDir(*dbPath)
+	}
+
+	// SERVER_WORKSPACE_ROOT: raw-binary on-prem parity with docker-compose.
+	// Env set explicitly but missing on disk stays an error (surfaced later
+	// by buildRepositoryIndex's stat) — only the unset case gets a default
+	// created here, matching defaultDBPath/ensureDBDir precedent.
+	if os.Getenv("SERVER_WORKSPACE_ROOT") == "" {
+		if root := defaultWorkspaceRoot(); root != "" {
+			if err := os.MkdirAll(root, 0o755); err != nil {
+				log.Printf("warning: could not create default SERVER_WORKSPACE_ROOT %s: %v", root, err)
+			} else {
+				os.Setenv("SERVER_WORKSPACE_ROOT", root)
+				log.Printf("SERVER_WORKSPACE_ROOT unset — using default %s", root)
+			}
+		}
 	}
 
 	// Auto-detect embed dim when not explicitly set (0 = default).
@@ -311,6 +372,8 @@ func main() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("GET /graph/{project}", mcpserver.HandleGraphData(db))
 		mux.HandleFunc("GET /api/graph/{project}", mcpserver.HandleGraphData(db))
+		mux.HandleFunc("GET /graph/{project}/linked", mcpserver.HandleLinkedProjects(db))
+		mux.HandleFunc("GET /api/graph/{project}/linked", mcpserver.HandleLinkedProjects(db))
 		mux.HandleFunc("GET /graph/{project}/", mcpserver.HandleGraphSPA(*spaDir))
 		graphServer := &http.Server{Addr: *graphAddr, Handler: mux}
 		go func() {

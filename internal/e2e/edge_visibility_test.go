@@ -1,8 +1,8 @@
 // Package e2e — onboard_check + cross-source links E2E tests.
 //
 // Spawns real binary, ingests tastastas repo, asserts:
-//   1. onboard_check returns edge_type_counts map with >0 entries
-//   2. recall with link_threshold returns expected cross-source links
+//  1. onboard_check returns edge_type_counts map with >0 entries
+//  2. recall with link_threshold returns expected cross-source links
 package e2e
 
 import (
@@ -27,13 +27,14 @@ func TestE2EOnboardCheckEdgeCounts(t *testing.T) {
 	ingestProjectOC(t, sess)
 
 	var out struct {
-		HasNodes       bool            `json:"has_nodes"`
-		HasEdges       bool            `json:"has_edges"`
-		EdgeCount      int             `json:"edge_count"`
-		EdgeTypeCounts map[string]int  `json:"edge_type_counts,omitempty"`
+		HasNodes       bool           `json:"has_nodes"`
+		HasEdges       bool           `json:"has_edges"`
+		EdgeCount      int            `json:"edge_count"`
+		EdgeTypeCounts map[string]int `json:"edge_type_counts,omitempty"`
 	}
 	callTool(t, sess, "onboard_check", map[string]any{
 		"project_id": "e2e-oc",
+		"stage":      "e2e-test",
 	}, &out)
 
 	if !out.HasNodes {
@@ -164,6 +165,7 @@ func ingestProjectOC(t *testing.T, sess *mcp.ClientSession) {
 	callTool(t, sess, "ingest", map[string]any{
 		"cwd":        "../..",
 		"project_id": "e2e-oc",
+		"stage":      "e2e-test",
 	}, &out)
 	for i := 0; i < 60; i++ {
 		var st struct {

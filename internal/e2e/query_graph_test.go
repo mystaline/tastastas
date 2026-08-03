@@ -30,6 +30,7 @@ func TestE2EQueryGraph(t *testing.T) {
 	var recall recallResult
 	callTool(t, sess, "recall", map[string]any{
 		"project_id": "e2e-qg",
+		"stage":      "e2e-test",
 		"query":      "MarkStaleDownstream",
 		"limit":      5,
 	}, &recall)
@@ -213,6 +214,7 @@ func ingestProjectQG(t *testing.T, sess *mcp.ClientSession) {
 	callTool(t, sess, "ingest", map[string]any{
 		"cwd":        "../..", // up from internal/e2e/ to repo root
 		"project_id": "e2e-qg",
+		"stage":      "e2e-test",
 	}, &out)
 
 	for i := 0; i < 60; i++ {
@@ -236,9 +238,9 @@ func ingestProjectQG(t *testing.T, sess *mcp.ClientSession) {
 
 // qgResult is the wire shape of QueryGraphOutput for unmarshal.
 type qgResult struct {
-	NodeID string      `json:"node_id"`
-	Title  string      `json:"title"`
-	Edges  []qgEdge    `json:"edges"`
+	NodeID string   `json:"node_id"`
+	Title  string   `json:"title"`
+	Edges  []qgEdge `json:"edges"`
 }
 
 type qgEdge struct {

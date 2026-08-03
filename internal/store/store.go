@@ -91,11 +91,13 @@ type EdgeResult struct {
 	FromType       string  `json:"from_type"`
 	FromGroup      string  `json:"from_group"`
 	FromSize       int     `json:"from_size"`
+	FromProjectID  string  `json:"from_project_id"`
 	ToID           string  `json:"to_id"`
 	ToTitle        string  `json:"to_title"`
 	ToType         string  `json:"to_type"`
 	ToGroup        string  `json:"to_group"`
 	ToSize         int     `json:"to_size"`
+	ToProjectID    string  `json:"to_project_id"`
 	EdgeType       string  `json:"edge_type"`
 	Confidence     float64 `json:"confidence"`
 	ConfidenceTier string  `json:"confidence_tier,omitempty"`
@@ -283,6 +285,10 @@ type Store interface {
 	ClearProject(ctx context.Context, projectID, modelID string) (ClearProjectResult, error)
 	ListProjects(ctx context.Context) ([]ProjectInfo, error)
 
+	// UpsertProject records the human-readable name and remote URL for a base
+	// (unstaged) project ID. Idempotent.
+	UpsertProject(ctx context.Context, projectID, projectName, repositoryURL string) error
+
 	ListEmbedModels(ctx context.Context, projectID string) ([]ModelInfo, error)
 
 	// ListProjectIDs returns all known project IDs.
@@ -290,6 +296,10 @@ type Store interface {
 
 	// GetTopNodesByImportance returns the top-N nodes for a project ordered by importance DESC.
 	GetTopNodesByImportance(ctx context.Context, projectID string, limit int) ([]Node, error)
+
+	// GetNodesByCrossProjectEdges returns nodes of projectID that are endpoints
+	// of edges touching otherProject, ordered by importance DESC.
+	GetNodesByCrossProjectEdges(ctx context.Context, projectID, otherProject string, limit int) ([]Node, error)
 
 	// GetNodeEmbeddings returns embeddings for the given node IDs.
 	GetNodeEmbeddings(ctx context.Context, nodeIDs []string) (map[string][]float32, error)
@@ -334,7 +344,11 @@ type ClearProjectResult struct {
 }
 
 type ProjectInfo struct {
-	ProjectID string `json:"project_id"`
-	NodeCount int    `json:"node_count"`
-	EdgeCount int    `json:"edge_count"`
+	ProjectID          string `json:"project_id"`
+	ProjectName        string `json:"project_name,omitempty"`
+	RepositoryURL      string `json:"repository_url,omitempty"`
+	Stage              string `json:"stage,omitempty"`
+	EffectiveProjectID string `json:"effective_project_id,omitempty"`
+	NodeCount          int    `json:"node_count"`
+	EdgeCount          int    `json:"edge_count"`
 }

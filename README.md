@@ -8,7 +8,28 @@ Data sources: doc repos (PRDs, ERDs, APIs, spec docs), codebases (Go, TypeScript
 
 ## Quick Start
 
-See [DEPLOYMENT.md](./DEPLOYMENT.md) for delivery options (binary, Docker, build from source).
+Pick one path:
+
+**Docker (OpenRouter, zero build):**
+```bash
+cp .env.example .env              # then set TASTASTAS_OPENAI_KEY in .env
+docker compose -f docker-compose.prod.yml up -d
+```
+
+**Binary (build from source):**
+```bash
+make build
+TASTASTAS_OPENAI_KEY=sk-... ./tastastas --serve :8080 --graph-addr :9292 --embed-backend openai
+```
+
+Connect your agent: copy the **HTTP (Docker Compose)** block below into your client's MCP config.
+
+Use it:
+- `ingest <repo-path>` — load a repo/docs into memory
+- `recall "<query>"` — search what's already remembered
+- or just tell your agent: *"ingest this folder"* / *"recall what you know about X"*
+
+Deployment details: [DEPLOYMENT.md](./DEPLOYMENT.md). API, architecture, tool list: below.
 
 ## MCP Configuration
 
@@ -260,10 +281,15 @@ Runs full pipeline: auto-detect adapters → chunk → embed → hierarchy → T
 
 ```
 Request:
-{ "root": "/path/to/repo", "project_id": "my-project", "ref": "main" }
+{ "root": "/path/to/repo", "project_id": "my-project", "stage": "main" }
 
-→ 202  {"job_id":"<ulid>","status":"running"}
-→ 400  {"error":"root is required"}          — missing root
+root is optional — same resolution as the MCP ingest tool: root, then
+repository_url, then project_id-only (see Path resolution below). stage is
+optional too — defaults to the git branch auto-detected from the resolved
+root, falling back to the literal stage "local" for non-git directories.
+
+→ 202  {"job_id":"<ulid>","status":"running","stage":"main","effective_project_id":"my-project::stage:main"}
+→ 400  {"error":"..."}                       — root/repository_url/project_id could not resolve a repository
 → 400  {"error":"invalid JSON"}              — malformed body
 ```
 
@@ -306,18 +332,39 @@ Three adapters. Point one at a folder:
 ```bash
 # From curl — httpie or HTTP mode
 curl -X POST localhost:8080/ingest \
-  -d '{"root": "/path/to/docs", "project_id": "my-project", "ref": "main"}'
+  -d '{"root": "/path/to/docs", "project_id": "my-project", "stage": "main"}'
 
 # From MCP client
-ingest project_id=my-project cwd=/path/to/docs ref=main
+ingest project_id=my-project cwd=/path/to/docs stage=main
+
+# Remote client path; server resolves repository by Git remote URL
+ingest project_id=my-project cwd=/home/mystaline-dev/Workspace/repo-a repository_url=https://gitea.example/org/repo-a.git stage=main
+
+# CI/CD, no server filesystem knowledge needed at all
+curl -X POST localhost:8080/ingest \
+  -d '{"repository_url": "git@github.com:org/repo-a.git", "project_id": "repo-a"}'
 ```
 
-### Path resolution (Docker vs native)
+### Path resolution (Docker, on-prem, native)
 
-Paths handed to `ingest`/`onboard` are resolved the same way in both modes:
+`ingest` and `onboard` resolve a server-readable directory:
 
-- **Native (bare binary):** the given path is used as-is.
-- **Docker:** the container mounts a host workspace at `/workspaces`. Set `HOST_WORKSPACE_DIR` to the mounted host directory (e.g. `/home/user/Workspace` or `D:/Kerja`), then send host paths — the server remaps them to `/workspaces/...` for walking. This is required because the client and server live on different filesystems: without it the server can't translate the paths you pass, so they fail or walk nothing. Paths outside the prefix fail fast with a clear error; Windows backslashes and drive-letter case are handled. Stored paths stay relative, so host origin naming is preserved. See [DEPLOYMENT.md#workspace-paths-docker](./DEPLOYMENT.md#workspace-paths-docker).
+- **Native (bare binary):** a server-visible `cwd` is used as-is.
+- **Docker with shared `/workspaces`:** set `SERVER_WORKSPACE_ROOT=/workspaces`. Send `/workspaces/repo-a` as `cwd`, or pass `repository_url`.
+- **Remote/on-prem client:** send optional `repository_url`. Server finds matching Git remote under `SERVER_WORKSPACE_ROOT`, then walks that server-visible directory. If URL lookup fails, server falls back to `cwd` only when that path exists on server.
+- **Neither `cwd` nor `repository_url`:** the server requires `project_id` and recursively searches `SERVER_WORKSPACE_ROOT` for a directory whose *basename* matches, at any depth (e.g. `project_id: repo-a` finds `/workspaces/repo-a` or `/workspaces/Personal/repo-a`, whichever exists). It never walks the bare workspace root itself — that would ingest every repo under the mount into one project. Ambiguous or unmatched names error instead of guessing.
+
+The server never knows or maps client host workspace directories — multiple users may have different local paths; identity comes from `repository_url`.
+
+`repository_url`/`project_id`-only resolution both require `SERVER_WORKSPACE_ROOT`. Docker sets it via `docker-compose.yml`. A bare binary with the env unset defaults to `~/tastastas/workspaces` and creates it at startup; an *explicitly set but missing* path is a hard error (typo/unmounted volume must surface, not silently create a wrong directory).
+
+Example server environment:
+
+```bash
+SERVER_WORKSPACE_ROOT=/home/user/workspaces
+```
+
+`repository_url` is normalized across HTTPS, SSH, and scp-style Git URLs. Stored `SourcePath` values remain relative; client and server absolute paths are never persisted. Unresolved paths return an error instead of scanning arbitrary directories. See [DEPLOYMENT.md#workspace-paths](./DEPLOYMENT.md#workspace-paths).
 
 `.memoryrc.yaml` example (optional, only needed for typed cross-linking):
 
@@ -348,7 +395,7 @@ jobs:
       - name: Update tastastas memory
         run: |
           curl -X POST http://your-server:8080/ingest \
-            -d '{"root": "$PWD", "project_id": "my-project", "ref": "main"}'
+            -d '{"root": "$PWD", "project_id": "my-project", "stage": "main"}'
 ```
 
 Ingest is idempotent — unchanged files keep their existing chunks and embeddings (content-hash skip). Only changed files are re-processed.

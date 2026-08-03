@@ -187,9 +187,9 @@ export function useForceSimulation(data: GraphData): UseForceSimulationResult {
       .data(simLinksRef.current, (d: SimLink) => d._key!)
       .join('line')
       .attr('class', 'link')
-      .attr('stroke', '#aaa')
-      .attr('stroke-width', 1)
-      .attr('opacity', edgeOpacityRef.current)
+      .attr('stroke', d => d._crossProject ? '#a78bfa' : '#aaa')
+      .attr('stroke-width', d => d._crossProject ? 2 : 1)
+      .attr('opacity', d => d._crossProject ? 1 : edgeOpacityRef.current)
     linkSelectionRef.current = linkSel
 
     const nodeSel = nodeLayer
@@ -271,6 +271,9 @@ export function useForceSimulation(data: GraphData): UseForceSimulationResult {
       proposedSelectionRef.current &&
         batchRef.current.updatePositions(proposedSelectionRef.current, nodeIndex)
     })
+
+    sim.alpha(0.02).restart()
+    sim.on('end', () => sim.stop())
 
     const afterInject = () => {
       const pSel = linkLayer

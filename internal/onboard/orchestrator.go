@@ -42,7 +42,6 @@ type ModuleEntry struct {
 type Config struct {
 	CWD       string
 	ProjectID string
-	Scope     string // "cwd" or "subtree"
 	ModelID   string // current embedding model ID
 	Embedder  embed.EmbedderBackend
 	Store     store.Store // injected from caller, not opened internally
@@ -92,10 +91,6 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	if cfg.ProjectID == "" {
 		cfg.ProjectID = "default"
 	}
-	if cfg.Scope == "" {
-		cfg.Scope = "subtree"
-	}
-
 	db := cfg.Store
 
 	var success bool
@@ -482,7 +477,9 @@ func detectModuleRoots(ctx context.Context, root string) []ModuleEntry {
 		if path != root {
 			rel, _ := filepath.Rel(root, path)
 			depth := len(strings.Split(filepath.ToSlash(rel), "/"))
-			if depth > 3 {
+			// Monorepos nest go.mod under services/{svc}/internal/modules/...;
+			// depth 3 missed those, so 6 covers services/*/internal/modules/*.
+			if depth > 6 {
 				return filepath.SkipDir
 			}
 			// Only prune subdirectories. The root entry itself is never

@@ -74,7 +74,7 @@ services:
       - "9292:9292"
     volumes:
       - tastastas-data:/data
-      - ${HOST_WORKSPACE_DIR:-/home/deploy/workspaces}:/workspaces
+      - ${WORKSPACE_MOUNT:-/home/deploy/workspaces}:/workspaces
     command:
       - "--serve"
       - ":8080"
@@ -86,7 +86,7 @@ services:
       - "1h"
     environment:
       - TASTASTAS_OPENAI_KEY=${TASTASTAS_OPENAI_KEY:?required}
-      - HOST_WORKSPACE_DIR=${HOST_WORKSPACE_DIR:-}
+      - SERVER_WORKSPACE_ROOT=/workspaces
 
 volumes:
   tastastas-data:
@@ -214,30 +214,85 @@ Heavy only during **ingest** (ONNX embedding saturates CPU, RAM spikes). Recall 
 
 ### Env variables
 
-| Variable | Equivalent flag |
-|----------|---------------|
-| `TASTASTAS_DB` | `--db` |
-| `TASTASTAS_OPENAI_KEY` | `--openai-api-key` |
-| `TASTASTAS_SPA_DIR` | `--spa-dir` |
-| `TASTASTAS_AUTH_TOKEN` | `--auth-token` |
-| `TASTASTAS_EMBED` | `--embed-backend` (docker-compose override) |
-| `HOST_WORKSPACE_DIR` | — (see [Workspace paths](#workspace-paths-docker)) |
+Precedence per variable: **explicit flag wins → env var → default**. Flags and env vars are interchangeable for these:
+
+| Variable | Flag | Notes |
+|----------|------|-------|
+| `TASTASTAS_DB` | `--db` | Env checked first, then XDG default |
+| `TASTASTAS_OPENAI_KEY` | `--openai-api-key` | Env used when flag empty |
+| `TASTASTAS_SPA_DIR` | `--spa-dir` | Env used when flag empty |
+| `TASTASTAS_AUTH_TOKEN` | `--auth-token` | Env used when flag empty |
+| `TASTASTAS_EMBED` | `--embed-backend` | Default `sidecar` |
+| `TASTASTAS_OPENAI_MODEL` | `--openai-model` | Default `text-embedding-3-small` |
+| `TASTASTAS_OPENAI_BASE_URL` | `--openai-base-url` | Default `https://api.openai.com/v1` |
+| `TASTASTAS_CONSOLIDATE` | `--consolidate-interval` | Empty = disabled |
+
+Env-only (no flag equivalent — read directly by the app):
+
+| Variable | Notes |
+|----------|-------|
+| `SERVER_WORKSPACE_ROOT` | Server-visible repository root; Docker default `/workspaces`. Bare binary: unset defaults to `~/tastastas/workspaces` (auto-created at startup); explicitly set but missing on disk is a hard error, not auto-created |
+
+Compose-only interpolation (read by docker-compose, never by the app):
+
+| Variable | Used for |
+|----------|----------|
+| `WORKSPACE_MOUNT` | Host directory bind-mounted at `/workspaces` |
+| `HTTP_PORT` / `GRAPH_PORT` | Published ports |
+| `TASTASTAS_IMAGE` | Prod image tag |
+| `GOPRIVATE` | Go toolchain private-module list (codeast/gitrepo ingest) |
+
+Rule of thumb: **bare binary** → flags (or the four `TASTASTAS_*` env vars above); **docker-compose** → set variables in `.env`, compose maps them into the `command`; anything else in the compose env block is interpolation only.
 
 ---
 
-## Workspace paths (Docker)
+## Workspace paths
 
-The container declares a fixed workspace volume at `/workspaces`. The host side is configurable via `HOST_WORKSPACE_DIR`:
+`SERVER_WORKSPACE_ROOT` is the path tastastas can read. It is not a client path. The server never maps or stores client filesystem paths.
 
-- Set `HOST_WORKSPACE_DIR` (e.g. `/home/user/Workspace`, `D:/Kerja`) to the host directory mounted at `/workspaces`.
-- Client (MCP/HTTP) paths under that prefix are remapped to `/workspaces/...` for file walks — send host paths, no need to know container paths.
-- Paths outside the prefix fail fast with a clear error: pass only paths under the workspace dir.
-- Matching is case-insensitive (`d:/Kerja` ≡ `D:/Kerja`) and Windows backslashes are normalized.
-- Stored data keeps relative paths — host origin naming is preserved; docker paths never persist.
+### Docker with shared `/workspaces`
 
-**Why it's required for smooth Docker usage:** the client and the server see different filesystems — the client knows host paths (`/home/user/...`, `D:/...`), the server only sees what is mounted in the container. Without `HOST_WORKSPACE_DIR`, the server cannot translate the path you hand it, so it fails or walks an empty tree. With it set, you keep using your normal paths and never touch container-internal ones.
+```yaml
+volumes:
+  - ${WORKSPACE_MOUNT:-/home/deploy/workspaces}:/workspaces
+environment:
+  - SERVER_WORKSPACE_ROOT=/workspaces
+```
 
-Unset or empty `HOST_WORKSPACE_DIR` → no remapping; the given path is used as-is (valid for bare-binary / non-Docker runs, where client and server share the same filesystem).
+Send `/workspaces/repo-a` as `cwd`, or pass `repository_url` and let the server resolve it.
+
+### On-prem server
+
+Set root to actual server-visible repository directory:
+
+```bash
+SERVER_WORKSPACE_ROOT=/home/user/workspaces
+```
+
+If unset, the bare binary defaults to `~/tastastas/workspaces` and creates it at startup (same precedent as `defaultDBPath`/`ensureDBDir`) — `repository_url` and `project_id`-only resolution work out of the box instead of hard-failing. If the env is set explicitly but the path doesn't exist, that's an error (`stat server workspace root ...`), not auto-created — a typo'd or unmounted path must surface loudly.
+
+For client-only paths, include `repository_url` in `onboard` or `ingest`:
+
+```json
+{
+  "cwd": "/home/mystaline-dev/Workspace/repo-a",
+  "repository_url": "https://gitea.example/org/repo-a.git"
+}
+```
+
+`cwd` is used as-is only when it exists on the server. Remote clients send `repository_url`; the server recursively scans `SERVER_WORKSPACE_ROOT` (no depth limit, so org/group-nested layouts like `/workspaces/Personal/repo-a` are found, not just direct children) for a Git repository whose `origin` remote matches. Matching remote resolves to canonical server path. Duplicate matches return an error. `.git`, `node_modules`, `vendor`, `.venv`/`venv`, `.cache`, `__pycache__`, and hidden directories are never descended into — once a directory's own `.git` is found, its subtree isn't descended into either, which bounds the scan.
+
+If `cwd` and `repository_url` are both empty, the server does **not** fall back to walking `SERVER_WORKSPACE_ROOT` itself (that would silently mix every repo under the mount into one project). It instead requires `project_id` and searches the same recursive index for a repository directory whose *basename* matches — e.g. `project_id: "repo-a"` finds `/workspaces/repo-a` or `/workspaces/Personal/repo-a`, whichever exists. Ambiguous basename matches (same name at two different paths) return an error listing all matches. If none of `cwd`, `repository_url`, or a matching `project_id` basename is found, the call errors instead of guessing.
+
+URL matching normalizes HTTPS, SSH, and scp-style remotes. Repository index refreshes when the discovered repo set or any `.git/config` timestamp changes. Stored `SourcePath` values remain relative.
+
+### Stage and scope gotchas
+
+`onboard`/`ingest` resolve a stage automatically and never error on it: pass `stage` explicitly, or let the server auto-detect the current git branch from `cwd`. If `cwd` isn't a git repo the server can read, git is missing, or the repo has an unborn HEAD (no commits yet), the stage falls back to the literal `"local"` instead of failing — this keeps non-git directories (docs folders, tarball exports, CI checkouts without `.git`) ingestable. The ingested data is stored under an effective ID of `project_id::stage:<stage>` — every read tool (`recall`, `onboard_check`, `clear_project`, `check_recent`, `project_graph`, `abort_ingestion`, `link_projects`) must be called with the **same** `project_id` + `stage` pair, or it will silently return zero results/nodes rather than an error (an empty scope is a valid, distinct state — not a typo signal).
+
+**`local` → real-branch transition.** If a directory was first ingested while non-git (stage `local`) and later becomes a real git repo (or `cwd` starts resolving a branch), new ingests land on the detected branch stage, not `local`. The response (`onboard`/`ingest`/`POST /ingest`) carries a `warning` field naming the still-present `local`-stage data and pointing at `clear_project` with `stage=local` as the remedy. This is never automatic — a docs directory or Obsidian vault can legitimately stay at `local` forever, so ingest never auto-purges it.
+
+A real git branch literally named `local` is indistinguishable from the fallback — acceptable, but worth knowing if debugging an unexpected transition warning.
 
 ---
 
