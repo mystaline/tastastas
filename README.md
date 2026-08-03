@@ -281,10 +281,15 @@ Runs full pipeline: auto-detect adapters → chunk → embed → hierarchy → T
 
 ```
 Request:
-{ "root": "/path/to/repo", "project_id": "my-project", "ref": "main" }
+{ "root": "/path/to/repo", "project_id": "my-project", "stage": "main" }
 
-→ 202  {"job_id":"<ulid>","status":"running"}
-→ 400  {"error":"root is required"}          — missing root
+root is optional — same resolution as the MCP ingest tool: root, then
+repository_url, then project_id-only (see Path resolution below). stage is
+optional too — defaults to the git branch auto-detected from the resolved
+root, falling back to the literal stage "local" for non-git directories.
+
+→ 202  {"job_id":"<ulid>","status":"running","stage":"main","effective_project_id":"my-project::stage:main"}
+→ 400  {"error":"..."}                       — root/repository_url/project_id could not resolve a repository
 → 400  {"error":"invalid JSON"}              — malformed body
 ```
 
@@ -327,13 +332,17 @@ Three adapters. Point one at a folder:
 ```bash
 # From curl — httpie or HTTP mode
 curl -X POST localhost:8080/ingest \
-  -d '{"root": "/path/to/docs", "project_id": "my-project", "ref": "main"}'
+  -d '{"root": "/path/to/docs", "project_id": "my-project", "stage": "main"}'
 
 # From MCP client
-ingest project_id=my-project cwd=/path/to/docs ref=main
+ingest project_id=my-project cwd=/path/to/docs stage=main
 
 # Remote client path; server resolves repository by Git remote URL
-ingest project_id=my-project cwd=/home/mystaline-dev/Workspace/repo-a repository_url=https://gitea.example/org/repo-a.git ref=main
+ingest project_id=my-project cwd=/home/mystaline-dev/Workspace/repo-a repository_url=https://gitea.example/org/repo-a.git stage=main
+
+# CI/CD, no server filesystem knowledge needed at all
+curl -X POST localhost:8080/ingest \
+  -d '{"repository_url": "git@github.com:org/repo-a.git", "project_id": "repo-a"}'
 ```
 
 ### Path resolution (Docker, on-prem, native)
@@ -343,8 +352,11 @@ ingest project_id=my-project cwd=/home/mystaline-dev/Workspace/repo-a repository
 - **Native (bare binary):** a server-visible `cwd` is used as-is.
 - **Docker with shared `/workspaces`:** set `SERVER_WORKSPACE_ROOT=/workspaces`. Send `/workspaces/repo-a` as `cwd`, or pass `repository_url`.
 - **Remote/on-prem client:** send optional `repository_url`. Server finds matching Git remote under `SERVER_WORKSPACE_ROOT`, then walks that server-visible directory. If URL lookup fails, server falls back to `cwd` only when that path exists on server.
+- **Neither `cwd` nor `repository_url`:** the server requires `project_id` and recursively searches `SERVER_WORKSPACE_ROOT` for a directory whose *basename* matches, at any depth (e.g. `project_id: repo-a` finds `/workspaces/repo-a` or `/workspaces/Personal/repo-a`, whichever exists). It never walks the bare workspace root itself — that would ingest every repo under the mount into one project. Ambiguous or unmatched names error instead of guessing.
 
 The server never knows or maps client host workspace directories — multiple users may have different local paths; identity comes from `repository_url`.
+
+`repository_url`/`project_id`-only resolution both require `SERVER_WORKSPACE_ROOT`. Docker sets it via `docker-compose.yml`. A bare binary with the env unset defaults to `~/tastastas/workspaces` and creates it at startup; an *explicitly set but missing* path is a hard error (typo/unmounted volume must surface, not silently create a wrong directory).
 
 Example server environment:
 
@@ -383,7 +395,7 @@ jobs:
       - name: Update tastastas memory
         run: |
           curl -X POST http://your-server:8080/ingest \
-            -d '{"root": "$PWD", "project_id": "my-project", "ref": "main"}'
+            -d '{"root": "$PWD", "project_id": "my-project", "stage": "main"}'
 ```
 
 Ingest is idempotent — unchanged files keep their existing chunks and embeddings (content-hash skip). Only changed files are re-processed.

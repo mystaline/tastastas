@@ -231,7 +231,7 @@ Env-only (no flag equivalent — read directly by the app):
 
 | Variable | Notes |
 |----------|-------|
-| `SERVER_WORKSPACE_ROOT` | Server-visible repository root; Docker default `/workspaces` |
+| `SERVER_WORKSPACE_ROOT` | Server-visible repository root; Docker default `/workspaces`. Bare binary: unset defaults to `~/tastastas/workspaces` (auto-created at startup); explicitly set but missing on disk is a hard error, not auto-created |
 
 Compose-only interpolation (read by docker-compose, never by the app):
 
@@ -269,6 +269,8 @@ Set root to actual server-visible repository directory:
 SERVER_WORKSPACE_ROOT=/home/user/workspaces
 ```
 
+If unset, the bare binary defaults to `~/tastastas/workspaces` and creates it at startup (same precedent as `defaultDBPath`/`ensureDBDir`) — `repository_url` and `project_id`-only resolution work out of the box instead of hard-failing. If the env is set explicitly but the path doesn't exist, that's an error (`stat server workspace root ...`), not auto-created — a typo'd or unmounted path must surface loudly.
+
 For client-only paths, include `repository_url` in `onboard` or `ingest`:
 
 ```json
@@ -278,9 +280,19 @@ For client-only paths, include `repository_url` in `onboard` or `ingest`:
 }
 ```
 
-`cwd` is used as-is only when it exists on the server. Remote clients send `repository_url`; the server searches direct child Git repositories under `SERVER_WORKSPACE_ROOT`. Matching remote resolves to canonical server path. Duplicate matches return an error. No arbitrary filesystem scan occurs.
+`cwd` is used as-is only when it exists on the server. Remote clients send `repository_url`; the server recursively scans `SERVER_WORKSPACE_ROOT` (no depth limit, so org/group-nested layouts like `/workspaces/Personal/repo-a` are found, not just direct children) for a Git repository whose `origin` remote matches. Matching remote resolves to canonical server path. Duplicate matches return an error. `.git`, `node_modules`, `vendor`, `.venv`/`venv`, `.cache`, `__pycache__`, and hidden directories are never descended into — once a directory's own `.git` is found, its subtree isn't descended into either, which bounds the scan.
 
-URL matching normalizes HTTPS, SSH, and scp-style remotes. Repository index refreshes when repository directories or `.git/config` timestamps change. Stored `SourcePath` values remain relative.
+If `cwd` and `repository_url` are both empty, the server does **not** fall back to walking `SERVER_WORKSPACE_ROOT` itself (that would silently mix every repo under the mount into one project). It instead requires `project_id` and searches the same recursive index for a repository directory whose *basename* matches — e.g. `project_id: "repo-a"` finds `/workspaces/repo-a` or `/workspaces/Personal/repo-a`, whichever exists. Ambiguous basename matches (same name at two different paths) return an error listing all matches. If none of `cwd`, `repository_url`, or a matching `project_id` basename is found, the call errors instead of guessing.
+
+URL matching normalizes HTTPS, SSH, and scp-style remotes. Repository index refreshes when the discovered repo set or any `.git/config` timestamp changes. Stored `SourcePath` values remain relative.
+
+### Stage and scope gotchas
+
+`onboard`/`ingest` resolve a stage automatically and never error on it: pass `stage` explicitly, or let the server auto-detect the current git branch from `cwd`. If `cwd` isn't a git repo the server can read, git is missing, or the repo has an unborn HEAD (no commits yet), the stage falls back to the literal `"local"` instead of failing — this keeps non-git directories (docs folders, tarball exports, CI checkouts without `.git`) ingestable. The ingested data is stored under an effective ID of `project_id::stage:<stage>` — every read tool (`recall`, `onboard_check`, `clear_project`, `check_recent`, `project_graph`, `abort_ingestion`, `link_projects`) must be called with the **same** `project_id` + `stage` pair, or it will silently return zero results/nodes rather than an error (an empty scope is a valid, distinct state — not a typo signal).
+
+**`local` → real-branch transition.** If a directory was first ingested while non-git (stage `local`) and later becomes a real git repo (or `cwd` starts resolving a branch), new ingests land on the detected branch stage, not `local`. The response (`onboard`/`ingest`/`POST /ingest`) carries a `warning` field naming the still-present `local`-stage data and pointing at `clear_project` with `stage=local` as the remedy. This is never automatic — a docs directory or Obsidian vault can legitimately stay at `local` forever, so ingest never auto-purges it.
+
+A real git branch literally named `local` is indistinguishable from the fallback — acceptable, but worth knowing if debugging an unexpected transition warning.
 
 ---
 
