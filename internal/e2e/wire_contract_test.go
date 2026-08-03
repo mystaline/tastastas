@@ -29,11 +29,12 @@ var expectedWireShapes = map[string][]string{
 	"forget":               {"status"},
 	"link":                 {"status"},
 	"check_impact":         {"stale_nodes"},
-	"onboard_check":        {"chunk_count", "edge_count", "edge_type_counts", "has_chunks", "has_conventions", "has_edges", "has_embeddings", "has_nodes", "node_count", "stale_count", "vec_count"},
+	"onboard_check":        {"chunk_count", "edge_count", "edge_type_counts", "gate_reason", "gated", "has_chunks", "has_conventions", "has_edges", "has_embeddings", "has_nodes", "node_count", "stale_count", "vec_count", "warning"},
+	"clone_repo":           {"path", "project_id", "status"},
 	"extract_and_remember": {"facts"},
-	"ingest":               {"auto_linked", "chunks_created", "conventions_inferred", "edges_created", "job_id", "nodes_ingested", "proposals_queued", "ref", "status"},
+	"ingest":               {"auto_linked", "chunks_created", "conventions_inferred", "edges_created", "effective_project_id", "job_id", "nodes_ingested", "proposals_queued", "stage", "status", "warning"},
 	"query_graph":          {"content_excerpt", "edges", "neighbor_counts", "node_id", "title"},
-	"clear_project":        {"deleted_chunks", "deleted_edges", "deleted_nodes", "deleted_vectors", "status"},
+	"clear_project":        {"deleted_chunks", "deleted_edges", "deleted_nodes", "deleted_vectors", "status", "warning"},
 	"list_projects":        {"projects"},
 }
 
@@ -83,6 +84,7 @@ func TestOutputWireContract(t *testing.T) {
 		"link":                 reflect.TypeOf(mcpserver.LinkOutput{}),
 		"check_impact":         reflect.TypeOf(mcpserver.CheckImpactOutput{}),
 		"onboard_check":        reflect.TypeOf(mcpserver.OnboardCheckOutput{}),
+		"clone_repo":           reflect.TypeOf(mcpserver.CloneRepoOutput{}),
 		"extract_and_remember": reflect.TypeOf(mcpserver.ExtractAndRememberOutput{}),
 		"ingest":               reflect.TypeOf(mcpserver.IngestOutput{}),
 		"query_graph":          reflect.TypeOf(mcpserver.QueryGraphOutput{}),
