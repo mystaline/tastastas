@@ -735,6 +735,9 @@ Paths (onboard/ingest, server mode only):
 			if projectID == "" {
 				projectID = "default"
 			}
+			if err := guardProjectID(ctx, db, args.ProjectID); err != nil {
+				return errorResult(err), RememberOutput{}, nil
+			}
 			nodeType := args.NodeType
 			if nodeType == "" {
 				nodeType = "generic-doc"
@@ -1295,6 +1298,9 @@ Paths (onboard/ingest, server mode only):
 		projectID := args.ProjectID
 		if projectID == "" {
 			projectID = "default"
+		}
+		if err := guardProjectID(ctx, db, args.ProjectID); err != nil {
+			return errorResult(err), ExtractAndRememberOutput{}, nil
 		}
 
 		job := jobs.create(projectID)

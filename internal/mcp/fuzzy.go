@@ -1,6 +1,8 @@
 package mcp
 
 import (
+	"context"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -95,4 +97,35 @@ func editDistance(a, b string) int {
 		prev, curr = curr, prev
 	}
 	return prev[lb]
+}
+
+// guardProjectID rejects a write when project_id is a near-miss of an
+// existing project (fuzzy match, not exact) — same fuzzy logic recall
+// uses for its "Did you mean" warning, but blocking instead of advisory,
+// since a write silently landing in the wrong project is data loss.
+// Returns nil (proceed) when project_id exactly matches an existing
+// project, or when there is no fuzzy match at all (genuinely new project).
+// Returns a non-nil error, with candidate suggestions, when there is a
+// fuzzy match but no exact match.
+func guardProjectID(ctx context.Context, db store.Store, projectID string) error {
+	if projectID == "" || projectID == "default" {
+		return nil // documented no-project-given fallback, not a typo
+	}
+	projects, err := db.ListProjects(ctx)
+	if err != nil {
+		return nil // don't block writes on a listing failure
+	}
+	for _, p := range projects {
+		if p.ProjectID == projectID || p.EffectiveProjectID == projectID {
+			return nil
+		}
+	}
+	suggestions := fuzzyMatchProjects(projectID, projects)
+	if len(suggestions) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"project_id '%s' does not exactly match an existing project. Did you mean: %s? "+
+			"(pass the exact id to write to that project, or a clearly different id to create a new one)",
+		projectID, formatSuggestions(suggestions))
 }

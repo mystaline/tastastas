@@ -3,6 +3,7 @@ package onboard
 import (
 	"context"
 	"math"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,6 +14,55 @@ import (
 	"github.com/mystaline/tastastas/internal/store"
 	sqlitestore "github.com/mystaline/tastastas/internal/store/sqlite"
 )
+
+func TestDetectJSVariants(t *testing.T) {
+	write := func(t *testing.T, dir string, files ...string) string {
+		t.Helper()
+		root := filepath.Join(dir, "proj")
+		for _, f := range files {
+			full := filepath.Join(root, f)
+			if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(full, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return root
+	}
+
+	t.Run("azure functions style, js only", func(t *testing.T) {
+		root := write(t, t.TempDir(), "package.json", "sendEmail/index.js", "sendSms/index.js")
+		got := detectJSVariants(root)
+		if len(got) != 1 || got[0] != "javascript" {
+			t.Fatalf("got %v, want [javascript]", got)
+		}
+	})
+
+	t.Run("typescript only", func(t *testing.T) {
+		root := write(t, t.TempDir(), "package.json", "src/index.ts")
+		got := detectJSVariants(root)
+		if len(got) != 1 || got[0] != "typescript" {
+			t.Fatalf("got %v, want [typescript]", got)
+		}
+	})
+
+	t.Run("mixed js and ts", func(t *testing.T) {
+		root := write(t, t.TempDir(), "package.json", "src/index.ts", "scripts/build.js")
+		got := detectJSVariants(root)
+		if len(got) != 2 {
+			t.Fatalf("got %v, want both javascript and typescript", got)
+		}
+	})
+
+	t.Run("no source files falls back to javascript", func(t *testing.T) {
+		root := write(t, t.TempDir(), "package.json")
+		got := detectJSVariants(root)
+		if len(got) != 1 || got[0] != "javascript" {
+			t.Fatalf("got %v, want [javascript]", got)
+		}
+	})
+}
 
 func TestNamePrefix(t *testing.T) {
 	tests := []struct{ in, want string }{

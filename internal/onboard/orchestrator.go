@@ -495,7 +495,7 @@ func detectModuleRoots(ctx context.Context, root string) []ModuleEntry {
 			langs = append(langs, "go")
 		}
 		if exists(filepath.Join(path, "package.json")) {
-			langs = append(langs, "typescript")
+			langs = append(langs, detectJSVariants(path)...)
 		}
 		if exists(filepath.Join(path, "pyproject.toml")) {
 			langs = append(langs, "python")
@@ -530,13 +530,49 @@ func parseModulePath(goModPath string) string {
 	return filepath.Base(filepath.Dir(goModPath))
 }
 
+// detectJSVariants inspects a JS/TS module root and returns which of
+// "javascript"/"typescript" have matching source files, so codeast walks
+// the extensions that actually exist instead of assuming TypeScript.
+// package.json alone used to always yield "typescript", so pure-JS repos
+// (e.g. Azure Functions style, .js only) got zero files walked — see
+// docs/bug-reports/2026-08-05-adapter-detection-null-js-azure-functions.md.
+func detectJSVariants(root string) []string {
+	hasTS, hasJS := false, false
+	filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if p != root && shouldSkipDir(d.Name()) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		switch filepath.Ext(p) {
+		case ".ts", ".tsx":
+			hasTS = true
+		case ".js", ".jsx":
+			hasJS = true
+		}
+		return nil
+	})
+	var langs []string
+	if hasTS {
+		langs = append(langs, "typescript")
+	}
+	if hasJS || !hasTS {
+		langs = append(langs, "javascript")
+	}
+	return langs
+}
+
 func detectLanguages(root string) []string {
 	var langs []string
 	if exists(filepath.Join(root, "go.mod")) {
 		langs = append(langs, "go")
 	}
 	if exists(filepath.Join(root, "package.json")) {
-		langs = append(langs, "typescript")
+		langs = append(langs, detectJSVariants(root)...)
 	}
 	if exists(filepath.Join(root, "pyproject.toml")) {
 		langs = append(langs, "python")
